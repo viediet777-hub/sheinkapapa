@@ -621,9 +621,9 @@ class AutoMiningEngine:
             return
         
         initial_msg = f"""
-🚀 **AUTO-MINING STARTED!**
+🚀 AUTO-MINING STARTED!
 
-📱 **Accounts:** {len(valid_sessions)}
+📱 Accounts: {len(valid_sessions)}
 ⏳ Processing one by one...
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -633,7 +633,7 @@ class AutoMiningEngine:
         async def status_callback(msg):
             try:
                 current_msg = f"""
-🚀 **AUTO-MINING IN PROGRESS...**
+🚀 AUTO-MINING IN PROGRESS...
 
 📱 Accounts: {len(valid_sessions)}
 ✅ Completed: {self.success_count}
@@ -675,17 +675,17 @@ class AutoMiningEngine:
                 await asyncio.sleep(2)
             
             summary_msg = f"""
-✅ **AUTO-MINING COMPLETE!**
+✅ AUTO-MINING COMPLETE!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📱 **Accounts Mined:** {len(results)}
-✅ **Successful:** {self.success_count}
-💰 **Total Coins Earned:** {self.total_earned}
-💎 **Total Gems Earned:** {self.total_gems}
-🎮 **Total Games Played:** {self.total_played}
+📱 Accounts Mined: {len(results)}
+✅ Successful: {self.success_count}
+💰 Total Coins Earned: {self.total_earned}
+💎 Total Gems Earned: {self.total_gems}
+🎮 Total Games Played: {self.total_played}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📌 **Next Steps:**
+📌 Next Steps:
 • Click 🚀 AUTO MINE again for daily mining
 • Add more accounts by logging in
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -755,9 +755,8 @@ def premium_header(user_id):
     premium = "⭐" if user.get('premium_status') == 'PREMIUM' else "💠"
     
     return f"""
-╔══════════════════════════════════════╗
-║    🚀 **NRTECNO PREMIUM BOT**        ║
-╠══════════════════════════════════════╣
+    
+🚀 VIEDIET PVT SHOPSY BOT        
 ║ {premium} User: {user.get('first_name', 'User')}
 ║ 📱 Accounts: {accounts} (Unlimited)
 ║ {mining} Status: {"Mining" if user.get('mining_active', 0) else "Idle"}
@@ -781,7 +780,7 @@ def view_accounts_text(user_id):
     
     if total == 0:
         return f"""
-📋 **YOUR ACCOUNTS**
+📋 YOUR ACCOUNTS
 
 ❌ No accounts found
 
@@ -791,7 +790,7 @@ def view_accounts_text(user_id):
 """
     
     text = f"""
-📋 **YOUR ACCOUNTS**
+📋 YOUR ACCOUNTS
 
 📱 Total Accounts: {total}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -819,7 +818,7 @@ def history_text(user_id):
     
     if not history:
         return """
-📊 **MINING HISTORY**
+📊 MINING HISTORY
 
 ❌ No mining data yet
 
@@ -831,7 +830,7 @@ Start auto-mining to track your earnings.
     total_games = sum(h[2] for h in history)
     
     text = f"""
-📊 **MINING HISTORY**
+📊 MINING HISTORY
 
 💰 Total Coins: {total_coins}
 💎 Total Gems: {total_gems}
@@ -852,25 +851,24 @@ Start auto-mining to track your earnings.
 
 def support_text():
     return """
-📢 **SUPPORT & HELP**
+📢 SUPPORT & HELP
 
-💬 **Commands:**
+💬 Commands:
 • /start - Restart bot
-• /admin - Admin panel (admins only)
 
-📱 **Login Methods:**
+📱 Login Methods:
 1. OTP Login: Receive OTP on mobile
 2. JSON Login: Upload JSON session
 
-⚡ **Features:**
+⚡Features:
 • Unlimited accounts
 • Auto-mining all accounts
 • Earnings tracking
 • Premium support
 
-📞 **Contact Support:**
+📞 Contact Support:
 Contact your admin for assistance.
-
+Group - @viedietlooterschat
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -914,15 +912,15 @@ def admin_command(message):
         return
     
     text = """
-👑 **ADMIN PANEL**
+👑 ADMIN PANEL
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📊 **Statistics:**
+📊 Statistics:
 • Total Users: {total}
 • Total Accounts: {accounts}
 
-👑 **Commands:**
+👑 Commands:
 • /adduser USER_ID - Grant access
 • /removeuser USER_ID - Revoke access
 • /listusers - Show all users
@@ -959,7 +957,7 @@ def adduser_command(message):
             try:
                 bot.send_message(
                     int(target_id),
-                    "🎉 **ACCESS GRANTED**\n\n"
+                    "🎉 ACCESS GRANTED\n\n"
                     "You now have access to NRTECNO Premium Bot.\n"
                     "Click /start to begin.",
                     parse_mode="HTML"
@@ -993,7 +991,7 @@ def removeuser_command(message):
             try:
                 bot.send_message(
                     int(target_id),
-                    "🔒 **ACCESS REVOKED**\n\n"
+                    "🔒 ACCESS REVOKED\n\n"
                     "You no longer have access to this bot.",
                     parse_mode="HTML"
                 )
@@ -1016,7 +1014,7 @@ def listusers_command(message):
         bot.reply_to(message, "No users found.")
         return
     
-    text = "👥 **ALL USERS**\n\n"
+    text = "👥 ALL USERS\n\n"
     for uid, username, status, referrals, premium in users[:20]:
         name = username or f"User_{uid}"
         icon = "🔓" if status == "ACTIVE" else "🔒"
@@ -1037,7 +1035,7 @@ def broadcast_command(message):
     
     msg = bot.reply_to(
         message,
-        "📢 **BROADCAST MESSAGE**\n\n"
+        "📢 BROADCAST MESSAGE\n\n"
         "Send the message to broadcast to all users.\n"
         "Send /cancel to abort.",
         parse_mode="HTML"
@@ -1174,7 +1172,7 @@ def callback_handler(call):
     # ===== ADD ACCOUNT MENU =====
     if data == "add_account_menu":
         bot.edit_message_text(
-            "📱 **ADD ACCOUNT**\n\n"
+            "📱 ADD ACCOUNT\n\n"
             "Choose your login method:\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "📱 OTP Login - Login via mobile number\n"
@@ -1386,7 +1384,7 @@ def json_login_handler(message):
         
         bot.reply_to(
             message,
-            f"✅ **JSON LOGIN SUCCESSFUL**\n\n"
+            f"✅ JSON LOGIN SUCCESSFUL\n\n"
             f"📱 Phone: +91{phone}\n"
             f"📊 Total Accounts: {accounts_count}\n"
             f"💾 Session saved successfully!\n\n"
@@ -1558,7 +1556,7 @@ def shopsy_otp_handler(message):
                 accounts_count = get_accounts_count(user_id)
                 
                 bot.edit_message_text(
-                    f"✅ **LOGIN SUCCESSFUL**\n\n"
+                    f"✅ LOGIN SUCCESSFUL\n\n"
                     f"📱 Phone: +91{phone}\n"
                     f"💾 Account saved!\n"
                     f"📊 Total Accounts: {accounts_count}\n"
