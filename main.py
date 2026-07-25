@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - VIEDIET PREMIUM BOT v10.0
-# WEBHOOK ONLY - No polling, No 409 errors
+# NRTECNO SYSTEM - VIEDIET PREMIUM BOT v11.0
+# POLLING MODE - No webhook, All buttons working
 
 import os
 import logging
@@ -15,7 +15,6 @@ import uuid
 import sys
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from flask import Flask, request
 
 # ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -26,9 +25,6 @@ if not BOT_TOKEN:
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 1364476174))
 CHANNEL_USERNAME = "viedietlooters"
 REFERRAL_REQUIRED = 6
-
-# Railway webhook config
-PORT = int(os.environ.get("PORT", 8443))
 
 # ===== PERSISTENT STORAGE =====
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
@@ -44,9 +40,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== BOT & FLASK INIT ====================
+# ==================== BOT INIT ====================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-app = Flask(__name__)
 
 # ==================== DATABASE ====================
 def init_db():
@@ -1009,7 +1004,7 @@ def callback_handler(call):
         return
     
     # ============================================================
-    # ADMIN CALLBACKS
+    # ADMIN CALLBACKS - ALL WORKING
     # ============================================================
     
     if data == "admin_panel":
@@ -1036,7 +1031,13 @@ def callback_handler(call):
         locked = get_locked_users()
         premium = get_premium_users()
         refs = get_total_referrals()
-        text = f"📊 BOT STATISTICS\n━━━━━━━━━━━━━━━━━━━\n👥 Total Users: {total}\n🔓 Unlocked: {unlocked}\n🔒 Locked: {locked}\n⭐ Premium: {premium}\n🔗 Total Referrals: {refs}"
+        text = f"""📊 BOT STATISTICS
+━━━━━━━━━━━━━━━━━━━
+👥 Total Users: {total}
+🔓 Unlocked: {unlocked}
+🔒 Locked: {locked}
+⭐ Premium: {premium}
+🔗 Total Referrals: {refs}"""
         bot.edit_message_text(
             text,
             chat_id=call.message.chat.id,
@@ -1076,7 +1077,16 @@ def callback_handler(call):
         if not target_user:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
-        text = f"""👤 USER DETAILS\n━━━━━━━━━━━━━━━━━━━\n🆔 ID: {target_id}\n👤 Name: {target_user.get('first_name', 'N/A')}\n🔓 Unlocked: {'✅' if target_user.get('is_unlocked') else '❌'}\n⭐ Premium: {'✅' if target_user.get('is_premium') else '❌'}\n📱 Referrals: {target_user.get('referrals_count', 0)}/{REFERRAL_REQUIRED}\n📱 Accounts: {get_accounts_count(target_id)}\n📊 Total Logins: {target_user.get('total_logins', 0)}\n📅 Joined: {target_user.get('registered_at', 'N/A')[:10]}"""
+        text = f"""👤 USER DETAILS
+━━━━━━━━━━━━━━━━━━━
+🆔 ID: {target_id}
+👤 Name: {target_user.get('first_name', 'N/A')}
+🔓 Unlocked: {'✅' if target_user.get('is_unlocked') else '❌'}
+⭐ Premium: {'✅' if target_user.get('is_premium') else '❌'}
+📱 Referrals: {target_user.get('referrals_count', 0)}/{REFERRAL_REQUIRED}
+📱 Accounts: {get_accounts_count(target_id)}
+📊 Total Logins: {target_user.get('total_logins', 0)}
+📅 Joined: {target_user.get('registered_at', 'N/A')[:10]}"""
         bot.edit_message_text(
             text,
             chat_id=call.message.chat.id,
@@ -1098,8 +1108,21 @@ def callback_handler(call):
             return
         update_user(target_id, is_unlocked=1, status='ACTIVE')
         bot.answer_callback_query(call.id, f"✅ User {target_id} unlocked!")
-        # Refresh user detail view
-        callback_handler(call)
+        # Refresh user detail
+        text = f"""👤 USER DETAILS (UPDATED)
+━━━━━━━━━━━━━━━━━━━
+🆔 ID: {target_id}
+👤 Name: {target_user.get('first_name', 'N/A')}
+🔓 Unlocked: ✅
+⭐ Premium: {'✅' if target_user.get('is_premium') else '❌'}
+📱 Referrals: {target_user.get('referrals_count', 0)}/{REFERRAL_REQUIRED}"""
+        bot.edit_message_text(
+            text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=admin_user_detail_keyboard(target_id),
+            parse_mode="HTML"
+        )
         return
     
     if data.startswith("admin_lock_"):
@@ -1113,7 +1136,21 @@ def callback_handler(call):
             return
         update_user(target_id, is_unlocked=0, is_premium=0, status='LOCKED')
         bot.answer_callback_query(call.id, f"✅ User {target_id} locked!")
-        callback_handler(call)
+        # Refresh user detail
+        text = f"""👤 USER DETAILS (UPDATED)
+━━━━━━━━━━━━━━━━━━━
+🆔 ID: {target_id}
+👤 Name: {target_user.get('first_name', 'N/A')}
+🔓 Unlocked: ❌
+⭐ Premium: ❌
+📱 Referrals: {target_user.get('referrals_count', 0)}/{REFERRAL_REQUIRED}"""
+        bot.edit_message_text(
+            text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=admin_user_detail_keyboard(target_id),
+            parse_mode="HTML"
+        )
         return
     
     if data.startswith("admin_premium_"):
@@ -1127,7 +1164,21 @@ def callback_handler(call):
             return
         update_user(target_id, is_premium=1, is_unlocked=1, status='ACTIVE')
         bot.answer_callback_query(call.id, f"⭐ User {target_id} premium granted!")
-        callback_handler(call)
+        # Refresh user detail
+        text = f"""👤 USER DETAILS (UPDATED)
+━━━━━━━━━━━━━━━━━━━
+🆔 ID: {target_id}
+👤 Name: {target_user.get('first_name', 'N/A')}
+🔓 Unlocked: ✅
+⭐ Premium: ✅
+📱 Referrals: {target_user.get('referrals_count', 0)}/{REFERRAL_REQUIRED}"""
+        bot.edit_message_text(
+            text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=admin_user_detail_keyboard(target_id),
+            parse_mode="HTML"
+        )
         return
     
     if data.startswith("admin_remove_premium_"):
@@ -1141,7 +1192,21 @@ def callback_handler(call):
             return
         update_user(target_id, is_premium=0)
         bot.answer_callback_query(call.id, f"❌ User {target_id} premium removed!")
-        callback_handler(call)
+        # Refresh user detail
+        text = f"""👤 USER DETAILS (UPDATED)
+━━━━━━━━━━━━━━━━━━━
+🆔 ID: {target_id}
+👤 Name: {target_user.get('first_name', 'N/A')}
+🔓 Unlocked: {'✅' if target_user.get('is_unlocked') else '❌'}
+⭐ Premium: ❌
+📱 Referrals: {target_user.get('referrals_count', 0)}/{REFERRAL_REQUIRED}"""
+        bot.edit_message_text(
+            text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=admin_user_detail_keyboard(target_id),
+            parse_mode="HTML"
+        )
         return
     
     if data.startswith("admin_users_page_"):
@@ -1184,7 +1249,15 @@ def callback_handler(call):
         locked = get_locked_users()
         premium = get_premium_users()
         refs = get_total_referrals()
-        text = f"""📈 COMPLETE ANALYTICS REPORT\n━━━━━━━━━━━━━━━━━━━\n👥 Total Registered: {total}\n🔓 Unlocked: {unlocked}\n🔒 Locked: {locked}\n⭐ Premium: {premium}\n📤 Referral Unlocked: {unlocked - premium}\n━━━━━━━━━━━━━━━━━━━\n🔗 Total Referrals: {refs}"""
+        text = f"""📈 COMPLETE ANALYTICS REPORT
+━━━━━━━━━━━━━━━━━━━
+👥 Total Registered: {total}
+🔓 Unlocked: {unlocked}
+🔒 Locked: {locked}
+⭐ Premium: {premium}
+📤 Referral Unlocked: {unlocked - premium}
+━━━━━━━━━━━━━━━━━━━
+🔗 Total Referrals: {refs}"""
         bot.edit_message_text(
             text,
             chat_id=call.message.chat.id,
@@ -1452,20 +1525,6 @@ def process_json_login(message, user_id, json_data):
     update_user(user_id, shopsy_phone=phone, shopsy_logged_in=1)
     show_unlocked_menu(message, user_id)
 
-# ==================== WEBHOOK ====================
-@app.route('/' + BOT_TOKEN, methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    return '', 403
-
-@app.route('/', methods=['GET'])
-def index():
-    return 'Bot is running!', 200
-
 # ==================== MAIN ====================
 if __name__ == "__main__":
     # Start background scheduler
@@ -1473,16 +1532,16 @@ if __name__ == "__main__":
     task_thread.start()
     
     logger.info("=" * 60)
-    logger.info("🚀 VIEDIET PREMIUM BOT v10.0 - WEBHOOK MODE")
+    logger.info("🚀 VIEDIET PREMIUM BOT v11.0 - POLLING MODE")
     logger.info("=" * 60)
     logger.info("🔒 Referrals Required: 6")
     logger.info("📱 Login: JSON ONLY")
     logger.info("📢 Channel: @{}".format(CHANNEL_USERNAME))
     logger.info("👑 Admin: BUTTON BASED")
-    logger.info("🌐 Webhook Server on Port: {}".format(PORT))
+    logger.info("🔄 Mode: POLLING (No webhook)")
     logger.info("=" * 60)
     
-    # Remove any existing webhook
+    # Remove webhook if any
     try:
         bot.remove_webhook()
         logger.info("✅ Webhook removed")
@@ -1491,13 +1550,11 @@ if __name__ == "__main__":
     
     time.sleep(1)
     
-    # Set webhook (Railway provides the URL automatically)
-    webhook_url = f"https://{os.environ.get('RAILWAY_STATIC_URL', 'localhost')}/{BOT_TOKEN}"
-    if os.environ.get('RAILWAY_STATIC_URL'):
-        bot.set_webhook(url=webhook_url)
-        logger.info(f"✅ Webhook set to: {webhook_url}")
-    else:
-        logger.warning("⚠️ RAILWAY_STATIC_URL not set. Webhook may not work.")
-    
-    # Start Flask server
-    app.run(host='0.0.0.0', port=PORT)
+    # Start polling - SINGLE INSTANCE
+    logger.info("🔄 Starting polling...")
+    try:
+        bot.polling(non_stop=True, interval=1, timeout=30)
+    except Exception as e:
+        logger.error(f"Polling error: {e}")
+        # Don't restart, just exit
+        sys.exit(1)
