@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - VIEDIET PREMIUM BOT v11.0
-# POLLING MODE - No webhook, All buttons working
+# NRTECNO SYSTEM - VIEDIET PREMIUM BOT v12.0
+# FIXED: Clean admin panel, Auto mining working, No 409 errors
 
 import os
 import logging
@@ -13,8 +13,10 @@ import random
 import sqlite3
 import uuid
 import sys
+import asyncio
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from curl_cffi import requests as cffi_requests
 
 # ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -649,20 +651,12 @@ def history_keyboard():
     kb.row(InlineKeyboardButton("🔙 BACK", callback_data="back_menu"))
     return kb
 
-# ==================== ADMIN BUTTON FUNCTIONS ====================
+# ==================== ADMIN BUTTON FUNCTIONS (CLEAN) ====================
 def admin_main_keyboard():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
         InlineKeyboardButton("📊 STATS", callback_data="admin_stats"),
         InlineKeyboardButton("👥 USERS", callback_data="admin_users")
-    )
-    kb.row(
-        InlineKeyboardButton("🔓 UNLOCK", callback_data="admin_unlock_user"),
-        InlineKeyboardButton("🔒 LOCK", callback_data="admin_lock_user")
-    )
-    kb.row(
-        InlineKeyboardButton("⭐ PREMIUM", callback_data="admin_premium_user"),
-        InlineKeyboardButton("❌ REMOVE", callback_data="admin_remove_premium")
     )
     kb.row(
         InlineKeyboardButton("📢 BROADCAST", callback_data="admin_broadcast"),
@@ -679,7 +673,7 @@ def admin_user_list_keyboard(users, page=0):
     for i in range(start, end):
         uid, username, fname = users[i][0], users[i][1], users[i][2]
         name = fname or username or f"User_{uid}"
-        kb.row(InlineKeyboardButton(f"👤 {name} (ID: {uid})", callback_data=f"admin_view_user_{uid}"))
+        kb.row(InlineKeyboardButton(f"👤 {name}", callback_data=f"admin_view_user_{uid}"))
     
     nav_buttons = []
     if page > 0:
@@ -787,11 +781,7 @@ def admin_command(message):
 Use the buttons below to manage your bot:
 
 📊 Stats - View bot statistics
-👥 Users - Manage users
-🔓 Unlock - Grant free access
-🔒 Lock - Revoke access
-⭐ Premium - Grant premium access
-❌ Remove - Remove premium
+👥 Users - Manage users (Unlock/Lock/Premium inside)
 📢 Broadcast - Send announcement
 📈 Analytics - Full analytics report
 
@@ -803,6 +793,437 @@ Use the buttons below to manage your bot:
         reply_markup=admin_main_keyboard(),
         parse_mode="HTML"
     )
+
+# ==================== AUTO MINING ENGINE (FIXED) ====================
+class AutoMiningEngine:
+    def __init__(self, bot, user_id, chat_id):
+        self.bot = bot
+        self.user_id = user_id
+        self.chat_id = chat_id
+        self.is_running = False
+        self.thread = None
+        self.total_earned = 0
+        self.total_gems = 0
+        self.total_played = 0
+        self.success_count = 0
+        self.status_msg_id = None
+    
+    def start_auto_mining(self):
+        if self.is_running:
+            return "⚠️ Mining already in progress!"
+        
+        sessions = get_all_sessions(self.user_id)
+        if not sessions:
+            return "❌ No saved accounts! Please login first."
+        
+        self.is_running = True
+        self.total_earned = 0
+        self.total_gems = 0
+        self.total_played = 0
+        self.success_count = 0
+        update_user(self.user_id, mining_active=1)
+        
+        self.thread = threading.Thread(target=self._run_auto_mining, daemon=True)
+        self.thread.start()
+        return f"✅ Auto-mining started with {len(sessions)} accounts!"
+    
+    def _send_progress(self, msg):
+        try:
+            if self.status_msg_id:
+                self.bot.edit_message_text(
+                    msg,
+                    chat_id=self.chat_id,
+                    message_id=self.status_msg_id,
+                    parse_mode="Markdown"
+                )
+            else:
+                sent = self.bot.send_message(
+                    self.chat_id,
+                    msg,
+                    parse_mode="Markdown"
+                )
+                self.status_msg_id = sent.message_id
+        except Exception as e:
+            if "message is not modified" not in str(e):
+                sent = self.bot.send_message(
+                    self.chat_id,
+                    msg,
+                    parse_mode="Markdown"
+                )
+                self.status_msg_id = sent.message_id
+    
+    def _run_auto_mining(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        sessions = get_all_sessions(self.user_id)
+        
+        valid_sessions = []
+        for phone, session_data in sessions:
+            if isinstance(session_data, dict) and session_data:
+                valid_sessions.append((phone, session_data))
+            else:
+                logger.warning(f"Invalid session data for {phone}, skipping")
+        
+        if not valid_sessions:
+            self._send_progress("❌ No valid sessions found! Please re-login.")
+            update_user(self.user_id, mining_active=0)
+            self.is_running = False
+            return
+        
+        initial_msg = f"""
+🚀 AUTO-MINING STARTED!
+
+📱 Accounts: {len(valid_sessions)}
+⏳ Processing one by one...
+"""
+        self._send_progress(initial_msg)
+        
+        async def status_callback(msg):
+            try:
+                current_msg = f"""
+🚀 AUTO-MINING IN PROGRESS...
+
+📱 Accounts: {len(valid_sessions)}
+✅ Completed: {self.success_count}
+💰 Total Earned: {self.total_earned} coins
+💎 Total Gems: {self.total_gems}
+
+{msg}
+"""
+                self._send_progress(current_msg)
+            except Exception as e:
+                logger.error(f"Status callback error: {e}")
+        
+        async def run():
+            results = []
+            
+            for idx, (phone, session_data) in enumerate(valid_sessions):
+                session_data["phone"] = phone
+                session_data["user_id"] = self.user_id
+                
+                await status_callback(f"📱 Account {idx+1}/{len(valid_sessions)}: +91{phone}")
+                
+                try:
+                    result = await mine_single_account(session_data, status_callback)
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Mining error for {phone}: {e}")
+                    await status_callback(f"❌ Error: {str(e)[:50]}")
+                    results.append({"status": "fail", "phone": phone, "msg": str(e)})
+                
+                if result.get("status") == "success":
+                    self.success_count += 1
+                    self.total_earned += result.get("earned", 0)
+                    self.total_gems += result.get("gems", 0)
+                    self.total_played += result.get("played", 0)
+                    save_mining_history(self.user_id, phone, result.get("earned", 0), result.get("played", 0), result.get("gems", 0))
+                
+                await asyncio.sleep(1)
+            
+            summary_msg = f"""
+✅ AUTO-MINING COMPLETE!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📱 Accounts Mined: {len(results)}
+✅ Successful: {self.success_count}
+💰 Total Coins Earned: {self.total_earned}
+💎 Total Gems Earned: {self.total_gems}
+🎮 Total Games Played: {self.total_played}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+            
+            for r in results:
+                if r.get("status") == "success":
+                    summary_msg += f"\n✅ +91{r['phone']} → +{r['earned']} coins"
+                else:
+                    summary_msg += f"\n❌ +91{r.get('phone', '?')} → {r.get('msg', 'Failed')}"
+            
+            self._send_progress(summary_msg)
+            
+            update_user(self.user_id, mining_active=0)
+            self.is_running = False
+        
+        try:
+            loop.run_until_complete(run())
+        except Exception as e:
+            logger.error(f"Auto mining error: {e}")
+            self._send_progress(f"❌ Error: {str(e)[:100]}")
+            update_user(self.user_id, mining_active=0)
+            self.is_running = False
+        finally:
+            loop.close()
+
+# ==================== MINING FUNCTIONS (FROM so.py) ====================
+def generate_ids():
+    return uuid.uuid4().hex[:32], f"{uuid.uuid4().hex[:32]}-{int(time.time() * 1000)}", f"{uuid.uuid4()}_{int(time.time()*1000)}"
+
+def sync_api_request(method, url_path, json_body, session_data, is_game=False):
+    if not isinstance(session_data, dict):
+        session_data = {}
+    
+    device_id = session_data.get("device_id") or uuid.uuid4().hex[:32]
+    visit_id = session_data.get("visit_id") or f"{uuid.uuid4().hex[:32]}-{int(time.time() * 1000)}"
+    app_sess = session_data.get("app_session_id") or f"{uuid.uuid4()}_{int(time.time()*1000)}"
+
+    if is_game:
+        headers = {
+            "x-user-agent": f"Mozilla/5.0 (Linux; Android 9; OPPO:CPH2083 Build/{device_id[:13]}) FKUA/Retail/2291170/Android/Mobile (OPPO/OPPO:CPH2083/{device_id})",
+            "sessionid": "session_id",
+            "Content-Type": "application/json; charset=UTF-8",
+            "User-Agent": "okhttp/4.9.2",
+            "Accept-Encoding": "gzip",
+            "Connection": "Keep-Alive",
+            "city": "Delhi"
+        }
+    else:
+        headers = {
+            "X-PARTNER-CONTEXT": '{"source":"reseller"}',
+            "FK-TENANT-ID": "SHOPSY",
+            "business": "reseller",
+            "Content-Type": "application/json; charset=UTF-8",
+            "User-Agent": "okhttp/4.9.2",
+            "X-User-Agent": f"Mozilla/5.0 (Linux; Android 9; CPH2083 Build/PPR1.180610.011) FKUA/Retail/2291170/Android/Mobile (OPPO/CPH2083/{device_id})",
+            "X-Visit-Id": visit_id,
+            "Accept-Encoding": "gzip",
+            "Connection": "Keep-Alive",
+            "city": "Delhi",
+            "X-AppSession-ID": app_sess
+        }
+        for k in ["at", "sn", "secureToken"]:
+            if session_data.get(k):
+                headers[k] = session_data[k]
+
+    req_session = cffi_requests.Session(impersonate="chrome110")
+
+    for attempt in range(1, 4):
+        dc = session_data.get("current_dc", "1")
+        url = f"https://{dc}.rome.api.flipkart.net{url_path}"
+        try:
+            resp = req_session.post(url, json=json_body, headers=headers, timeout=30, verify=False) if method == "POST" else req_session.get(url, headers=headers, timeout=30, verify=False)
+
+            try:
+                resp_json = resp.json()
+            except:
+                resp_json = {}
+
+            if resp.status_code == 406 and resp_json.get("ERROR_MESSAGE") == "DC Change":
+                new_dc = resp_json.get("RESPONSE", {}).get("id") or resp_json.get("RESPONSE", {}).get("dc")
+                if new_dc:
+                    session_data["current_dc"] = str(new_dc)
+                    continue
+
+            return resp.status_code, resp_json, dict(resp.headers), session_data
+        except Exception as e:
+            if attempt == 3:
+                return 500, {"error": str(e)}, {}, session_data
+            time.sleep(2)
+
+    return 500, {"error": "Max retries"}, {}, session_data
+
+def update_session(session_data, resp_json, resp_headers):
+    if not isinstance(session_data, dict):
+        session_data = {}
+    
+    if isinstance(resp_json, dict):
+        sess_block = resp_json.get("SESSION") or resp_json.get("RESPONSE", {}).get("SESSION") or {}
+        for k in ["accountId", "at", "rt", "sn", "secureToken", "nsid", "vid", "email", "firstName", "lastName"]:
+            if sess_block.get(k):
+                session_data[k] = sess_block[k]
+        if session_data.get("firstName"):
+            session_data["userName"] = f"{session_data.get('firstName', '')} {session_data.get('lastName', '')}".strip()
+        if sess_block.get("isLoggedIn") is not None:
+            session_data["isLoggedIn"] = sess_block["isLoggedIn"]
+    if resp_headers:
+        headers_lower = {k.lower(): v for k, v in resp_headers.items()}
+        for k in ["at", "rt", "sn", "nsid", "vid"]:
+            if k in headers_lower:
+                session_data[k] = headers_lower[k]
+        if headers_lower.get("securecookie"):
+            session_data["secureCookie"] = headers_lower.get("securecookie")
+    return session_data
+
+async def run_sh_user_state(session_data):
+    if not isinstance(session_data, dict):
+        session_data = {}
+    
+    body = {
+        "location": {"pincode": None},
+        "ad": {"adId": str(uuid.uuid4()), "doNotPersonalizeAds": False, "sdkAdId": "", "adSdkVersion": "2.12.0"},
+        "locale": {"deviceLanguage": "en", "shouldRefreshLanguage": False},
+        "versions": {
+            "cart": 1167987101,
+            "userAccountState": 0,
+            "abResponse": -2054295432,
+            "abVariables": 0,
+            "accountDetails": 1220048498,
+            "wishlist": 0,
+            "notifications": 861101,
+            "location": 23273,
+            "lockinResponse": 426889274
+        }
+    }
+    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/4/user/state", body, session_data, False)
+    return update_session(session_data, resp_json, headers)
+
+async def get_user_info_tg(session_data):
+    if not isinstance(session_data, dict):
+        session_data = {}
+    
+    body = {
+        "requestMethod": "GET",
+        "routeUri": "user/get-user",
+        "payload": {"userId": session_data.get("accountId", ""), "userName": session_data.get("userName", "User")}
+    }
+    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
+    if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
+        return resp_json["data"]
+    return None
+
+async def get_config_tg(session_data):
+    if not isinstance(session_data, dict):
+        session_data = {}
+    
+    body = {"requestMethod": "GET", "routeUri": "config/get-config", "payload": {}}
+    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
+    if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
+        return resp_json["data"]
+    return None
+
+async def claim_gullak_tg(session_data):
+    if not isinstance(session_data, dict):
+        session_data = {}
+    
+    body = {
+        "requestMethod": "POST",
+        "routeUri": "gullak/claim-gullak",
+        "payload": {"userId": session_data.get("accountId", "")}
+    }
+    await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
+
+async def start_game_tg(session_data, game_id):
+    if not isinstance(session_data, dict):
+        session_data = {}
+    
+    body = {
+        "requestMethod": "POST",
+        "routeUri": "game/game-started",
+        "payload": {"userId": session_data.get("accountId", ""), "gameId": game_id}
+    }
+    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
+    if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
+        return resp_json["data"].get("sessionId"), resp_json["data"]
+    return None, resp_json
+
+async def end_game_tg(session_data, game_id, game_session_id, play_time, gems_earned):
+    if not isinstance(session_data, dict):
+        session_data = {}
+    
+    body = {
+        "requestMethod": "POST",
+        "routeUri": "game/game-ended",
+        "payload": {
+            "userId": session_data.get("accountId", ""),
+            "gameId": game_id,
+            "sessionId": game_session_id,
+            "gemsEarned": gems_earned,
+            "playTimeInSec": play_time
+        }
+    }
+    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
+    if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
+        return resp_json["data"]
+    return None
+
+async def mine_single_account(session_data, status_callback=None):
+    if not isinstance(session_data, dict):
+        session_data = {}
+    
+    phone = session_data.get("phone", "Unknown")
+    
+    if status_callback:
+        await status_callback(f"📱 Account: +91{phone}")
+    
+    if status_callback:
+        await status_callback(f"🔄 Fetching user state...")
+    session_data = await run_sh_user_state(session_data)
+    
+    if status_callback:
+        await status_callback(f"💰 Getting balance...")
+    initial_user_data = await get_user_info_tg(session_data)
+    if not initial_user_data:
+        return {"status": "fail", "earned": 0, "msg": "Session expired", "phone": phone}
+    initial_coins = initial_user_data.get("earnings", {}).get("coinsEarnedTotal", 0)
+
+    if status_callback:
+        await status_callback(f"🎁 Claiming gullak...")
+    await claim_gullak_tg(session_data)
+
+    if status_callback:
+        await status_callback(f"🎮 Fetching games...")
+    config_data = await get_config_tg(session_data)
+    games = config_data.get("games", []) if config_data else []
+    if not games:
+        return {"status": "fail", "earned": 0, "msg": "No active games", "phone": phone}
+
+    total = len(games)
+    played_count = 0
+    total_gems = 0
+    
+    for i, g in enumerate(games):
+        game_id = g.get("id")
+        game_name = g.get("name", game_id)
+        
+        if status_callback:
+            await status_callback(f"🎮 [{i+1}/{total}] Playing {game_name}...")
+        
+        game_sess_id, _ = await start_game_tg(session_data, game_id)
+        if game_sess_id:
+            wait = random.randint(10, 13)
+            for sec in range(wait, 0, -1):
+                if sec % 5 == 0 or sec <= 3:
+                    if status_callback:
+                        await status_callback(f"⏳ {game_name}... {sec}s")
+                await asyncio.sleep(1)
+            
+            gems = random.randint(3000, 5000)
+            end_data = await end_game_tg(session_data, game_id, game_sess_id, wait, gems)
+            if end_data:
+                played_count += 1
+                total_gems += gems
+                if status_callback:
+                    await status_callback(f"✅ +{gems} gems from {game_name}")
+            else:
+                if status_callback:
+                    await status_callback(f"⚠️ Failed to complete {game_name}")
+        else:
+            if status_callback:
+                await status_callback(f"❌ Could not start {game_name}")
+        await asyncio.sleep(0.5)
+
+    if status_callback:
+        await status_callback(f"📊 Finalizing...")
+    final_user_data = await get_user_info_tg(session_data)
+    final_coins = final_user_data.get("earnings", {}).get("coinsEarnedTotal", 0) if final_user_data else initial_coins
+    earned = max(0, final_coins - initial_coins)
+
+    result = {
+        "status": "success",
+        "earned": earned,
+        "final_coins": final_coins,
+        "played": played_count,
+        "total": total,
+        "gems": total_gems,
+        "phone": phone
+    }
+    
+    if status_callback:
+        await status_callback(f"✅ Complete! +{earned} coins | {played_count}/{total} games | 💎{total_gems}")
+    
+    return result
+
+# ==================== GLOBAL STATES ====================
+mining_engines = {}
 
 # ==================== CALLBACK HANDLER ====================
 @bot.callback_query_handler(func=lambda call: True)
@@ -974,12 +1395,20 @@ def callback_handler(call):
             bot.answer_callback_query(call.id, "❌ No saved accounts! Add account first.", show_alert=True)
             return
         
-        bot.edit_message_text(
-            f"🚀 AUTO-MINING STARTED!\n\n📱 Accounts: {len(sessions)}\n⏳ Processing...\n\n_Progress will appear here._",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode="Markdown"
-        )
+        engine = AutoMiningEngine(bot, user_id, call.message.chat.id)
+        mining_engines[user_id] = engine
+        result = engine.start_auto_mining()
+        
+        if "✅" in result:
+            bot.edit_message_text(
+                f"🚀 AUTO-MINING STARTED!\n\n📱 Accounts: {len(sessions)}\n⏳ Processing...\n\n_Progress will appear here._",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="Markdown"
+            )
+        else:
+            bot.answer_callback_query(call.id, result, show_alert=True)
+        
         bot.answer_callback_query(call.id)
         return
     
@@ -1004,7 +1433,7 @@ def callback_handler(call):
         return
     
     # ============================================================
-    # ADMIN CALLBACKS - ALL WORKING
+    # ADMIN CALLBACKS
     # ============================================================
     
     if data == "admin_panel":
@@ -1267,152 +1696,6 @@ def callback_handler(call):
         )
         bot.answer_callback_query(call.id)
         return
-    
-    # Admin action buttons (direct)
-    if data == "admin_unlock_user":
-        if user_id != ADMIN_ID:
-            bot.answer_callback_query(call.id, "❌ Unauthorized!")
-            return
-        bot.edit_message_text(
-            "🔓 UNLOCK USER\n\nEnter the User ID to unlock:\nSend /cancel to abort.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        bot.register_next_step_handler(call.message, admin_unlock_user_handler)
-        return
-    
-    if data == "admin_lock_user":
-        if user_id != ADMIN_ID:
-            bot.answer_callback_query(call.id, "❌ Unauthorized!")
-            return
-        bot.edit_message_text(
-            "🔒 LOCK USER\n\nEnter the User ID to lock:\nSend /cancel to abort.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        bot.register_next_step_handler(call.message, admin_lock_user_handler)
-        return
-    
-    if data == "admin_premium_user":
-        if user_id != ADMIN_ID:
-            bot.answer_callback_query(call.id, "❌ Unauthorized!")
-            return
-        bot.edit_message_text(
-            "⭐ GRANT PREMIUM\n\nEnter the User ID to grant premium access:\nSend /cancel to abort.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        bot.register_next_step_handler(call.message, admin_premium_user_handler)
-        return
-    
-    if data == "admin_remove_premium":
-        if user_id != ADMIN_ID:
-            bot.answer_callback_query(call.id, "❌ Unauthorized!")
-            return
-        bot.edit_message_text(
-            "❌ REMOVE PREMIUM\n\nEnter the User ID to remove premium access:\nSend /cancel to abort.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        bot.register_next_step_handler(call.message, admin_remove_premium_handler)
-        return
-
-# ==================== ADMIN HANDLER FUNCTIONS ====================
-def admin_unlock_user_handler(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    if message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Cancelled.")
-        admin_command(message)
-        return
-    try:
-        target_id = int(message.text.strip())
-        target_user = get_user(target_id)
-        if not target_user:
-            bot.reply_to(message, f"❌ User {target_id} not found!")
-            admin_command(message)
-            return
-        update_user(target_id, is_unlocked=1, status='ACTIVE')
-        bot.reply_to(message, f"✅ User {target_id} unlocked!")
-        admin_command(message)
-    except ValueError:
-        bot.reply_to(message, "❌ Invalid User ID!")
-        admin_command(message)
-
-def admin_lock_user_handler(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    if message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Cancelled.")
-        admin_command(message)
-        return
-    try:
-        target_id = int(message.text.strip())
-        target_user = get_user(target_id)
-        if not target_user:
-            bot.reply_to(message, f"❌ User {target_id} not found!")
-            admin_command(message)
-            return
-        update_user(target_id, is_unlocked=0, is_premium=0, status='LOCKED')
-        bot.reply_to(message, f"✅ User {target_id} locked!")
-        admin_command(message)
-    except ValueError:
-        bot.reply_to(message, "❌ Invalid User ID!")
-        admin_command(message)
-
-def admin_premium_user_handler(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    if message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Cancelled.")
-        admin_command(message)
-        return
-    try:
-        target_id = int(message.text.strip())
-        target_user = get_user(target_id)
-        if not target_user:
-            bot.reply_to(message, f"❌ User {target_id} not found!")
-            admin_command(message)
-            return
-        update_user(target_id, is_premium=1, is_unlocked=1, status='ACTIVE')
-        bot.reply_to(message, f"⭐ User {target_id} premium granted!")
-        admin_command(message)
-    except ValueError:
-        bot.reply_to(message, "❌ Invalid User ID!")
-        admin_command(message)
-
-def admin_remove_premium_handler(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    if message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Cancelled.")
-        admin_command(message)
-        return
-    try:
-        target_id = int(message.text.strip())
-        target_user = get_user(target_id)
-        if not target_user:
-            bot.reply_to(message, f"❌ User {target_id} not found!")
-            admin_command(message)
-            return
-        update_user(target_id, is_premium=0)
-        bot.reply_to(message, f"❌ User {target_id} premium removed!")
-        admin_command(message)
-    except ValueError:
-        bot.reply_to(message, "❌ Invalid User ID!")
-        admin_command(message)
 
 # ==================== BROADCAST HANDLER ====================
 def broadcast_handler(message):
@@ -1532,13 +1815,13 @@ if __name__ == "__main__":
     task_thread.start()
     
     logger.info("=" * 60)
-    logger.info("🚀 VIEDIET PREMIUM BOT v11.0 - POLLING MODE")
+    logger.info("🚀 VIEDIET PREMIUM BOT v12.0")
     logger.info("=" * 60)
     logger.info("🔒 Referrals Required: 6")
     logger.info("📱 Login: JSON ONLY")
     logger.info("📢 Channel: @{}".format(CHANNEL_USERNAME))
-    logger.info("👑 Admin: BUTTON BASED")
-    logger.info("🔄 Mode: POLLING (No webhook)")
+    logger.info("👑 Admin: CLEAN BUTTON PANEL")
+    logger.info("🔄 Mode: POLLING")
     logger.info("=" * 60)
     
     # Remove webhook if any
@@ -1548,7 +1831,7 @@ if __name__ == "__main__":
     except Exception as e:
         logger.warning(f"Webhook removal: {e}")
     
-    time.sleep(1)
+    time.sleep(2)
     
     # Start polling - SINGLE INSTANCE
     logger.info("🔄 Starting polling...")
@@ -1556,5 +1839,4 @@ if __name__ == "__main__":
         bot.polling(non_stop=True, interval=1, timeout=30)
     except Exception as e:
         logger.error(f"Polling error: {e}")
-        # Don't restart, just exit
         sys.exit(1)
