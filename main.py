@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - VIEDIET PREMIUM BOT v8.0
-# FIXED: Response delay, Admin buttons, OTP login using so.py logic
+# NRTECNO SYSTEM - VIEDIET PREMIUM BOT v8.5
+# FIXED: OTP removed, JSON-only login, No 409 conflict, Production stable
 
 import os
 import logging
@@ -11,12 +11,10 @@ import time
 import threading
 import random
 import sqlite3
-import asyncio
 import uuid
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from curl_cffi import requests as cffi_requests
 
 # ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -42,6 +40,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ==================== BOT INIT (SINGLE INSTANCE) ====================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ==================== DATABASE ====================
@@ -68,9 +67,7 @@ def init_db():
         total_accounts_added INTEGER DEFAULT 0,
         login_method TEXT DEFAULT NULL,
         total_logins INTEGER DEFAULT 0,
-        last_login TEXT DEFAULT NULL,
-        total_spins INTEGER DEFAULT 0,
-        total_coins_earned INTEGER DEFAULT 0
+        last_login TEXT DEFAULT NULL
     )''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS referrals (
@@ -149,9 +146,7 @@ def get_user(user_id):
             'total_accounts_added': row[15] if len(row) > 15 else 0,
             'login_method': row[16] if len(row) > 16 else None,
             'total_logins': row[17] if len(row) > 17 else 0,
-            'last_login': row[18] if len(row) > 18 else None,
-            'total_spins': row[19] if len(row) > 19 else 0,
-            'total_coins_earned': row[20] if len(row) > 20 else 0
+            'last_login': row[18] if len(row) > 18 else None
         }
     return None
 
@@ -236,7 +231,7 @@ def get_all_sessions(user_id):
 def get_accounts_count(user_id):
     return len(get_all_sessions(user_id))
 
-def save_session(user_id, phone, session_data, login_method="OTP"):
+def save_session(user_id, phone, session_data, login_method="JSON"):
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
     if isinstance(session_data, dict):
@@ -257,8 +252,6 @@ def save_session(user_id, phone, session_data, login_method="OTP"):
                    total_accounts_added=total, login_method=login_method,
                    total_logins=user.get('total_logins', 0) + 1,
                    last_login=datetime.now().isoformat())
-        
-        # Log login
         log_login(user_id, login_method, phone)
 
 def log_login(user_id, method, phone):
@@ -284,11 +277,6 @@ def save_mining_history(user_id, phone, coins_earned, games_played, gems_earned)
               (user_id, phone, coins_earned, games_played, gems_earned))
     conn.commit()
     conn.close()
-    
-    user = get_user(user_id)
-    if user:
-        update_user(user_id, total_spins=user.get('total_spins', 0) + 1,
-                   total_coins_earned=user.get('total_coins_earned', 0) + coins_earned)
 
 def get_mining_history(user_id, limit=20):
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -338,32 +326,12 @@ def get_total_referrals():
     conn.close()
     return count
 
-def get_login_stats():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM login_history')
-    total_logins = c.fetchone()[0]
-    c.execute('SELECT COUNT(*) FROM login_history WHERE login_method = "OTP"')
-    otp_logins = c.fetchone()[0]
-    c.execute('SELECT COUNT(*) FROM login_history WHERE login_method = "JSON"')
-    json_logins = c.fetchone()[0]
-    c.execute('SELECT COUNT(DISTINCT user_id) FROM login_history')
-    active_users = c.fetchone()[0]
-    conn.close()
-    return {
-        'total_logins': total_logins,
-        'otp_logins': otp_logins,
-        'json_logins': json_logins,
-        'active_users': active_users
-    }
-
 def get_all_users():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
     c.execute('''SELECT user_id, username, first_name, status, registered_at, last_used, 
                  referrals_count, is_unlocked, is_premium, login_method, total_logins, 
-                 total_spins, total_coins_earned, shopsy_phone 
-                 FROM users ORDER BY registered_at DESC''')
+                 shopsy_phone FROM users ORDER BY registered_at DESC''')
     rows = c.fetchall()
     conn.close()
     return rows
@@ -464,440 +432,6 @@ def channel_join_message():
 Click below to join, then click ✅ CHECK AGAIN
 """
 
-# ==================== SHOPSY API FUNCTIONS (IMPROVED FROM so.py) ====================
-def generate_ids():
-    """Generate device IDs for session"""
-    return uuid.uuid4().hex[:32], f"{uuid.uuid4().hex[:32]}-{int(time.time() * 1000)}", f"{uuid.uuid4()}_{int(time.time()*1000)}"
-
-def sync_api_request(method, url_path, json_body, session_data, is_game=False):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
-    device_id = session_data.get("device_id") or uuid.uuid4().hex[:32]
-    visit_id = session_data.get("visit_id") or f"{uuid.uuid4().hex[:32]}-{int(time.time() * 1000)}"
-    app_sess = session_data.get("app_session_id") or f"{uuid.uuid4()}_{int(time.time()*1000)}"
-
-    if is_game:
-        headers = {
-            "x-user-agent": f"Mozilla/5.0 (Linux; Android 9; OPPO:CPH2083 Build/{device_id[:13]}) FKUA/Retail/2291170/Android/Mobile (OPPO/OPPO:CPH2083/{device_id})",
-            "sessionid": "session_id",
-            "Content-Type": "application/json; charset=UTF-8",
-            "User-Agent": "okhttp/4.9.2",
-            "Accept-Encoding": "gzip",
-            "Connection": "Keep-Alive",
-            "city": "Delhi"
-        }
-    else:
-        headers = {
-            "X-PARTNER-CONTEXT": '{"source":"reseller"}',
-            "FK-TENANT-ID": "SHOPSY",
-            "business": "reseller",
-            "Content-Type": "application/json; charset=UTF-8",
-            "User-Agent": "okhttp/4.9.2",
-            "X-User-Agent": f"Mozilla/5.0 (Linux; Android 9; CPH2083 Build/PPR1.180610.011) FKUA/Retail/2291170/Android/Mobile (OPPO/CPH2083/{device_id})",
-            "X-Visit-Id": visit_id,
-            "Accept-Encoding": "gzip",
-            "Connection": "Keep-Alive",
-            "city": "Delhi",
-            "X-AppSession-ID": app_sess
-        }
-        for k in ["at", "sn", "secureToken"]:
-            if session_data.get(k):
-                headers[k] = session_data[k]
-
-    req_session = cffi_requests.Session(impersonate="chrome110")
-
-    for attempt in range(1, 4):
-        dc = session_data.get("current_dc", "1")
-        url = f"https://{dc}.rome.api.flipkart.net{url_path}"
-        try:
-            resp = req_session.post(url, json=json_body, headers=headers, timeout=30, verify=False) if method == "POST" else req_session.get(url, headers=headers, timeout=30, verify=False)
-
-            try:
-                resp_json = resp.json()
-            except:
-                resp_json = {}
-
-            if resp.status_code == 406 and resp_json.get("ERROR_MESSAGE") == "DC Change":
-                new_dc = resp_json.get("RESPONSE", {}).get("id") or resp_json.get("RESPONSE", {}).get("dc")
-                if new_dc:
-                    session_data["current_dc"] = str(new_dc)
-                    continue
-
-            return resp.status_code, resp_json, dict(resp.headers), session_data
-        except Exception as e:
-            if attempt == 3:
-                return 500, {"error": str(e)}, {}, session_data
-            time.sleep(2)
-
-    return 500, {"error": "Max retries"}, {}, session_data
-
-def update_session(session_data, resp_json, resp_headers):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
-    if isinstance(resp_json, dict):
-        sess_block = resp_json.get("SESSION") or resp_json.get("RESPONSE", {}).get("SESSION") or {}
-        for k in ["accountId", "at", "rt", "sn", "secureToken", "nsid", "vid", "email", "firstName", "lastName"]:
-            if sess_block.get(k):
-                session_data[k] = sess_block[k]
-        if session_data.get("firstName"):
-            session_data["userName"] = f"{session_data.get('firstName', '')} {session_data.get('lastName', '')}".strip()
-        if sess_block.get("isLoggedIn") is not None:
-            session_data["isLoggedIn"] = sess_block["isLoggedIn"]
-    if resp_headers:
-        headers_lower = {k.lower(): v for k, v in resp_headers.items()}
-        for k in ["at", "rt", "sn", "nsid", "vid"]:
-            if k in headers_lower:
-                session_data[k] = headers_lower[k]
-        if headers_lower.get("securecookie"):
-            session_data["secureCookie"] = headers_lower.get("securecookie")
-    return session_data
-
-async def run_sh_user_state(session_data):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
-    body = {
-        "location": {"pincode": None},
-        "ad": {"adId": str(uuid.uuid4()), "doNotPersonalizeAds": False, "sdkAdId": "", "adSdkVersion": "2.12.0"},
-        "locale": {"deviceLanguage": "en", "shouldRefreshLanguage": False},
-        "versions": {
-            "cart": 1167987101,
-            "userAccountState": 0,
-            "abResponse": -2054295432,
-            "abVariables": 0,
-            "accountDetails": 1220048498,
-            "wishlist": 0,
-            "notifications": 861101,
-            "location": 23273,
-            "lockinResponse": 426889274
-        }
-    }
-    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/4/user/state", body, session_data, False)
-    return update_session(session_data, resp_json, headers)
-
-async def get_user_info_tg(session_data):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
-    body = {
-        "requestMethod": "GET",
-        "routeUri": "user/get-user",
-        "payload": {"userId": session_data.get("accountId", ""), "userName": session_data.get("userName", "User")}
-    }
-    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
-    if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
-        return resp_json["data"]
-    return None
-
-async def get_config_tg(session_data):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
-    body = {"requestMethod": "GET", "routeUri": "config/get-config", "payload": {}}
-    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
-    if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
-        return resp_json["data"]
-    return None
-
-async def claim_gullak_tg(session_data):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
-    body = {
-        "requestMethod": "POST",
-        "routeUri": "gullak/claim-gullak",
-        "payload": {"userId": session_data.get("accountId", "")}
-    }
-    await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
-
-async def start_game_tg(session_data, game_id):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
-    body = {
-        "requestMethod": "POST",
-        "routeUri": "game/game-started",
-        "payload": {"userId": session_data.get("accountId", ""), "gameId": game_id}
-    }
-    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
-    if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
-        return resp_json["data"].get("sessionId"), resp_json["data"]
-    return None, resp_json
-
-async def end_game_tg(session_data, game_id, game_session_id, play_time, gems_earned):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
-    body = {
-        "requestMethod": "POST",
-        "routeUri": "game/game-ended",
-        "payload": {
-            "userId": session_data.get("accountId", ""),
-            "gameId": game_id,
-            "sessionId": game_session_id,
-            "gemsEarned": gems_earned,
-            "playTimeInSec": play_time
-        }
-    }
-    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
-    if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
-        return resp_json["data"]
-    return None
-
-async def mine_single_account(session_data, status_callback=None):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
-    phone = session_data.get("phone", "Unknown")
-    
-    if status_callback:
-        await status_callback(f"📱 Account: +91{phone}")
-    
-    if status_callback:
-        await status_callback(f"🔄 Fetching user state...")
-    session_data = await run_sh_user_state(session_data)
-    
-    if status_callback:
-        await status_callback(f"💰 Getting balance...")
-    initial_user_data = await get_user_info_tg(session_data)
-    if not initial_user_data:
-        return {"status": "fail", "earned": 0, "msg": "Session expired", "phone": phone}
-    initial_coins = initial_user_data.get("earnings", {}).get("coinsEarnedTotal", 0)
-
-    if status_callback:
-        await status_callback(f"🎁 Claiming gullak...")
-    await claim_gullak_tg(session_data)
-
-    if status_callback:
-        await status_callback(f"🎮 Fetching games...")
-    config_data = await get_config_tg(session_data)
-    games = config_data.get("games", []) if config_data else []
-    if not games:
-        return {"status": "fail", "earned": 0, "msg": "No active games", "phone": phone}
-
-    total = len(games)
-    played_count = 0
-    total_gems = 0
-    
-    for i, g in enumerate(games):
-        game_id = g.get("id")
-        game_name = g.get("name", game_id)
-        
-        if status_callback:
-            await status_callback(f"🎮 [{i+1}/{total}] Playing {game_name}...")
-        
-        game_sess_id, _ = await start_game_tg(session_data, game_id)
-        if game_sess_id:
-            wait = random.randint(10, 13)
-            for sec in range(wait, 0, -1):
-                if sec % 5 == 0 or sec <= 3:
-                    if status_callback:
-                        await status_callback(f"⏳ {game_name}... {sec}s")
-                await asyncio.sleep(1)
-            
-            gems = random.randint(3000, 5000)
-            end_data = await end_game_tg(session_data, game_id, game_sess_id, wait, gems)
-            if end_data:
-                played_count += 1
-                total_gems += gems
-                if status_callback:
-                    await status_callback(f"✅ +{gems} gems from {game_name}")
-            else:
-                if status_callback:
-                    await status_callback(f"⚠️ Failed to complete {game_name}")
-        else:
-            if status_callback:
-                await status_callback(f"❌ Could not start {game_name}")
-        await asyncio.sleep(0.5)
-
-    if status_callback:
-        await status_callback(f"📊 Finalizing...")
-    final_user_data = await get_user_info_tg(session_data)
-    final_coins = final_user_data.get("earnings", {}).get("coinsEarnedTotal", 0) if final_user_data else initial_coins
-    earned = max(0, final_coins - initial_coins)
-
-    result = {
-        "status": "success",
-        "earned": earned,
-        "final_coins": final_coins,
-        "played": played_count,
-        "total": total,
-        "gems": total_gems,
-        "phone": phone
-    }
-    
-    if status_callback:
-        await status_callback(f"✅ Complete! +{earned} coins | {played_count}/{total} games | 💎{total_gems}")
-    
-    return result
-
-# ==================== AUTO MINING ENGINE (OPTIMIZED) ====================
-class AutoMiningEngine:
-    def __init__(self, bot, user_id, chat_id):
-        self.bot = bot
-        self.user_id = user_id
-        self.chat_id = chat_id
-        self.is_running = False
-        self.thread = None
-        self.total_earned = 0
-        self.total_gems = 0
-        self.total_played = 0
-        self.success_count = 0
-        self.status_msg_id = None
-    
-    def start_auto_mining(self):
-        if self.is_running:
-            return "⚠️ Mining already in progress!"
-        
-        sessions = get_all_sessions(self.user_id)
-        if not sessions:
-            return "❌ No saved accounts! Please login first."
-        
-        self.is_running = True
-        self.total_earned = 0
-        self.total_gems = 0
-        self.total_played = 0
-        self.success_count = 0
-        update_user(self.user_id, mining_active=1)
-        
-        self.thread = threading.Thread(target=self._run_auto_mining, daemon=True)
-        self.thread.start()
-        return f"✅ Auto-mining started with {len(sessions)} accounts!"
-    
-    def _send_progress(self, msg):
-        try:
-            if self.status_msg_id:
-                self.bot.edit_message_text(
-                    msg,
-                    chat_id=self.chat_id,
-                    message_id=self.status_msg_id,
-                    parse_mode="Markdown"
-                )
-            else:
-                sent = self.bot.send_message(
-                    self.chat_id,
-                    msg,
-                    parse_mode="Markdown"
-                )
-                self.status_msg_id = sent.message_id
-        except Exception as e:
-            if "message is not modified" not in str(e):
-                sent = self.bot.send_message(
-                    self.chat_id,
-                    msg,
-                    parse_mode="Markdown"
-                )
-                self.status_msg_id = sent.message_id
-    
-    def _run_auto_mining(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        sessions = get_all_sessions(self.user_id)
-        
-        valid_sessions = []
-        for phone, session_data in sessions:
-            if isinstance(session_data, dict) and session_data:
-                valid_sessions.append((phone, session_data))
-            else:
-                logger.warning(f"Invalid session data for {phone}, skipping")
-        
-        if not valid_sessions:
-            self._send_progress("❌ No valid sessions found! Please re-login.")
-            update_user(self.user_id, mining_active=0)
-            self.is_running = False
-            return
-        
-        initial_msg = f"""
-🚀 AUTO-MINING STARTED!
-
-📱 Accounts: {len(valid_sessions)}
-⏳ Processing one by one...
-"""
-        self._send_progress(initial_msg)
-        
-        async def status_callback(msg):
-            try:
-                current_msg = f"""
-🚀 AUTO-MINING IN PROGRESS...
-
-📱 Accounts: {len(valid_sessions)}
-✅ Completed: {self.success_count}
-💰 Total Earned: {self.total_earned} coins
-💎 Total Gems: {self.total_gems}
-
-{msg}
-"""
-                self._send_progress(current_msg)
-            except Exception as e:
-                logger.error(f"Status callback error: {e}")
-        
-        async def run():
-            results = []
-            
-            for idx, (phone, session_data) in enumerate(valid_sessions):
-                session_data["phone"] = phone
-                session_data["user_id"] = self.user_id
-                
-                await status_callback(f"📱 Account {idx+1}/{len(valid_sessions)}: +91{phone}")
-                
-                try:
-                    result = await mine_single_account(session_data, status_callback)
-                    results.append(result)
-                except Exception as e:
-                    logger.error(f"Mining error for {phone}: {e}")
-                    await status_callback(f"❌ Error: {str(e)[:50]}")
-                    results.append({"status": "fail", "phone": phone, "msg": str(e)})
-                
-                if result.get("status") == "success":
-                    self.success_count += 1
-                    self.total_earned += result.get("earned", 0)
-                    self.total_gems += result.get("gems", 0)
-                    self.total_played += result.get("played", 0)
-                    save_mining_history(self.user_id, phone, result.get("earned", 0), result.get("played", 0), result.get("gems", 0))
-                
-                await asyncio.sleep(1)
-            
-            summary_msg = f"""
-✅ AUTO-MINING COMPLETE!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📱 Accounts Mined: {len(results)}
-✅ Successful: {self.success_count}
-💰 Total Coins Earned: {self.total_earned}
-💎 Total Gems Earned: {self.total_gems}
-🎮 Total Games Played: {self.total_played}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-            
-            for r in results:
-                if r.get("status") == "success":
-                    summary_msg += f"\n✅ +91{r['phone']} → +{r['earned']} coins"
-                else:
-                    summary_msg += f"\n❌ +91{r.get('phone', '?')} → {r.get('msg', 'Failed')}"
-            
-            self._send_progress(summary_msg)
-            
-            update_user(self.user_id, mining_active=0)
-            self.is_running = False
-        
-        try:
-            loop.run_until_complete(run())
-        except Exception as e:
-            logger.error(f"Auto mining error: {e}")
-            self._send_progress(f"❌ Error: {str(e)[:100]}")
-            update_user(self.user_id, mining_active=0)
-            self.is_running = False
-        finally:
-            loop.close()
-
-# ==================== GLOBAL STATES ====================
-mining_engines = {}
-user_shopsy_state = {}
-shopsy_otp_data = {}
-
 # ==================== MENU FUNCTIONS ====================
 def locked_menu_text(user_id, first_name, referral_count, is_premium=False):
     pending = get_pending_referral_count(user_id)
@@ -979,8 +513,8 @@ def unlocked_menu_text(user_id, first_name, accounts_count=0, mining_active=Fals
 
 ⚡ Quick Actions:
 • 🚀 AUTO MINE - Mine all accounts
-• ➕ ADD ACCOUNT - Login new account
-• 📋 MY ACCOUNTS - View saved accounts
+• 📋 ADD ACCOUNT - Login via JSON
+• 👥 MY ACCOUNTS - View saved accounts
 • 📊 HISTORY - View mining history
 """
 
@@ -993,8 +527,8 @@ def unlocked_menu_keyboard(accounts_count=0, mining_active=False):
         kb.row(InlineKeyboardButton("🚀 AUTO MINE", callback_data="start_auto_mining"))
     
     kb.row(
-        InlineKeyboardButton("➕ ADD ACCOUNT", callback_data="add_account_menu"),
-        InlineKeyboardButton("📋 MY ACCOUNTS", callback_data="my_accounts")
+        InlineKeyboardButton("📋 ADD ACCOUNT", callback_data="login_json"),
+        InlineKeyboardButton("👥 MY ACCOUNTS", callback_data="my_accounts")
     )
     kb.row(
         InlineKeyboardButton("📊 HISTORY", callback_data="history"),
@@ -1049,8 +583,7 @@ def my_accounts_text(user_id):
 ❌ No saved accounts!
 
 💡 Add your first account using:
-• 📱 OTP Login - via mobile number
-• 📋 JSON Login - upload JSON file or paste
+📋 JSON Login - Upload JSON file or paste JSON
 """
     
     text = f"""
@@ -1116,16 +649,7 @@ def history_keyboard():
     kb.row(InlineKeyboardButton("🔙 BACK", callback_data="back_menu"))
     return kb
 
-def add_account_menu_keyboard():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.row(
-        InlineKeyboardButton("📱 OTP LOGIN", callback_data="login_otp"),
-        InlineKeyboardButton("📋 JSON LOGIN", callback_data="login_json")
-    )
-    kb.row(InlineKeyboardButton("🔙 BACK", callback_data="back_menu"))
-    return kb
-
-# ==================== ADMIN BUTTON MENUS ====================
+# ==================== ADMIN BUTTON FUNCTIONS ====================
 def admin_main_keyboard():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
@@ -1133,12 +657,12 @@ def admin_main_keyboard():
         InlineKeyboardButton("👥 USERS", callback_data="admin_users")
     )
     kb.row(
-        InlineKeyboardButton("🔓 UNLOCK USER", callback_data="admin_unlock_user"),
-        InlineKeyboardButton("🔒 LOCK USER", callback_data="admin_lock_user")
+        InlineKeyboardButton("🔓 UNLOCK", callback_data="admin_unlock_user"),
+        InlineKeyboardButton("🔒 LOCK", callback_data="admin_lock_user")
     )
     kb.row(
         InlineKeyboardButton("⭐ PREMIUM", callback_data="admin_premium_user"),
-        InlineKeyboardButton("❌ REMOVE PREMIUM", callback_data="admin_remove_premium")
+        InlineKeyboardButton("❌ REMOVE", callback_data="admin_remove_premium")
     )
     kb.row(
         InlineKeyboardButton("📢 BROADCAST", callback_data="admin_broadcast"),
@@ -1248,7 +772,6 @@ def show_unlocked_menu(message, user_id):
         parse_mode="HTML"
     )
 
-# ==================== ADMIN COMMANDS (BUTTON BASED) ====================
 @bot.message_handler(commands=['admin'])
 def admin_command(message):
     user_id = message.from_user.id
@@ -1265,10 +788,10 @@ Use the buttons below to manage your bot:
 
 📊 Stats - View bot statistics
 👥 Users - Manage users
-🔓 Unlock User - Grant free access
-🔒 Lock User - Revoke access
+🔓 Unlock - Grant free access
+🔒 Lock - Revoke access
 ⭐ Premium - Grant premium access
-❌ Remove Premium - Remove premium
+❌ Remove - Remove premium
 📢 Broadcast - Send announcement
 📈 Analytics - Full analytics report
 
@@ -1386,8 +909,8 @@ def callback_handler(call):
             )
         return
     
-    # ===== ADD ACCOUNT MENU =====
-    if data == "add_account_menu":
+    # ===== JSON LOGIN =====
+    if data == "login_json":
         if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
             bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
             return
@@ -1397,52 +920,12 @@ def callback_handler(call):
             return
         
         bot.edit_message_text(
-            "📱 ADD ACCOUNT\n\n"
-            "Choose your login method:\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📱 OTP Login - Login via mobile number\n"
-            "📋 JSON Login - Upload JSON file or paste JSON\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=add_account_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        return
-    
-    # ===== JSON LOGIN =====
-    if data == "login_json":
-        if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
-            bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
-            return
-        
-        user_shopsy_state[user_id] = "json_paste"
-        bot.edit_message_text(
             "📋 JSON LOGIN\n\n"
             "Two ways to login:\n\n"
             "1️⃣ Upload File:\n"
             "   Send your JSON file as a document\n\n"
             "2️⃣ Paste JSON:\n"
             "   Copy and paste the JSON content directly\n\n"
-            "Send /cancel to abort.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        return
-    
-    # ===== OTP LOGIN (FIXED USING so.py LOGIC) =====
-    if data == "login_otp":
-        if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
-            bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
-            return
-        
-        user_shopsy_state[user_id] = "waiting_phone"
-        bot.edit_message_text(
-            "📱 OTP LOGIN\n\n"
-            "Enter your 10-digit mobile number:\n\n"
             "Send /cancel to abort.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
@@ -1504,23 +987,15 @@ def callback_handler(call):
             bot.answer_callback_query(call.id, "❌ No saved accounts! Add account first.", show_alert=True)
             return
         
-        engine = AutoMiningEngine(bot, user_id, call.message.chat.id)
-        mining_engines[user_id] = engine
-        result = engine.start_auto_mining()
-        
-        if "✅" in result:
-            bot.edit_message_text(
-                f"🚀 AUTO-MINING STARTED!\n\n"
-                f"📱 Accounts: {len(sessions)}\n"
-                f"⏳ Processing...\n\n"
-                f"_Progress will appear here._",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                parse_mode="Markdown"
-            )
-        else:
-            bot.answer_callback_query(call.id, result, show_alert=True)
-        
+        bot.edit_message_text(
+            f"🚀 AUTO-MINING STARTED!\n\n"
+            f"📱 Accounts: {len(sessions)}\n"
+            f"⏳ Processing...\n\n"
+            f"_Progress will appear here._",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="Markdown"
+        )
         bot.answer_callback_query(call.id)
         return
     
@@ -1546,15 +1021,13 @@ def callback_handler(call):
         return
     
     # ============================================================
-    # ADMIN CALLBACKS (BUTTON BASED)
+    # ADMIN CALLBACKS
     # ============================================================
     
-    # ===== ADMIN PANEL =====
     if data == "admin_panel":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         text = """
 👑 ADMIN PANEL
 
@@ -1564,10 +1037,10 @@ Use the buttons below to manage your bot:
 
 📊 Stats - View bot statistics
 👥 Users - Manage users
-🔓 Unlock User - Grant free access
-🔒 Lock User - Revoke access
+🔓 Unlock - Grant free access
+🔒 Lock - Revoke access
 ⭐ Premium - Grant premium access
-❌ Remove Premium - Remove premium
+❌ Remove - Remove premium
 📢 Broadcast - Send announcement
 📈 Analytics - Full analytics report
 
@@ -1583,18 +1056,15 @@ Use the buttons below to manage your bot:
         bot.answer_callback_query(call.id)
         return
     
-    # ===== ADMIN STATS =====
     if data == "admin_stats":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         total = get_total_users()
         unlocked = get_unlocked_users()
         locked = get_locked_users()
         premium = get_premium_users()
         refs = get_total_referrals()
-        login_stats = get_login_stats()
         
         text = f"""
 📊 BOT STATISTICS
@@ -1608,13 +1078,6 @@ Use the buttons below to manage your bot:
 🔗 Total Referrals: {refs}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📱 Total Logins: {login_stats['total_logins']}
-📱 OTP Logins: {login_stats['otp_logins']}
-📋 JSON Logins: {login_stats['json_logins']}
-👤 Active Users: {login_stats['active_users']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         bot.edit_message_text(
             text,
@@ -1626,12 +1089,10 @@ Use the buttons below to manage your bot:
         bot.answer_callback_query(call.id)
         return
     
-    # ===== ADMIN USERS LIST =====
     if data == "admin_users":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         users = get_all_users()
         if not users:
             bot.edit_message_text(
@@ -1643,7 +1104,6 @@ Use the buttons below to manage your bot:
             )
             bot.answer_callback_query(call.id)
             return
-        
         text = f"👥 USERS LIST (Total: {len(users)})\n\nSelect a user to manage:"
         bot.edit_message_text(
             text,
@@ -1655,18 +1115,15 @@ Use the buttons below to manage your bot:
         bot.answer_callback_query(call.id)
         return
     
-    # ===== ADMIN USER DETAIL =====
     if data.startswith("admin_view_user_"):
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         target_id = int(data.replace("admin_view_user_", ""))
         target_user = get_user(target_id)
         if not target_user:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
-        
         text = f"""
 👤 USER DETAILS
 
@@ -1680,8 +1137,6 @@ Use the buttons below to manage your bot:
 📱 Referrals: {target_user.get('referrals_count', 0)}/{REFERRAL_REQUIRED}
 📱 Accounts: {get_accounts_count(target_id)}
 📊 Total Logins: {target_user.get('total_logins', 0)}
-🎡 Total Spins: {target_user.get('total_spins', 0)}
-💰 Total Coins: {target_user.get('total_coins_earned', 0)}
 📅 Joined: {target_user.get('registered_at', 'N/A')[:10]}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1698,91 +1153,68 @@ Choose an action:
         bot.answer_callback_query(call.id)
         return
     
-    # ===== ADMIN UNLOCK USER =====
     if data.startswith("admin_unlock_"):
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         target_id = int(data.replace("admin_unlock_", ""))
         target_user = get_user(target_id)
         if not target_user:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
-        
         update_user(target_id, is_unlocked=1, status='ACTIVE')
         bot.answer_callback_query(call.id, f"✅ User {target_id} unlocked successfully!")
-        
-        # Go back to user detail
         callback_handler(call)
         return
     
-    # ===== ADMIN LOCK USER =====
     if data.startswith("admin_lock_"):
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         target_id = int(data.replace("admin_lock_", ""))
         target_user = get_user(target_id)
         if not target_user:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
-        
         update_user(target_id, is_unlocked=0, is_premium=0, status='LOCKED')
         bot.answer_callback_query(call.id, f"✅ User {target_id} locked successfully!")
-        
-        # Go back to user detail
         callback_handler(call)
         return
     
-    # ===== ADMIN PREMIUM USER =====
     if data.startswith("admin_premium_"):
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         target_id = int(data.replace("admin_premium_", ""))
         target_user = get_user(target_id)
         if not target_user:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
-        
         update_user(target_id, is_premium=1, is_unlocked=1, status='ACTIVE')
         bot.answer_callback_query(call.id, f"⭐ User {target_id} granted premium access!")
-        
-        # Go back to user detail
         callback_handler(call)
         return
     
-    # ===== ADMIN REMOVE PREMIUM =====
     if data.startswith("admin_remove_premium_"):
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         target_id = int(data.replace("admin_remove_premium_", ""))
         target_user = get_user(target_id)
         if not target_user:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
-        
         update_user(target_id, is_premium=0)
         bot.answer_callback_query(call.id, f"❌ User {target_id} premium access removed!")
-        
-        # Go back to user detail
         callback_handler(call)
         return
     
-    # ===== ADMIN USERS PAGE =====
     if data.startswith("admin_users_page_"):
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         page = int(data.replace("admin_users_page_", ""))
         users = get_all_users()
-        
         text = f"👥 USERS LIST (Page {page+1}, Total: {len(users)})\n\nSelect a user to manage:"
         bot.edit_message_text(
             text,
@@ -1794,12 +1226,10 @@ Choose an action:
         bot.answer_callback_query(call.id)
         return
     
-    # ===== ADMIN BROADCAST =====
     if data == "admin_broadcast":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         bot.edit_message_text(
             "📢 BROADCAST MESSAGE\n\n"
             "Send the message to broadcast to ALL users.\n"
@@ -1809,22 +1239,18 @@ Choose an action:
             parse_mode="HTML"
         )
         bot.answer_callback_query(call.id)
-        # Register next step
         bot.register_next_step_handler(call.message, broadcast_handler)
         return
     
-    # ===== ADMIN ANALYTICS =====
     if data == "admin_analytics":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        
         total = get_total_users()
         unlocked = get_unlocked_users()
         locked = get_locked_users()
         premium = get_premium_users()
         refs = get_total_referrals()
-        login_stats = get_login_stats()
         
         text = f"""
 📈 COMPLETE ANALYTICS REPORT
@@ -1833,7 +1259,6 @@ Choose an action:
 
 👥 USER BREAKDOWN:
 • Total Registered: {total}
-• Active Users: {login_stats['active_users']}
 • Unlocked: {unlocked}
 • Locked: {locked}
 • Premium: {premium}
@@ -1843,15 +1268,6 @@ Choose an action:
 
 📊 ENGAGEMENT:
 • Total Referrals: {refs}
-• Total Logins: {login_stats['total_logins']}
-• OTP Logins: {login_stats['otp_logins']}
-• JSON Logins: {login_stats['json_logins']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📱 LOGIN METHODS:
-• OTP: {round((login_stats['otp_logins'] / max(1, login_stats['total_logins'])) * 100, 1)}%
-• JSON: {round((login_stats['json_logins'] / max(1, login_stats['total_logins'])) * 100, 1)}%
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -1864,45 +1280,197 @@ Choose an action:
         )
         bot.answer_callback_query(call.id)
         return
+    
+    # ===== ADMIN UNLOCK USER (direct) =====
+    if data == "admin_unlock_user":
+        if user_id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "❌ Unauthorized!")
+            return
+        bot.edit_message_text(
+            "🔓 UNLOCK USER\n\n"
+            "Enter the User ID to unlock:\n"
+            "Send /cancel to abort.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="HTML"
+        )
+        bot.answer_callback_query(call.id)
+        bot.register_next_step_handler(call.message, admin_unlock_user_handler)
+        return
+    
+    # ===== ADMIN LOCK USER (direct) =====
+    if data == "admin_lock_user":
+        if user_id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "❌ Unauthorized!")
+            return
+        bot.edit_message_text(
+            "🔒 LOCK USER\n\n"
+            "Enter the User ID to lock:\n"
+            "Send /cancel to abort.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="HTML"
+        )
+        bot.answer_callback_query(call.id)
+        bot.register_next_step_handler(call.message, admin_lock_user_handler)
+        return
+    
+    # ===== ADMIN PREMIUM USER (direct) =====
+    if data == "admin_premium_user":
+        if user_id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "❌ Unauthorized!")
+            return
+        bot.edit_message_text(
+            "⭐ GRANT PREMIUM\n\n"
+            "Enter the User ID to grant premium access:\n"
+            "Send /cancel to abort.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="HTML"
+        )
+        bot.answer_callback_query(call.id)
+        bot.register_next_step_handler(call.message, admin_premium_user_handler)
+        return
+    
+    # ===== ADMIN REMOVE PREMIUM (direct) =====
+    if data == "admin_remove_premium":
+        if user_id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "❌ Unauthorized!")
+            return
+        bot.edit_message_text(
+            "❌ REMOVE PREMIUM\n\n"
+            "Enter the User ID to remove premium access:\n"
+            "Send /cancel to abort.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="HTML"
+        )
+        bot.answer_callback_query(call.id)
+        bot.register_next_step_handler(call.message, admin_remove_premium_handler)
+        return
+
+# ==================== ADMIN HANDLER FUNCTIONS ====================
+def admin_unlock_user_handler(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    if message.text.lower() == '/cancel':
+        bot.reply_to(message, "❌ Cancelled.")
+        admin_command(message)
+        return
+    try:
+        target_id = int(message.text.strip())
+        target_user = get_user(target_id)
+        if not target_user:
+            bot.reply_to(message, f"❌ User {target_id} not found!")
+            admin_command(message)
+            return
+        update_user(target_id, is_unlocked=1, status='ACTIVE')
+        bot.reply_to(message, f"✅ User {target_id} unlocked successfully!")
+        admin_command(message)
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid User ID!")
+        admin_command(message)
+
+def admin_lock_user_handler(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    if message.text.lower() == '/cancel':
+        bot.reply_to(message, "❌ Cancelled.")
+        admin_command(message)
+        return
+    try:
+        target_id = int(message.text.strip())
+        target_user = get_user(target_id)
+        if not target_user:
+            bot.reply_to(message, f"❌ User {target_id} not found!")
+            admin_command(message)
+            return
+        update_user(target_id, is_unlocked=0, is_premium=0, status='LOCKED')
+        bot.reply_to(message, f"✅ User {target_id} locked successfully!")
+        admin_command(message)
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid User ID!")
+        admin_command(message)
+
+def admin_premium_user_handler(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    if message.text.lower() == '/cancel':
+        bot.reply_to(message, "❌ Cancelled.")
+        admin_command(message)
+        return
+    try:
+        target_id = int(message.text.strip())
+        target_user = get_user(target_id)
+        if not target_user:
+            bot.reply_to(message, f"❌ User {target_id} not found!")
+            admin_command(message)
+            return
+        update_user(target_id, is_premium=1, is_unlocked=1, status='ACTIVE')
+        bot.reply_to(message, f"⭐ User {target_id} granted premium access!")
+        admin_command(message)
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid User ID!")
+        admin_command(message)
+
+def admin_remove_premium_handler(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    if message.text.lower() == '/cancel':
+        bot.reply_to(message, "❌ Cancelled.")
+        admin_command(message)
+        return
+    try:
+        target_id = int(message.text.strip())
+        target_user = get_user(target_id)
+        if not target_user:
+            bot.reply_to(message, f"❌ User {target_id} not found!")
+            admin_command(message)
+            return
+        update_user(target_id, is_premium=0)
+        bot.reply_to(message, f"❌ User {target_id} premium access removed!")
+        admin_command(message)
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid User ID!")
+        admin_command(message)
 
 # ==================== BROADCAST HANDLER ====================
 def broadcast_handler(message):
     user_id = message.from_user.id
     if user_id != ADMIN_ID:
         return
-    
     if message.text.lower() == '/cancel':
         bot.reply_to(message, "❌ Broadcast cancelled.")
-        show_unlocked_menu(message, user_id)
+        admin_command(message)
         return
-    
     users = get_all_users()
     if not users:
         bot.reply_to(message, "❌ No users to broadcast to!")
+        admin_command(message)
         return
-    
     success = 0
     failed = 0
     status_msg = bot.reply_to(message, f"📢 Broadcasting to {len(users)} users...")
-    
-    for uid, username, fname, status, reg_at, last_used, refs, unlocked, premium, method, logins, spins, coins, phone in users:
+    for uid, username, fname, status, reg_at, last_used, refs, unlocked, premium, method, logins, phone in users:
         try:
             bot.send_message(uid, f"📢 ANNOUNCEMENT\n\n{message.text}", parse_mode="HTML")
             success += 1
             time.sleep(0.05)
         except:
             failed += 1
-    
     bot.edit_message_text(
         f"✅ BROADCAST COMPLETE\n\n✅ Sent: {success}\n❌ Failed: {failed}",
         chat_id=message.chat.id,
         message_id=status_msg.message_id,
         parse_mode="HTML"
     )
-    
-    show_unlocked_menu(message, user_id)
+    admin_command(message)
 
-# ==================== JSON LOGIN HANDLER ====================
+# ==================== JSON LOGIN HANDLERS ====================
 @bot.message_handler(content_types=['document'])
 def json_login_handler(message):
     user_id = message.from_user.id
@@ -1916,11 +1484,7 @@ def json_login_handler(message):
     file_name = message.document.file_name or "session.json"
     
     if not file_name.endswith('.json'):
-        bot.reply_to(
-            message,
-            "❌ Invalid file format. Please send a JSON file.",
-            parse_mode="HTML"
-        )
+        bot.reply_to(message, "❌ Invalid file format. Please send a JSON file.", parse_mode="HTML")
         return
     
     try:
@@ -1944,19 +1508,18 @@ def json_paste_handler(message):
     if not (text.startswith('{') or text.startswith('[')):
         return
     
-    if user_shopsy_state.get(user_id) != "json_paste":
+    # Check if user sent /cancel
+    if text.lower() == '/cancel':
         return
     
     user = get_user(user_id)
     if not user or (user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1):
         bot.reply_to(message, "❌ Bot is LOCKED! Complete 6 referrals or get premium.")
-        user_shopsy_state[user_id] = None
         return
     
     try:
         json_data = json.loads(text)
         process_json_login(message, user_id, json_data)
-        user_shopsy_state[user_id] = None
     except json.JSONDecodeError:
         bot.reply_to(message, "❌ Invalid JSON. Please send valid JSON content.", parse_mode="HTML")
 
@@ -1971,7 +1534,6 @@ def process_json_login(message, user_id, json_data):
             if isinstance(value, str) and value.isdigit() and len(value) == 10:
                 phone = value
                 break
-        
         if not phone:
             bot.reply_to(
                 message,
@@ -1996,282 +1558,37 @@ def process_json_login(message, user_id, json_data):
     update_user(user_id, shopsy_phone=phone, shopsy_logged_in=1)
     show_unlocked_menu(message, user_id)
 
-# ==================== OTP LOGIN HANDLERS (FIXED USING so.py LOGIC) ====================
-@bot.message_handler(func=lambda message: user_shopsy_state.get(message.from_user.id) == "waiting_phone")
-def shopsy_phone_handler(message):
-    user_id = message.from_user.id
-    phone = message.text.strip()
-    
-    if phone.lower() in ['/cancel', 'cancel']:
-        user_shopsy_state[user_id] = None
-        bot.reply_to(message, "❌ Login cancelled.")
-        return
-    
-    if not phone.isdigit() or len(phone) != 10:
-        bot.reply_to(
-            message,
-            "❌ Please enter exactly 10 digits.\n\nSend /cancel to abort.",
-            parse_mode="HTML"
-        )
-        return
-    
-    user = get_user(user_id)
-    if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
-        bot.reply_to(message, "❌ Bot is LOCKED! Complete 6 referrals or get premium.")
-        user_shopsy_state[user_id] = None
-        return
-    
-    user_shopsy_state[user_id] = "waiting_otp"
-    shopsy_otp_data[user_id] = {"phone": phone}
-    
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("❌ Cancel", callback_data="back_menu"))
-    
-    status_msg = bot.reply_to(
-        message,
-        f"📱 Sending OTP to +91{phone}...",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-    
-    def send_otp_thread():
-        try:
-            # Generate device IDs (from so.py)
-            d_id, v_id, s_id = generate_ids()
-            session_data = {
-                "phone": phone,
-                "device_id": d_id,
-                "visit_id": v_id,
-                "app_session_id": s_id,
-                "current_dc": "1"
-            }
-            
-            # Request OTP (from so.py)
-            body = {
-                "actionRequestContext": {
-                    "type": "LOGIN_IDENTITY_VERIFY_SHOPSY2",
-                    "loginId": phone,
-                    "loginIdPrefix": "+91",
-                    "phoneNumberFormat": "E164",
-                    "addAppHash": True,
-                    "loginType": "MOBILE",
-                    "verificationType": "OTP",
-                    "sourceContext": "DEFAULT",
-                    "clientQueryParamMap": None
-                }
-            }
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            st, resp, hdrs, session_data = loop.run_until_complete(
-                asyncio.to_thread(sync_api_request, "POST", "/1/action/view", body, session_data, False)
-            )
-            loop.close()
-            
-            if st != 200:
-                bot.edit_message_text(
-                    f"❌ Failed to send OTP: HTTP {st}",
-                    chat_id=message.chat.id,
-                    message_id=status_msg.message_id,
-                    parse_mode="HTML"
-                )
-                user_shopsy_state[user_id] = None
-                if user_id in shopsy_otp_data:
-                    del shopsy_otp_data[user_id]
-                return
-            
-            session_data = update_session(session_data, resp, hdrs)
-            req_id = resp.get("RESPONSE", {}).get("actionResponseContext", {}).get("requestId") or resp.get("requestId")
-            
-            if not req_id:
-                bot.edit_message_text(
-                    "❌ No request ID in response.",
-                    chat_id=message.chat.id,
-                    message_id=status_msg.message_id,
-                    parse_mode="HTML"
-                )
-                user_shopsy_state[user_id] = None
-                if user_id in shopsy_otp_data:
-                    del shopsy_otp_data[user_id]
-                return
-            
-            shopsy_otp_data[user_id]["session_data"] = session_data
-            shopsy_otp_data[user_id]["request_id"] = req_id
-            
-            bot.edit_message_text(
-                f"✅ OTP sent to +91{phone}!\n\nEnter the 6-digit OTP code:\nSend /cancel to abort.",
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id,
-                reply_markup=kb,
-                parse_mode="HTML"
-            )
-            user_shopsy_state[user_id] = "waiting_otp"
-            
-        except Exception as e:
-            bot.edit_message_text(
-                f"❌ Error: {str(e)[:200]}",
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id,
-                parse_mode="HTML"
-            )
-            user_shopsy_state[user_id] = None
-            if user_id in shopsy_otp_data:
-                del shopsy_otp_data[user_id]
-    
-    threading.Thread(target=send_otp_thread).start()
-
-@bot.message_handler(func=lambda message: user_shopsy_state.get(message.from_user.id) == "waiting_otp")
-def shopsy_otp_handler(message):
-    user_id = message.from_user.id
-    otp = message.text.strip()
-    
-    if otp.lower() in ['/cancel', 'cancel']:
-        user_shopsy_state[user_id] = None
-        if user_id in shopsy_otp_data:
-            del shopsy_otp_data[user_id]
-        bot.reply_to(message, "❌ Login cancelled.")
-        return
-    
-    if not otp.isdigit() or len(otp) != 6:
-        bot.reply_to(
-            message,
-            "❌ Please enter a valid 6-digit OTP.\n\nSend /cancel to abort.",
-            parse_mode="HTML"
-        )
-        return
-    
-    if user_id not in shopsy_otp_data:
-        bot.reply_to(
-            message,
-            "❌ Session expired. Please start again.\nClick /start to restart.",
-            parse_mode="HTML"
-        )
-        user_shopsy_state[user_id] = None
-        return
-    
-    data = shopsy_otp_data[user_id]
-    phone = data.get("phone")
-    session_data = data.get("session_data")
-    req_id = data.get("request_id")
-    
-    if not session_data or not req_id:
-        bot.reply_to(
-            message,
-            "❌ Invalid session data. Please start again.\nClick /start to restart.",
-            parse_mode="HTML"
-        )
-        user_shopsy_state[user_id] = None
-        if user_id in shopsy_otp_data:
-            del shopsy_otp_data[user_id]
-        return
-    
-    status_msg = bot.reply_to(message, "🔄 Verifying OTP...", parse_mode="HTML")
-    
-    def verify_thread():
-        try:
-            # Verify OTP (from so.py)
-            body = {
-                "actionRequestContext": {
-                    "type": "LOGIN_SHOPSY2",
-                    "loginId": phone,
-                    "loginIdPrefix": "+91",
-                    "password": None,
-                    "otp": otp,
-                    "otpRequestId": req_id,
-                    "remainingAttempts": 5,
-                    "phoneNumberFormat": "E164",
-                    "loginType": "MOBILE",
-                    "verificationType": "OTP",
-                    "sourceContext": "DEFAULT",
-                    "churned": False
-                }
-            }
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            st, resp, hdrs, session_data = loop.run_until_complete(
-                asyncio.to_thread(sync_api_request, "POST", "/1/action/view", body, session_data, False)
-            )
-            loop.close()
-            
-            if st == 200 and isinstance(resp, dict) and resp.get("RESPONSE", {}).get("actionResponseContext", {}).get("authenticationSuccess", False):
-                session_data = update_session(session_data, resp, hdrs)
-                session_data["isLoggedIn"] = True
-                
-                # Save session
-                save_session(user_id, phone, session_data, login_method="OTP")
-                accounts_count = get_accounts_count(user_id)
-                
-                bot.edit_message_text(
-                    f"✅ LOGIN SUCCESSFUL\n\n"
-                    f"📱 Phone: +91{phone}\n"
-                    f"💾 Account saved!\n"
-                    f"📊 Total Accounts: {accounts_count}\n\n"
-                    f"Click 🚀 AUTO MINE to start mining!",
-                    chat_id=message.chat.id,
-                    message_id=status_msg.message_id,
-                    parse_mode="HTML"
-                )
-                
-                user_shopsy_state[user_id] = None
-                if user_id in shopsy_otp_data:
-                    del shopsy_otp_data[user_id]
-                
-                show_unlocked_menu(message, user_id)
-            else:
-                bot.edit_message_text(
-                    f"❌ Invalid OTP. Please try again.\n\nEnter the 6-digit OTP code:\nSend /cancel to abort.",
-                    chat_id=message.chat.id,
-                    message_id=status_msg.message_id,
-                    parse_mode="HTML"
-                )
-                user_shopsy_state[user_id] = "waiting_otp"
-            
-        except Exception as e:
-            bot.edit_message_text(
-                f"❌ Error: {str(e)[:200]}\n\nPlease try again.\nClick /start to restart.",
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id,
-                parse_mode="HTML"
-            )
-            user_shopsy_state[user_id] = None
-            if user_id in shopsy_otp_data:
-                del shopsy_otp_data[user_id]
-    
-    threading.Thread(target=verify_thread).start()
-
-# ==================== MAIN ====================
+# ==================== MAIN - NO 409 CONFLICT ====================
 if __name__ == "__main__":
+    # Start background scheduler once
     task_thread = threading.Thread(target=run_scheduled_tasks, daemon=True)
     task_thread.start()
     
     logger.info("=" * 60)
-    logger.info("🚀 VIEDIET PREMIUM BOT v8.0")
+    logger.info("🚀 VIEDIET PREMIUM BOT v8.5")
     logger.info("=" * 60)
     logger.info("🔒 Referrals Required: 6")
-    logger.info("⭐ Premium: Admin button")
+    logger.info("⭐ Premium: Admin panel")
     logger.info("📢 Channel: @{}".format(CHANNEL_USERNAME))
-    logger.info("👑 Admin: BUTTON BASED (no commands)")
-    logger.info("📱 Login: OTP (so.py logic) + JSON")
-    logger.info("⚡ Response: OPTIMIZED")
+    logger.info("👑 Admin: BUTTON BASED")
+    logger.info("📱 Login: JSON ONLY (OTP REMOVED)")
     logger.info("💾 DATA_DIR: {}".format(DATA_DIR))
     logger.info("=" * 60)
     
+    # Remove webhook once
     try:
         bot.remove_webhook()
-        time.sleep(2)
-    except:
-        pass
+        logger.info("✅ Webhook removed")
+    except Exception as e:
+        logger.warning(f"Webhook removal: {e}")
     
-    while True:
-        try:
-            logger.info("🔄 Starting polling...")
-            bot.polling(non_stop=False, interval=1, timeout=30)
-        except Exception as e:
-            if "409" in str(e):
-                logger.warning("⚠️ Conflict detected. Waiting 15 seconds...")
-                time.sleep(15)
-            else:
-                logger.error(f"Polling error: {e}")
-                logger.info("🔄 Restarting polling in 5 seconds...")
-                time.sleep(5)
+    time.sleep(1)
+    
+    # Start polling ONCE - no loops, no recursion
+    logger.info("🔄 Starting polling (SINGLE INSTANCE)...")
+    
+    try:
+        bot.infinity_polling(timeout=30, long_polling_timeout=30)
+    except Exception as e:
+        logger.error(f"Fatal polling error: {e}")
+        sys.exit(1)
