@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - VIEDIET PREMIUM BOT v8.5
-# FIXED: OTP removed, JSON-only login, No 409 conflict, Production stable
+# NRTECNO SYSTEM - VIEDIET PREMIUM BOT v9.0
+# FIXED: Webhook mode (no 409 conflict), All buttons working
 
 import os
 import logging
@@ -26,6 +26,12 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", 1364476174))
 CHANNEL_USERNAME = "viedietlooters"
 REFERRAL_REQUIRED = 6
 
+# Webhook settings
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "")
+WEBHOOK_PORT = int(os.environ.get("PORT", 8443))
+WEBHOOK_LISTEN = "0.0.0.0"
+WEBHOOK_URL = f"{WEBHOOK_HOST}/{BOT_TOKEN}" if WEBHOOK_HOST else None
+
 # ===== PERSISTENT STORAGE =====
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -40,7 +46,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== BOT INIT (SINGLE INSTANCE) ====================
+# ==================== BOT INIT ====================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ==================== DATABASE ====================
@@ -396,7 +402,7 @@ def run_scheduled_tasks():
             logger.error(f"Scheduled task error: {e}")
         time.sleep(60)
 
-# ==================== CHANNEL CHECK FUNCTIONS ====================
+# ==================== CHANNEL CHECK ====================
 def check_channel_membership(user_id):
     try:
         member = bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
@@ -815,7 +821,7 @@ def callback_handler(call):
         bot.answer_callback_query(call.id, "User not found")
         return
     
-    # ===== CHANNEL CHECK =====
+    # Channel Check
     if data == "check_channel":
         if check_channel_membership(user_id):
             bot.answer_callback_query(call.id, "✅ Channel joined! Welcome!")
@@ -827,7 +833,7 @@ def callback_handler(call):
             bot.answer_callback_query(call.id, "❌ Please join the channel first!", show_alert=True)
         return
     
-    # ===== BACK =====
+    # Back
     if data == "back_menu":
         if user.get('is_unlocked', 0) == 1 or user.get('is_premium', 0) == 1:
             show_unlocked_menu(call.message, user_id)
@@ -836,7 +842,7 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
     
-    # ===== REFRESH =====
+    # Refresh
     if data == "refresh":
         if user.get('is_unlocked', 0) == 1 or user.get('is_premium', 0) == 1:
             show_unlocked_menu(call.message, user_id)
@@ -845,11 +851,10 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
     
-    # ===== REFERRAL =====
+    # Referral Link
     if data == "referral_link":
         referral_count = get_referral_count(user_id)
         pending_count = get_pending_referral_count(user_id)
-        
         text = referral_link_text(user_id, user['first_name'], referral_count, pending_count)
         bot.edit_message_text(
             text,
@@ -871,7 +876,7 @@ def callback_handler(call):
         )
         return
     
-    # ===== CHECK STATUS =====
+    # Check Status
     if data == "check_status":
         referral_count = get_referral_count(user_id)
         pending_count = get_pending_referral_count(user_id)
@@ -882,9 +887,7 @@ def callback_handler(call):
         if is_premium:
             bot.answer_callback_query(
                 call.id,
-                f"⭐ PREMIUM USER!\n\n"
-                f"👥 Referrals: {referral_count}/{REFERRAL_REQUIRED}\n"
-                f"🔓 Status: UNLOCKED (Premium)",
+                f"⭐ PREMIUM USER!\n\n👥 Referrals: {referral_count}/{REFERRAL_REQUIRED}\n🔓 Status: UNLOCKED (Premium)",
                 show_alert=True
             )
             return
@@ -893,23 +896,19 @@ def callback_handler(call):
             update_user(user_id, is_unlocked=1, status='ACTIVE')
             bot.answer_callback_query(
                 call.id,
-                f"🎉 UNLOCKED!\n\n"
-                f"👥 Referrals: {referral_count}/{REFERRAL_REQUIRED}\n"
-                f"🔓 Status: UNLOCKED",
+                f"🎉 UNLOCKED!\n\n👥 Referrals: {referral_count}/{REFERRAL_REQUIRED}\n🔓 Status: UNLOCKED",
                 show_alert=True
             )
             show_unlocked_menu(call.message, user_id)
         else:
             bot.answer_callback_query(
                 call.id,
-                f"🔒 {referral_count}/{REFERRAL_REQUIRED} referrals\n"
-                f"⏳ Pending: {pending_count}\n"
-                f"🎯 Need {remaining} more to unlock!",
+                f"🔒 {referral_count}/{REFERRAL_REQUIRED} referrals\n⏳ Pending: {pending_count}\n🎯 Need {remaining} more to unlock!",
                 show_alert=True
             )
         return
     
-    # ===== JSON LOGIN =====
+    # JSON Login
     if data == "login_json":
         if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
             bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
@@ -920,13 +919,7 @@ def callback_handler(call):
             return
         
         bot.edit_message_text(
-            "📋 JSON LOGIN\n\n"
-            "Two ways to login:\n\n"
-            "1️⃣ Upload File:\n"
-            "   Send your JSON file as a document\n\n"
-            "2️⃣ Paste JSON:\n"
-            "   Copy and paste the JSON content directly\n\n"
-            "Send /cancel to abort.",
+            "📋 JSON LOGIN\n\nTwo ways to login:\n\n1️⃣ Upload File:\n   Send your JSON file as a document\n\n2️⃣ Paste JSON:\n   Copy and paste the JSON content directly\n\nSend /cancel to abort.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="HTML"
@@ -934,7 +927,7 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
     
-    # ===== MY ACCOUNTS =====
+    # My Accounts
     if data == "my_accounts":
         if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
             bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
@@ -951,7 +944,7 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
     
-    # ===== HISTORY =====
+    # History
     if data == "history":
         if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
             bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
@@ -968,7 +961,7 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
     
-    # ===== START AUTO MINING =====
+    # Auto Mining
     if data == "start_auto_mining":
         if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
             bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete 6 referrals or get premium.", show_alert=True)
@@ -988,10 +981,7 @@ def callback_handler(call):
             return
         
         bot.edit_message_text(
-            f"🚀 AUTO-MINING STARTED!\n\n"
-            f"📱 Accounts: {len(sessions)}\n"
-            f"⏳ Processing...\n\n"
-            f"_Progress will appear here._",
+            f"🚀 AUTO-MINING STARTED!\n\n📱 Accounts: {len(sessions)}\n⏳ Processing...\n\n_Progress will appear here._",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="Markdown"
@@ -999,19 +989,18 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
     
-    # ===== LOGOUT ALL =====
+    # Logout All
     if data == "logout_all":
         logout_user(user_id)
         bot.answer_callback_query(call.id, "🚪 All accounts logged out successfully!", show_alert=True)
         show_unlocked_menu(call.message, user_id)
         return
     
-    # ===== MINING STATUS =====
+    # Mining Status
     if data == "mining_status":
         user = get_user(user_id)
         sessions = get_all_sessions(user_id)
         mining_active = user.get('mining_active', 0)
-        
         status_text = "🟢 Active" if mining_active else "🟡 Idle"
         bot.answer_callback_query(
             call.id,
@@ -1028,24 +1017,7 @@ def callback_handler(call):
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        text = """
-👑 ADMIN PANEL
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Use the buttons below to manage your bot:
-
-📊 Stats - View bot statistics
-👥 Users - Manage users
-🔓 Unlock - Grant free access
-🔒 Lock - Revoke access
-⭐ Premium - Grant premium access
-❌ Remove - Remove premium
-📢 Broadcast - Send announcement
-📈 Analytics - Full analytics report
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+        text = """👑 ADMIN PANEL\n\nUse the buttons below:\n📊 Stats\n👥 Users\n🔓 Unlock\n🔒 Lock\n⭐ Premium\n❌ Remove\n📢 Broadcast\n📈 Analytics"""
         bot.edit_message_text(
             text,
             chat_id=call.message.chat.id,
@@ -1065,20 +1037,7 @@ Use the buttons below to manage your bot:
         locked = get_locked_users()
         premium = get_premium_users()
         refs = get_total_referrals()
-        
-        text = f"""
-📊 BOT STATISTICS
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-👥 Total Users: {total}
-🔓 Unlocked: {unlocked}
-🔒 Locked: {locked}
-⭐ Premium: {premium}
-🔗 Total Referrals: {refs}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+        text = f"📊 BOT STATISTICS\n━━━━━━━━━━━━━━━━━━━\n👥 Total Users: {total}\n🔓 Unlocked: {unlocked}\n🔒 Locked: {locked}\n⭐ Premium: {premium}\n🔗 Total Referrals: {refs}"
         bot.edit_message_text(
             text,
             chat_id=call.message.chat.id,
@@ -1095,13 +1054,7 @@ Use the buttons below to manage your bot:
             return
         users = get_all_users()
         if not users:
-            bot.edit_message_text(
-                "❌ No users found.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                reply_markup=admin_main_keyboard(),
-                parse_mode="HTML"
-            )
+            bot.edit_message_text("❌ No users found.", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=admin_main_keyboard(), parse_mode="HTML")
             bot.answer_callback_query(call.id)
             return
         text = f"👥 USERS LIST (Total: {len(users)})\n\nSelect a user to manage:"
@@ -1124,25 +1077,7 @@ Use the buttons below to manage your bot:
         if not target_user:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
-        text = f"""
-👤 USER DETAILS
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🆔 ID: {target_id}
-👤 Name: {target_user.get('first_name', 'N/A')}
-👥 Username: @{target_user.get('username', 'N/A')}
-🔓 Unlocked: {'✅' if target_user.get('is_unlocked') else '❌'}
-⭐ Premium: {'✅' if target_user.get('is_premium') else '❌'}
-📱 Referrals: {target_user.get('referrals_count', 0)}/{REFERRAL_REQUIRED}
-📱 Accounts: {get_accounts_count(target_id)}
-📊 Total Logins: {target_user.get('total_logins', 0)}
-📅 Joined: {target_user.get('registered_at', 'N/A')[:10]}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Choose an action:
-"""
+        text = f"""👤 USER DETAILS\n━━━━━━━━━━━━━━━━━━━\n🆔 ID: {target_id}\n👤 Name: {target_user.get('first_name', 'N/A')}\n🔓 Unlocked: {'✅' if target_user.get('is_unlocked') else '❌'}\n⭐ Premium: {'✅' if target_user.get('is_premium') else '❌'}\n📱 Referrals: {target_user.get('referrals_count', 0)}/{REFERRAL_REQUIRED}\n📱 Accounts: {get_accounts_count(target_id)}\n📊 Total Logins: {target_user.get('total_logins', 0)}\n📅 Joined: {target_user.get('registered_at', 'N/A')[:10]}"""
         bot.edit_message_text(
             text,
             chat_id=call.message.chat.id,
@@ -1163,7 +1098,7 @@ Choose an action:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
         update_user(target_id, is_unlocked=1, status='ACTIVE')
-        bot.answer_callback_query(call.id, f"✅ User {target_id} unlocked successfully!")
+        bot.answer_callback_query(call.id, f"✅ User {target_id} unlocked!")
         callback_handler(call)
         return
     
@@ -1177,7 +1112,7 @@ Choose an action:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
         update_user(target_id, is_unlocked=0, is_premium=0, status='LOCKED')
-        bot.answer_callback_query(call.id, f"✅ User {target_id} locked successfully!")
+        bot.answer_callback_query(call.id, f"✅ User {target_id} locked!")
         callback_handler(call)
         return
     
@@ -1191,7 +1126,7 @@ Choose an action:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
         update_user(target_id, is_premium=1, is_unlocked=1, status='ACTIVE')
-        bot.answer_callback_query(call.id, f"⭐ User {target_id} granted premium access!")
+        bot.answer_callback_query(call.id, f"⭐ User {target_id} premium granted!")
         callback_handler(call)
         return
     
@@ -1205,7 +1140,7 @@ Choose an action:
             bot.answer_callback_query(call.id, "User not found!", show_alert=True)
             return
         update_user(target_id, is_premium=0)
-        bot.answer_callback_query(call.id, f"❌ User {target_id} premium access removed!")
+        bot.answer_callback_query(call.id, f"❌ User {target_id} premium removed!")
         callback_handler(call)
         return
     
@@ -1231,9 +1166,7 @@ Choose an action:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
         bot.edit_message_text(
-            "📢 BROADCAST MESSAGE\n\n"
-            "Send the message to broadcast to ALL users.\n"
-            "Send /cancel to abort.",
+            "📢 BROADCAST MESSAGE\n\nSend the message to broadcast to ALL users.\nSend /cancel to abort.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="HTML"
@@ -1251,26 +1184,7 @@ Choose an action:
         locked = get_locked_users()
         premium = get_premium_users()
         refs = get_total_referrals()
-        
-        text = f"""
-📈 COMPLETE ANALYTICS REPORT
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-👥 USER BREAKDOWN:
-• Total Registered: {total}
-• Unlocked: {unlocked}
-• Locked: {locked}
-• Premium: {premium}
-• Referral Unlocked: {unlocked - premium}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📊 ENGAGEMENT:
-• Total Referrals: {refs}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+        text = f"""📈 COMPLETE ANALYTICS REPORT\n━━━━━━━━━━━━━━━━━━━\n👥 Total Registered: {total}\n🔓 Unlocked: {unlocked}\n🔒 Locked: {locked}\n⭐ Premium: {premium}\n📤 Referral Unlocked: {unlocked - premium}\n━━━━━━━━━━━━━━━━━━━\n🔗 Total Referrals: {refs}"""
         bot.edit_message_text(
             text,
             chat_id=call.message.chat.id,
@@ -1281,15 +1195,13 @@ Choose an action:
         bot.answer_callback_query(call.id)
         return
     
-    # ===== ADMIN UNLOCK USER (direct) =====
+    # Admin action buttons (direct)
     if data == "admin_unlock_user":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
         bot.edit_message_text(
-            "🔓 UNLOCK USER\n\n"
-            "Enter the User ID to unlock:\n"
-            "Send /cancel to abort.",
+            "🔓 UNLOCK USER\n\nEnter the User ID to unlock:\nSend /cancel to abort.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="HTML"
@@ -1298,15 +1210,12 @@ Choose an action:
         bot.register_next_step_handler(call.message, admin_unlock_user_handler)
         return
     
-    # ===== ADMIN LOCK USER (direct) =====
     if data == "admin_lock_user":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
         bot.edit_message_text(
-            "🔒 LOCK USER\n\n"
-            "Enter the User ID to lock:\n"
-            "Send /cancel to abort.",
+            "🔒 LOCK USER\n\nEnter the User ID to lock:\nSend /cancel to abort.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="HTML"
@@ -1315,15 +1224,12 @@ Choose an action:
         bot.register_next_step_handler(call.message, admin_lock_user_handler)
         return
     
-    # ===== ADMIN PREMIUM USER (direct) =====
     if data == "admin_premium_user":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
         bot.edit_message_text(
-            "⭐ GRANT PREMIUM\n\n"
-            "Enter the User ID to grant premium access:\n"
-            "Send /cancel to abort.",
+            "⭐ GRANT PREMIUM\n\nEnter the User ID to grant premium access:\nSend /cancel to abort.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="HTML"
@@ -1332,15 +1238,12 @@ Choose an action:
         bot.register_next_step_handler(call.message, admin_premium_user_handler)
         return
     
-    # ===== ADMIN REMOVE PREMIUM (direct) =====
     if data == "admin_remove_premium":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
         bot.edit_message_text(
-            "❌ REMOVE PREMIUM\n\n"
-            "Enter the User ID to remove premium access:\n"
-            "Send /cancel to abort.",
+            "❌ REMOVE PREMIUM\n\nEnter the User ID to remove premium access:\nSend /cancel to abort.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode="HTML"
@@ -1366,7 +1269,7 @@ def admin_unlock_user_handler(message):
             admin_command(message)
             return
         update_user(target_id, is_unlocked=1, status='ACTIVE')
-        bot.reply_to(message, f"✅ User {target_id} unlocked successfully!")
+        bot.reply_to(message, f"✅ User {target_id} unlocked!")
         admin_command(message)
     except ValueError:
         bot.reply_to(message, "❌ Invalid User ID!")
@@ -1388,7 +1291,7 @@ def admin_lock_user_handler(message):
             admin_command(message)
             return
         update_user(target_id, is_unlocked=0, is_premium=0, status='LOCKED')
-        bot.reply_to(message, f"✅ User {target_id} locked successfully!")
+        bot.reply_to(message, f"✅ User {target_id} locked!")
         admin_command(message)
     except ValueError:
         bot.reply_to(message, "❌ Invalid User ID!")
@@ -1410,7 +1313,7 @@ def admin_premium_user_handler(message):
             admin_command(message)
             return
         update_user(target_id, is_premium=1, is_unlocked=1, status='ACTIVE')
-        bot.reply_to(message, f"⭐ User {target_id} granted premium access!")
+        bot.reply_to(message, f"⭐ User {target_id} premium granted!")
         admin_command(message)
     except ValueError:
         bot.reply_to(message, "❌ Invalid User ID!")
@@ -1432,7 +1335,7 @@ def admin_remove_premium_handler(message):
             admin_command(message)
             return
         update_user(target_id, is_premium=0)
-        bot.reply_to(message, f"❌ User {target_id} premium access removed!")
+        bot.reply_to(message, f"❌ User {target_id} premium removed!")
         admin_command(message)
     except ValueError:
         bot.reply_to(message, "❌ Invalid User ID!")
@@ -1480,20 +1383,18 @@ def json_login_handler(message):
         bot.reply_to(message, "❌ Bot is LOCKED! Complete 6 referrals or get premium.")
         return
     
-    file_id = message.document.file_id
     file_name = message.document.file_name or "session.json"
-    
     if not file_name.endswith('.json'):
         bot.reply_to(message, "❌ Invalid file format. Please send a JSON file.", parse_mode="HTML")
         return
     
     try:
-        file_info = bot.get_file(file_id)
+        file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         json_data = json.loads(downloaded_file.decode('utf-8'))
         process_json_login(message, user_id, json_data)
     except json.JSONDecodeError:
-        bot.reply_to(message, "❌ Invalid JSON format. Please send a valid JSON file.", parse_mode="HTML")
+        bot.reply_to(message, "❌ Invalid JSON format.", parse_mode="HTML")
     except Exception as e:
         bot.reply_to(message, f"❌ Error: {str(e)[:200]}", parse_mode="HTML")
 
@@ -1504,11 +1405,8 @@ def json_paste_handler(message):
     
     if not text:
         return
-    
     if not (text.startswith('{') or text.startswith('[')):
         return
-    
-    # Check if user sent /cancel
     if text.lower() == '/cancel':
         return
     
@@ -1521,7 +1419,7 @@ def json_paste_handler(message):
         json_data = json.loads(text)
         process_json_login(message, user_id, json_data)
     except json.JSONDecodeError:
-        bot.reply_to(message, "❌ Invalid JSON. Please send valid JSON content.", parse_mode="HTML")
+        bot.reply_to(message, "❌ Invalid JSON content.", parse_mode="HTML")
 
 def process_json_login(message, user_id, json_data):
     if not isinstance(json_data, dict):
@@ -1537,8 +1435,7 @@ def process_json_login(message, user_id, json_data):
         if not phone:
             bot.reply_to(
                 message,
-                "❌ Could not detect phone number in JSON.\n\n"
-                "Make sure the JSON contains 'phone', 'accountId', or a 10-digit number.",
+                "❌ Could not detect phone number.\nMake sure JSON contains 'phone', 'accountId', or a 10-digit number.",
                 parse_mode="HTML"
             )
             return
@@ -1548,47 +1445,61 @@ def process_json_login(message, user_id, json_data):
     
     bot.reply_to(
         message,
-        f"✅ JSON LOGIN SUCCESSFUL\n\n"
-        f"📱 Phone: +91{phone}\n"
-        f"📊 Total Accounts: {accounts_count}\n\n"
-        f"Click 🚀 AUTO MINE to start mining.",
+        f"✅ JSON LOGIN SUCCESSFUL\n\n📱 Phone: +91{phone}\n📊 Total Accounts: {accounts_count}\n\nClick 🚀 AUTO MINE to start mining.",
         parse_mode="HTML"
     )
     
     update_user(user_id, shopsy_phone=phone, shopsy_logged_in=1)
     show_unlocked_menu(message, user_id)
 
-# ==================== MAIN - NO 409 CONFLICT ====================
+# ==================== WEBHOOK SERVER ====================
+if WEBHOOK_HOST:
+    from flask import Flask, request
+    app = Flask(__name__)
+    
+    @app.route('/' + BOT_TOKEN, methods=['POST'])
+    def webhook():
+        if request.headers.get('content-type') == 'application/json':
+            json_string = request.get_data().decode('utf-8')
+            update = telebot.types.Update.de_json(json_string)
+            bot.process_new_updates([update])
+            return '', 200
+        return '', 403
+    
+    @app.route('/', methods=['GET'])
+    def index():
+        return 'Bot is running!', 200
+
+# ==================== MAIN ====================
 if __name__ == "__main__":
-    # Start background scheduler once
+    # Start background scheduler
     task_thread = threading.Thread(target=run_scheduled_tasks, daemon=True)
     task_thread.start()
     
     logger.info("=" * 60)
-    logger.info("🚀 VIEDIET PREMIUM BOT v8.5")
+    logger.info("🚀 VIEDIET PREMIUM BOT v9.0")
     logger.info("=" * 60)
     logger.info("🔒 Referrals Required: 6")
-    logger.info("⭐ Premium: Admin panel")
+    logger.info("📱 Login: JSON ONLY")
     logger.info("📢 Channel: @{}".format(CHANNEL_USERNAME))
     logger.info("👑 Admin: BUTTON BASED")
-    logger.info("📱 Login: JSON ONLY (OTP REMOVED)")
-    logger.info("💾 DATA_DIR: {}".format(DATA_DIR))
     logger.info("=" * 60)
     
-    # Remove webhook once
-    try:
+    if WEBHOOK_HOST:
+        # Webhook mode (for Railway/Render)
+        logger.info(f"🌐 Starting webhook server on port {WEBHOOK_PORT}")
         bot.remove_webhook()
-        logger.info("✅ Webhook removed")
-    except Exception as e:
-        logger.warning(f"Webhook removal: {e}")
-    
-    time.sleep(1)
-    
-    # Start polling ONCE - no loops, no recursion
-    logger.info("🔄 Starting polling (SINGLE INSTANCE)...")
-    
-    try:
-        bot.infinity_polling(timeout=30, long_polling_timeout=30)
-    except Exception as e:
-        logger.error(f"Fatal polling error: {e}")
-        sys.exit(1)
+        time.sleep(1)
+        bot.set_webhook(url=WEBHOOK_URL)
+        logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
+        app.run(host=WEBHOOK_LISTEN, port=WEBHOOK_PORT)
+    else:
+        # Polling mode (for local testing)
+        logger.info("🔄 Starting polling...")
+        try:
+            bot.remove_webhook()
+            time.sleep(1)
+            bot.infinity_polling(timeout=30, long_polling_timeout=30)
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            sys.exit(1)
