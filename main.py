@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - VIEDIET PREMIUM BOT v9.0
-# FIXED: Webhook mode (no 409 conflict), All buttons working
+# NRTECNO SYSTEM - VIEDIET PREMIUM BOT v10.0
+# WEBHOOK ONLY - No polling, No 409 errors
 
 import os
 import logging
@@ -15,6 +15,7 @@ import uuid
 import sys
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from flask import Flask, request
 
 # ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -26,11 +27,8 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", 1364476174))
 CHANNEL_USERNAME = "viedietlooters"
 REFERRAL_REQUIRED = 6
 
-# Webhook settings
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "")
-WEBHOOK_PORT = int(os.environ.get("PORT", 8443))
-WEBHOOK_LISTEN = "0.0.0.0"
-WEBHOOK_URL = f"{WEBHOOK_HOST}/{BOT_TOKEN}" if WEBHOOK_HOST else None
+# Railway webhook config
+PORT = int(os.environ.get("PORT", 8443))
 
 # ===== PERSISTENT STORAGE =====
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
@@ -46,8 +44,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== BOT INIT ====================
+# ==================== BOT & FLASK INIT ====================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+app = Flask(__name__)
 
 # ==================== DATABASE ====================
 def init_db():
@@ -1017,7 +1016,7 @@ def callback_handler(call):
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
             return
-        text = """👑 ADMIN PANEL\n\nUse the buttons below:\n📊 Stats\n👥 Users\n🔓 Unlock\n🔒 Lock\n⭐ Premium\n❌ Remove\n📢 Broadcast\n📈 Analytics"""
+        text = "👑 ADMIN PANEL\n\nUse the buttons below:"
         bot.edit_message_text(
             text,
             chat_id=call.message.chat.id,
@@ -1099,6 +1098,7 @@ def callback_handler(call):
             return
         update_user(target_id, is_unlocked=1, status='ACTIVE')
         bot.answer_callback_query(call.id, f"✅ User {target_id} unlocked!")
+        # Refresh user detail view
         callback_handler(call)
         return
     
@@ -1452,23 +1452,19 @@ def process_json_login(message, user_id, json_data):
     update_user(user_id, shopsy_phone=phone, shopsy_logged_in=1)
     show_unlocked_menu(message, user_id)
 
-# ==================== WEBHOOK SERVER ====================
-if WEBHOOK_HOST:
-    from flask import Flask, request
-    app = Flask(__name__)
-    
-    @app.route('/' + BOT_TOKEN, methods=['POST'])
-    def webhook():
-        if request.headers.get('content-type') == 'application/json':
-            json_string = request.get_data().decode('utf-8')
-            update = telebot.types.Update.de_json(json_string)
-            bot.process_new_updates([update])
-            return '', 200
-        return '', 403
-    
-    @app.route('/', methods=['GET'])
-    def index():
-        return 'Bot is running!', 200
+# ==================== WEBHOOK ====================
+@app.route('/' + BOT_TOKEN, methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return '', 200
+    return '', 403
+
+@app.route('/', methods=['GET'])
+def index():
+    return 'Bot is running!', 200
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
@@ -1477,29 +1473,31 @@ if __name__ == "__main__":
     task_thread.start()
     
     logger.info("=" * 60)
-    logger.info("🚀 VIEDIET PREMIUM BOT v9.0")
+    logger.info("🚀 VIEDIET PREMIUM BOT v10.0 - WEBHOOK MODE")
     logger.info("=" * 60)
     logger.info("🔒 Referrals Required: 6")
     logger.info("📱 Login: JSON ONLY")
     logger.info("📢 Channel: @{}".format(CHANNEL_USERNAME))
     logger.info("👑 Admin: BUTTON BASED")
+    logger.info("🌐 Webhook Server on Port: {}".format(PORT))
     logger.info("=" * 60)
     
-    if WEBHOOK_HOST:
-        # Webhook mode (for Railway/Render)
-        logger.info(f"🌐 Starting webhook server on port {WEBHOOK_PORT}")
+    # Remove any existing webhook
+    try:
         bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"✅ Webhook set to: {WEBHOOK_URL}")
-        app.run(host=WEBHOOK_LISTEN, port=WEBHOOK_PORT)
+        logger.info("✅ Webhook removed")
+    except Exception as e:
+        logger.warning(f"Webhook removal: {e}")
+    
+    time.sleep(1)
+    
+    # Set webhook (Railway provides the URL automatically)
+    webhook_url = f"https://{os.environ.get('RAILWAY_STATIC_URL', 'localhost')}/{BOT_TOKEN}"
+    if os.environ.get('RAILWAY_STATIC_URL'):
+        bot.set_webhook(url=webhook_url)
+        logger.info(f"✅ Webhook set to: {webhook_url}")
     else:
-        # Polling mode (for local testing)
-        logger.info("🔄 Starting polling...")
-        try:
-            bot.remove_webhook()
-            time.sleep(1)
-            bot.infinity_polling(timeout=30, long_polling_timeout=30)
-        except Exception as e:
-            logger.error(f"Polling error: {e}")
-            sys.exit(1)
+        logger.warning("⚠️ RAILWAY_STATIC_URL not set. Webhook may not work.")
+    
+    # Start Flask server
+    app.run(host='0.0.0.0', port=PORT)
