@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - VIEDIET SHOPSY ULTIMATE BOT v5.0
-# FEATURES: JSON Login + OTP Login + Auto Mining + Referral System
+# VIEDIET SHOPSY ULTIMATE - Bot + Web + API (Single File)
+# Deploy on Railway - Everything in One File!
 
 import os
 import logging
@@ -15,7 +14,8 @@ import asyncio
 import uuid
 import sys
 from datetime import datetime, timedelta
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask_cors import CORS
 from curl_cffi import requests as cffi_requests
 
 # ==================== CONFIG ====================
@@ -33,8 +33,8 @@ REFERRAL_TO_ACCOUNT = 1
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DB_PATH = os.path.join(DATA_DIR, "shopsy_ultimate.db")
-SESSIONS_DIR = os.path.join(DATA_DIR, "shopsy_sessions")
+DB_PATH = os.path.join(DATA_DIR, "viediet_ultimate.db")
+SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 logging.basicConfig(
@@ -43,6 +43,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ==================== FLASK APP ====================
+app = Flask(__name__, template_folder='.')
+app.secret_key = os.environ.get("SECRET_KEY", "viediet-secret-2026")
+CORS(app)
+
+# ==================== BOT INIT ====================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ==================== DATABASE ====================
@@ -70,7 +76,9 @@ def init_db():
         max_accounts_allowed INTEGER DEFAULT 5,
         login_method TEXT DEFAULT NULL,
         total_logins INTEGER DEFAULT 0,
-        last_login TEXT DEFAULT NULL
+        last_login TEXT DEFAULT NULL,
+        web_token TEXT DEFAULT NULL,
+        credits INTEGER DEFAULT 0
     )''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS referrals (
@@ -117,9 +125,13 @@ def init_db():
         mined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     
-    c.execute('''CREATE TABLE IF NOT EXISTS config (
-        key TEXT PRIMARY KEY,
-        value TEXT
+    c.execute('''CREATE TABLE IF NOT EXISTS credit_transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount INTEGER,
+        type TEXT,
+        reference TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     
     conn.commit()
@@ -156,7 +168,9 @@ def get_user(user_id):
             'max_accounts_allowed': row[16] if len(row) > 16 else 5,
             'login_method': row[17] if len(row) > 17 else None,
             'total_logins': row[18] if len(row) > 18 else 0,
-            'last_login': row[19] if len(row) > 19 else None
+            'last_login': row[19] if len(row) > 19 else None,
+            'web_token': row[20] if len(row) > 20 else None,
+            'credits': row[21] if len(row) > 21 else 0
         }
     return None
 
@@ -165,11 +179,12 @@ def create_user(user_id, username, first_name, referred_by=None):
     c = conn.cursor()
     now = datetime.now().isoformat()
     ref_code = f"REF{user_id}{random.randint(1000, 9999)}"
+    token = f"WEB{uuid.uuid4().hex[:16]}"
     
     c.execute('''INSERT OR IGNORE INTO users 
-        (user_id, username, first_name, status, registered_at, last_used, referred_by, referral_code, referrals_count, is_unlocked, is_premium, shopsy_logged_in, mining_active, channel_joined, total_accounts_added, max_accounts_allowed)
-        VALUES (?, ?, ?, 'LOCKED', ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 5)''',
-        (user_id, username, first_name, now, now, referred_by, ref_code))
+        (user_id, username, first_name, status, registered_at, last_used, referred_by, referral_code, web_token, credits)
+        VALUES (?, ?, ?, 'LOCKED', ?, ?, ?, ?, ?, 0)''',
+        (user_id, username, first_name, now, now, referred_by, ref_code, token))
     conn.commit()
     conn.close()
     
@@ -190,33 +205,25 @@ def update_user(user_id, **kwargs):
     conn.commit()
     conn.close()
 
-def add_pending_referral(referrer_id, referred_id):
+def get_user_by_token(token):
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
-    now = datetime.now().isoformat()
-    try:
-        c.execute('INSERT INTO pending_referrals (referrer_id, referred_id, join_timestamp) VALUES (?, ?, ?)',
-                  (referrer_id, referred_id, now))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    c.execute('SELECT * FROM users WHERE web_token = ?', (token,))
+    row = c.fetchone()
     conn.close()
-
-def get_referral_count(user_id):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND is_valid = 1', (user_id,))
-    count = c.fetchone()[0]
-    conn.close()
-    return count
-
-def get_pending_referral_count(user_id):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM pending_referrals WHERE referrer_id = ?', (user_id,))
-    count = c.fetchone()[0]
-    conn.close()
-    return count
+    if row:
+        return {
+            'user_id': row[0],
+            'username': row[1],
+            'first_name': row[2],
+            'status': row[3],
+            'is_unlocked': row[9] if len(row) > 9 else 0,
+            'is_premium': row[10] if len(row) > 10 else 0,
+            'shopsy_phone': row[12] if len(row) > 12 else None,
+            'web_token': row[20] if len(row) > 20 else None,
+            'credits': row[21] if len(row) > 21 else 0
+        }
+    return None
 
 def get_all_sessions(user_id):
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -227,10 +234,7 @@ def get_all_sessions(user_id):
     result = []
     for phone, session_data, login_method in rows:
         try:
-            if isinstance(session_data, str):
-                data = json.loads(session_data)
-            else:
-                data = session_data
+            data = json.loads(session_data) if isinstance(session_data, str) else session_data
             if not isinstance(data, dict):
                 data = {}
             result.append((phone, data, login_method))
@@ -241,25 +245,24 @@ def get_all_sessions(user_id):
 def get_accounts_count(user_id):
     return len(get_all_sessions(user_id))
 
+def get_referral_count(user_id):
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND is_valid = 1', (user_id,))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
 def get_max_accounts_allowed(user_id):
     user = get_user(user_id)
     if user:
         return user.get('max_accounts_allowed', 5)
     return 5
 
-def update_max_accounts(user_id):
-    referrals = get_referral_count(user_id)
-    max_allowed = 5 + (referrals * REFERRAL_TO_ACCOUNT)
-    update_user(user_id, max_accounts_allowed=max_allowed)
-    return max_allowed
-
 def save_session(user_id, phone, session_data, login_method="JSON"):
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
-    if isinstance(session_data, dict):
-        session_json = json.dumps(session_data)
-    else:
-        session_json = session_data if isinstance(session_data, str) else json.dumps({})
+    session_json = json.dumps(session_data) if isinstance(session_data, dict) else str(session_data)
     
     c.execute('''INSERT OR REPLACE INTO shopsy_sessions (user_id, phone, session_data, login_method, updated_at) 
                  VALUES (?, ?, ?, ?, ?)''',
@@ -281,14 +284,6 @@ def log_login(user_id, method, phone):
     c = conn.cursor()
     c.execute('INSERT INTO login_history (user_id, login_method, phone) VALUES (?, ?, ?)',
               (user_id, method, phone))
-    conn.commit()
-    conn.close()
-
-def logout_user(user_id):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('DELETE FROM shopsy_sessions WHERE user_id = ?', (user_id,))
-    c.execute('UPDATE users SET shopsy_logged_in = 0, shopsy_phone = NULL, mining_active = 0 WHERE user_id = ?', (user_id,))
     conn.commit()
     conn.close()
 
@@ -316,151 +311,15 @@ def get_total_users():
     conn.close()
     return count
 
-def get_unlocked_users():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM users WHERE is_unlocked = 1 OR is_premium = 1')
-    count = c.fetchone()[0]
-    conn.close()
-    return count
-
-def get_premium_users():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM users WHERE is_premium = 1')
-    count = c.fetchone()[0]
-    conn.close()
-    return count
-
-def get_locked_users():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM users WHERE is_unlocked = 0 AND is_premium = 0')
-    count = c.fetchone()[0]
-    conn.close()
-    return count
-
-def get_total_referrals():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM referrals WHERE is_valid = 1')
-    count = c.fetchone()[0]
-    conn.close()
-    return count
-
 def get_all_users():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
-    c.execute('''SELECT user_id, username, first_name, status, registered_at, last_used, 
-                 referrals_count, is_unlocked, is_premium, login_method, total_logins, 
-                 shopsy_phone FROM users ORDER BY registered_at DESC''')
+    c.execute('SELECT user_id, username, first_name, status, referrals_count, is_unlocked, is_premium FROM users ORDER BY registered_at DESC')
     rows = c.fetchall()
     conn.close()
     return rows
 
-def check_and_award_referrals():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    now = datetime.now()
-    
-    c.execute('SELECT id, referrer_id, referred_id, join_timestamp FROM pending_referrals')
-    pending = c.fetchall()
-    
-    for pid, referrer_id, referred_id, join_ts in pending:
-        try:
-            c.execute('SELECT status FROM users WHERE user_id = ?', (referred_id,))
-            user_row = c.fetchone()
-            if user_row and user_row[0] in ['LOCKED', 'UNLOCKED', 'ACTIVE']:
-                c.execute('UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id = ?', (referrer_id,))
-                c.execute('INSERT INTO referrals (referrer_id, referred_id, join_timestamp, is_valid) VALUES (?, ?, ?, 1)',
-                          (referrer_id, referred_id, join_ts))
-                c.execute('DELETE FROM pending_referrals WHERE id = ?', (pid,))
-                conn.commit()
-                
-                c.execute('SELECT referrals_count FROM users WHERE user_id = ?', (referrer_id,))
-                count = c.fetchone()[0]
-                
-                new_max = 5 + (count * REFERRAL_TO_ACCOUNT)
-                c.execute('UPDATE users SET max_accounts_allowed = ? WHERE user_id = ?', (new_max, referrer_id))
-                conn.commit()
-                
-                if count >= REFERRAL_REQUIRED:
-                    c.execute('UPDATE users SET is_unlocked = 1, status = "UNLOCKED" WHERE user_id = ?', (referrer_id,))
-                    conn.commit()
-                    try:
-                        bot.send_message(
-                            referrer_id,
-                            f"🎉 <b>CONGRATULATIONS!</b>\n\n"
-                            f"You have completed <b>{REFERRAL_REQUIRED} referrals</b>!\n"
-                            f"🔓 <b>Bot is now UNLOCKED!</b>\n\n"
-                            f"📱 You can now add up to <b>{new_max}</b> accounts!\n"
-                            f"🚀 Click <b>AUTO MINE</b> to begin!",
-                            parse_mode="HTML"
-                        )
-                    except:
-                        pass
-                else:
-                    try:
-                        bot.send_message(
-                            referrer_id,
-                            f"🎉 <b>Referral Bonus!</b>\n\n"
-                            f"👥 You now have <b>{count}</b> referrals!\n"
-                            f"📱 Account limit increased to <b>{new_max}</b> accounts!\n"
-                            f"🎯 Need <b>{REFERRAL_REQUIRED - count}</b> more to unlock!",
-                            parse_mode="HTML"
-                        )
-                    except:
-                        pass
-        except Exception as e:
-            logger.error(f"Referral award error: {e}")
-    
-    conn.close()
-
-def run_scheduled_tasks():
-    while True:
-        try:
-            check_and_award_referrals()
-        except Exception as e:
-            logger.error(f"Scheduled task error: {e}")
-        time.sleep(60)
-
-# ==================== CHANNEL CHECK ====================
-def check_channel_membership(user_id):
-    try:
-        member = bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
-        is_member = member.status in ['member', 'administrator', 'creator']
-        if is_member:
-            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-            c = conn.cursor()
-            c.execute('UPDATE users SET channel_joined = 1 WHERE user_id = ?', (user_id,))
-            conn.commit()
-            conn.close()
-        return is_member
-    except:
-        return False
-
-def channel_join_force_keyboard():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.row(InlineKeyboardButton("📢 JOIN CHANNEL", url=f"https://t.me/{CHANNEL_USERNAME}"))
-    kb.row(InlineKeyboardButton("✅ CHECK JOINED", callback_data="check_channel"))
-    return kb
-
-def channel_join_message():
-    return f"""
-🔒 <b>CHANNEL REQUIRED</b>
-
-⚠️ <b>You must join our channel to use this bot!</b>
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📢 <b>Channel:</b> @{CHANNEL_USERNAME}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Click below to join, then click ✅ CHECK JOINED
-"""
-
-# ==================== SHOPSY API FUNCTIONS ====================
+# ==================== SHOPSY API ====================
 def sync_api_request(method, url_path, json_body, session_data, is_game=False):
     if not isinstance(session_data, dict):
         session_data = {}
@@ -469,134 +328,76 @@ def sync_api_request(method, url_path, json_body, session_data, is_game=False):
     visit_id = session_data.get("visit_id") or f"{uuid.uuid4().hex[:32]}-{int(time.time() * 1000)}"
     app_sess = session_data.get("app_session_id") or f"{uuid.uuid4()}_{int(time.time()*1000)}"
 
+    headers = {
+        "X-PARTNER-CONTEXT": '{"source":"reseller"}',
+        "FK-TENANT-ID": "SHOPSY",
+        "business": "reseller",
+        "Content-Type": "application/json; charset=UTF-8",
+        "User-Agent": "okhttp/4.9.2",
+        "X-User-Agent": f"Mozilla/5.0 (Linux; Android 9; CPH2083 Build/PPR1.180610.011) FKUA/Retail/2291170/Android/Mobile (OPPO/CPH2083/{device_id})",
+        "X-Visit-Id": visit_id,
+        "Accept-Encoding": "gzip",
+        "Connection": "Keep-Alive",
+        "city": "Delhi",
+        "X-AppSession-ID": app_sess
+    }
     if is_game:
-        headers = {
-            "x-user-agent": f"Mozilla/5.0 (Linux; Android 9; OPPO:CPH2083 Build/{device_id[:13]}) FKUA/Retail/2291170/Android/Mobile (OPPO/OPPO:CPH2083/{device_id})",
-            "sessionid": "session_id",
-            "Content-Type": "application/json; charset=UTF-8",
-            "User-Agent": "okhttp/4.9.2",
-            "Accept-Encoding": "gzip",
-            "Connection": "Keep-Alive",
-            "city": "Delhi"
-        }
-    else:
-        headers = {
-            "X-PARTNER-CONTEXT": '{"source":"reseller"}',
-            "FK-TENANT-ID": "SHOPSY",
-            "business": "reseller",
-            "Content-Type": "application/json; charset=UTF-8",
-            "User-Agent": "okhttp/4.9.2",
-            "X-User-Agent": f"Mozilla/5.0 (Linux; Android 9; CPH2083 Build/PPR1.180610.011) FKUA/Retail/2291170/Android/Mobile (OPPO/CPH2083/{device_id})",
-            "X-Visit-Id": visit_id,
-            "Accept-Encoding": "gzip",
-            "Connection": "Keep-Alive",
-            "city": "Delhi",
-            "X-AppSession-ID": app_sess
-        }
-        for k in ["at", "sn", "secureToken"]:
-            if session_data.get(k):
-                headers[k] = session_data[k]
-
+        headers["sessionid"] = "session_id"
+    
     req_session = cffi_requests.Session(impersonate="chrome110")
-
-    for attempt in range(1, 4):
-        dc = session_data.get("current_dc", "1")
-        url = f"https://{dc}.rome.api.flipkart.net{url_path}"
-        try:
-            resp = req_session.post(url, json=json_body, headers=headers, timeout=30, verify=False) if method == "POST" else req_session.get(url, headers=headers, timeout=30, verify=False)
-
-            try:
-                resp_json = resp.json()
-            except:
-                resp_json = {}
-
-            if resp.status_code == 406 and resp_json.get("ERROR_MESSAGE") == "DC Change":
-                new_dc = resp_json.get("RESPONSE", {}).get("id") or resp_json.get("RESPONSE", {}).get("dc")
-                if new_dc:
-                    session_data["current_dc"] = str(new_dc)
-                    continue
-
-            return resp.status_code, resp_json, dict(resp.headers), session_data
-        except Exception as e:
-            if attempt == 3:
-                return 500, {"error": str(e)}, {}, session_data
-            time.sleep(2)
-
-    return 500, {"error": "Max retries"}, {}, session_data
+    dc = session_data.get("current_dc", "1")
+    url = f"https://{dc}.rome.api.flipkart.net{url_path}"
+    
+    try:
+        resp = req_session.post(url, json=json_body, headers=headers, timeout=30, verify=False)
+        resp_json = resp.json() if resp.text else {}
+        return resp.status_code, resp_json, dict(resp.headers), session_data
+    except Exception as e:
+        return 500, {"error": str(e)}, {}, session_data
 
 def update_session(session_data, resp_json, resp_headers):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
     if isinstance(resp_json, dict):
         sess_block = resp_json.get("SESSION") or resp_json.get("RESPONSE", {}).get("SESSION") or {}
         for k in ["accountId", "at", "rt", "sn", "secureToken", "nsid", "vid", "email", "firstName", "lastName"]:
             if sess_block.get(k):
                 session_data[k] = sess_block[k]
-        if session_data.get("firstName"):
-            session_data["userName"] = f"{session_data.get('firstName', '')} {session_data.get('lastName', '')}".strip()
-        if sess_block.get("isLoggedIn") is not None:
-            session_data["isLoggedIn"] = sess_block["isLoggedIn"]
-    if resp_headers:
-        headers_lower = {k.lower(): v for k, v in resp_headers.items()}
-        for k in ["at", "rt", "sn", "nsid", "vid"]:
-            if k in headers_lower:
-                session_data[k] = headers_lower[k]
-        if headers_lower.get("securecookie"):
-            session_data["secureCookie"] = headers_lower.get("securecookie")
     return session_data
 
 async def run_sh_user_state(session_data):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
     body = {
         "location": {"pincode": None},
-        "ad": {"adId": str(uuid.uuid4()), "doNotPersonalizeAds": False, "sdkAdId": "", "adSdkVersion": "2.12.0"},
+        "ad": {"adId": str(uuid.uuid4()), "doNotPersonalizeAds": False},
         "locale": {"deviceLanguage": "en", "shouldRefreshLanguage": False},
-        "versions": {
-            "cart": 1167987101,
-            "userAccountState": 0,
-            "abResponse": -2054295432,
-            "abVariables": 0,
-            "accountDetails": 1220048498,
-            "wishlist": 0,
-            "notifications": 861101,
-            "location": 23273,
-            "lockinResponse": 426889274
-        }
+        "versions": {"cart": 1167987101, "userAccountState": 0}
     }
-    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/4/user/state", body, session_data, False)
+    st, resp_json, headers, session_data = await asyncio.to_thread(
+        sync_api_request, "POST", "/4/user/state", body, session_data, False
+    )
     return update_session(session_data, resp_json, headers)
 
 async def get_user_info_tg(session_data):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
     body = {
         "requestMethod": "GET",
         "routeUri": "user/get-user",
-        "payload": {"userId": session_data.get("accountId", ""), "userName": session_data.get("userName", "User")}
+        "payload": {"userId": session_data.get("accountId", ""), "userName": "User"}
     }
-    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
+    st, resp_json, headers, session_data = await asyncio.to_thread(
+        sync_api_request, "POST", "/1/shopsy/games", body, session_data, True
+    )
     if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
         return resp_json["data"]
     return None
 
 async def get_config_tg(session_data):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
     body = {"requestMethod": "GET", "routeUri": "config/get-config", "payload": {}}
-    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
+    st, resp_json, headers, session_data = await asyncio.to_thread(
+        sync_api_request, "POST", "/1/shopsy/games", body, session_data, True
+    )
     if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
         return resp_json["data"]
     return None
 
 async def claim_gullak_tg(session_data):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
     body = {
         "requestMethod": "POST",
         "routeUri": "gullak/claim-gullak",
@@ -605,23 +406,19 @@ async def claim_gullak_tg(session_data):
     await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
 
 async def start_game_tg(session_data, game_id):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
     body = {
         "requestMethod": "POST",
         "routeUri": "game/game-started",
         "payload": {"userId": session_data.get("accountId", ""), "gameId": game_id}
     }
-    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
+    st, resp_json, headers, session_data = await asyncio.to_thread(
+        sync_api_request, "POST", "/1/shopsy/games", body, session_data, True
+    )
     if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
         return resp_json["data"].get("sessionId"), resp_json["data"]
     return None, resp_json
 
 async def end_game_tg(session_data, game_id, game_session_id, play_time, gems_earned):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
     body = {
         "requestMethod": "POST",
         "routeUri": "game/game-ended",
@@ -633,596 +430,852 @@ async def end_game_tg(session_data, game_id, game_session_id, play_time, gems_ea
             "playTimeInSec": play_time
         }
     }
-    st, resp_json, headers, session_data = await asyncio.to_thread(sync_api_request, "POST", "/1/shopsy/games", body, session_data, True)
+    st, resp_json, headers, session_data = await asyncio.to_thread(
+        sync_api_request, "POST", "/1/shopsy/games", body, session_data, True
+    )
     if st == 200 and isinstance(resp_json, dict) and resp_json.get("success"):
         return resp_json["data"]
     return None
 
 async def mine_single_account(session_data, status_callback=None):
-    if not isinstance(session_data, dict):
-        session_data = {}
-    
     phone = session_data.get("phone", "Unknown")
     
-    if status_callback:
-        await status_callback(f"📱 **Account:** +91{phone}\n━━━━━━━━━━━━━━━━━━━━━")
-    
-    if status_callback:
-        await status_callback(f"🔄 Fetching user state...")
     session_data = await run_sh_user_state(session_data)
-    
-    if status_callback:
-        await status_callback(f"💰 Getting balance...")
     initial_user_data = await get_user_info_tg(session_data)
     if not initial_user_data:
         return {"status": "fail", "earned": 0, "msg": "Session expired", "phone": phone}
     initial_coins = initial_user_data.get("earnings", {}).get("coinsEarnedTotal", 0)
 
-    if status_callback:
-        await status_callback(f"🎁 Claiming gullak...")
     await claim_gullak_tg(session_data)
-
-    if status_callback:
-        await status_callback(f"🎮 Fetching games...")
     config_data = await get_config_tg(session_data)
     games = config_data.get("games", []) if config_data else []
     if not games:
         return {"status": "fail", "earned": 0, "msg": "No active games", "phone": phone}
 
-    total = len(games)
     played_count = 0
     total_gems = 0
     
-    for i, g in enumerate(games):
+    for g in games:
         game_id = g.get("id")
-        game_name = g.get("name", game_id)
-        
-        if status_callback:
-            await status_callback(f"🎮 [{i+1}/{total}] Playing {game_name}...")
-        
         game_sess_id, _ = await start_game_tg(session_data, game_id)
         if game_sess_id:
             wait = random.randint(10, 15)
-            for sec in range(wait, 0, -1):
-                if sec % 5 == 0 or sec <= 3:
-                    if status_callback:
-                        await status_callback(f"⏳ {game_name}... {sec}s remaining")
-                await asyncio.sleep(1)
-            
+            await asyncio.sleep(wait)
             gems = random.randint(3000, 5000)
             end_data = await end_game_tg(session_data, game_id, game_sess_id, wait, gems)
             if end_data:
                 played_count += 1
                 total_gems += gems
-                if status_callback:
-                    await status_callback(f"✅ +{gems} gems from {game_name}")
-            else:
-                if status_callback:
-                    await status_callback(f"⚠️ Failed to complete {game_name}")
-        else:
-            if status_callback:
-                await status_callback(f"❌ Could not start {game_name}")
-        await asyncio.sleep(1)
 
-    if status_callback:
-        await status_callback(f"📊 Finalizing...")
     final_user_data = await get_user_info_tg(session_data)
     final_coins = final_user_data.get("earnings", {}).get("coinsEarnedTotal", 0) if final_user_data else initial_coins
     earned = max(0, final_coins - initial_coins)
 
-    result = {
+    return {
         "status": "success",
         "earned": earned,
-        "final_coins": final_coins,
         "played": played_count,
-        "total": total,
+        "total": len(games),
         "gems": total_gems,
         "phone": phone
     }
+
+# ==================== WEB ROUTES ====================
+
+# Embedded HTML Dashboard
+DASHBOARD_HTML = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VIEDIET SHOPSY ULTIMATE</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #0a0a12;
+            --card: #14142a;
+            --border: #2a2a4a;
+            --accent: #7c3aed;
+            --text: #ffffff;
+            --text-secondary: #a0a0b8;
+            --success: #10b981;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        
+        /* Header */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            font-size: 24px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .header h1 i { color: var(--accent); }
+        .header-info { display: flex; align-items: center; gap: 20px; }
+        .user-badge {
+            padding: 6px 16px;
+            border-radius: 20px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            font-size: 14px;
+        }
+        .status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .status-dot.online { background: var(--success); }
+        
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: var(--card);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }
+        .stat-card .label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .stat-card .value {
+            font-size: 28px;
+            font-weight: 700;
+            margin: 8px 0;
+        }
+        .stat-card .sub {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        
+        /* Quick Actions */
+        .actions {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            margin-bottom: 30px;
+        }
+        .action-btn {
+            background: var(--card);
+            padding: 16px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            color: var(--text);
+            text-decoration: none;
+        }
+        .action-btn:hover {
+            border-color: var(--accent);
+            transform: translateY(-2px);
+        }
+        .action-btn i {
+            font-size: 24px;
+            color: var(--accent);
+            display: block;
+            margin-bottom: 8px;
+        }
+        .action-btn .label { font-size: 13px; font-weight: 600; }
+        .action-btn .desc { font-size: 11px; color: var(--text-secondary); }
+        
+        /* Activity */
+        .activity {
+            background: var(--card);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            padding: 20px;
+        }
+        .activity h3 { margin-bottom: 15px; font-size: 16px; }
+        .activity-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 14px;
+        }
+        .activity-item:last-child { border: none; }
+        .activity-item .time { color: var(--text-secondary); font-size: 12px; }
+        
+        /* Modals */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 999;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal.active { display: flex; }
+        .modal-content {
+            background: var(--bg);
+            padding: 30px;
+            border-radius: 16px;
+            border: 1px solid var(--border);
+            max-width: 500px;
+            width: 90%;
+        }
+        .modal-content h2 {
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .modal-content input {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: var(--card);
+            color: var(--text);
+            margin-bottom: 12px;
+        }
+        .modal-content button {
+            padding: 12px 24px;
+            border-radius: 8px;
+            border: none;
+            background: var(--accent);
+            color: white;
+            cursor: pointer;
+            font-weight: 600;
+            width: 100%;
+        }
+        .modal-content button:hover { opacity: 0.9; }
+        .modal-close {
+            float: right;
+            cursor: pointer;
+            color: var(--text-secondary);
+        }
+        
+        /* Login */
+        .login-container {
+            max-width: 400px;
+            margin: 100px auto;
+            padding: 40px;
+            background: var(--card);
+            border-radius: 16px;
+            border: 1px solid var(--border);
+        }
+        .login-container h1 {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .login-container input {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: var(--bg);
+            color: var(--text);
+            margin-bottom: 12px;
+        }
+        .login-container button {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            border: none;
+            background: var(--accent);
+            color: white;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        
+        /* Responsive */
+        @media (max-width: 600px) {
+            .header { flex-direction: column; gap: 10px; }
+            .header-info { flex-wrap: wrap; }
+            .stats-grid { grid-template-columns: 1fr 1fr; }
+            .actions { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- LOGIN PAGE -->
+<div id="loginPage" style="display: none;">
+    <div class="login-container">
+        <h1><i class="fas fa-rocket" style="color: var(--accent);"></i> VIEDIET</h1>
+        <p style="text-align: center; color: var(--text-secondary); margin-bottom: 20px;">Login to your dashboard</p>
+        <input type="number" id="loginUserId" placeholder="Telegram User ID">
+        <input type="password" id="loginPassword" placeholder="Password (default: 123456)">
+        <button onclick="handleLogin()">Login</button>
+        <p style="text-align: center; color: var(--text-secondary); font-size: 12px; margin-top: 15px;">Default password: 123456</p>
+    </div>
+</div>
+
+<!-- MAIN DASHBOARD -->
+<div id="dashboardPage">
+    <div class="container">
+        <div class="header">
+            <h1><i class="fas fa-rocket"></i> VIEDIET SHOPSY ULTIMATE</h1>
+            <div class="header-info">
+                <span class="user-badge" id="userBadge">👤 Loading...</span>
+                <span class="user-badge" id="premiumBadge">⭐ Free</span>
+                <button onclick="logout()" style="background: none; border: none; color: var(--text-secondary); cursor: pointer;">
+                    <i class="fas fa-sign-out-alt"></i>
+                </button>
+            </div>
+        </div>
+
+        <div class="stats-grid" id="statsGrid">
+            <div class="stat-card">
+                <div class="label">Accounts</div>
+                <div class="value" id="accCount">0</div>
+                <div class="sub">Total Accounts</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Referrals</div>
+                <div class="value" id="refCount">0</div>
+                <div class="sub">Total Referrals</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Mining Status</div>
+                <div class="value" style="font-size: 20px;" id="miningStatus">
+                    <span class="status-dot online"></span> Ready
+                </div>
+                <div class="sub">Ready to Mine</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Total Coins</div>
+                <div class="value" id="totalCoins">0</div>
+                <div class="sub">Points Earned</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Today Mined</div>
+                <div class="value" id="todayCoins">0</div>
+                <div class="sub">Points Today</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Bot Status</div>
+                <div class="value" style="font-size: 20px;">
+                    <span class="status-dot online"></span> Online
+                </div>
+                <div class="sub">Everything OK</div>
+            </div>
+        </div>
+
+        <div class="actions">
+            <div class="action-btn" onclick="startMining()">
+                <i class="fas fa-robot"></i>
+                <div class="label">AUTO MINE</div>
+                <div class="desc">Mine all accounts</div>
+            </div>
+            <div class="action-btn" onclick="showOTPLogin()">
+                <i class="fas fa-mobile-alt"></i>
+                <div class="label">OTP LOGIN</div>
+                <div class="desc">Login with OTP</div>
+            </div>
+            <div class="action-btn" onclick="showJSONLogin()">
+                <i class="fas fa-file-code"></i>
+                <div class="label">JSON LOGIN</div>
+                <div class="desc">Upload JSON file</div>
+            </div>
+            <div class="action-btn" onclick="loadAccounts()">
+                <i class="fas fa-users"></i>
+                <div class="label">MY ACCOUNTS</div>
+                <div class="desc">View saved accounts</div>
+            </div>
+            <div class="action-btn" onclick="loadHistory()">
+                <i class="fas fa-history"></i>
+                <div class="label">HISTORY</div>
+                <div class="desc">View mining history</div>
+            </div>
+            <div class="action-btn" onclick="refreshDashboard()">
+                <i class="fas fa-sync"></i>
+                <div class="label">REFRESH</div>
+                <div class="desc">Refresh dashboard</div>
+            </div>
+        </div>
+
+        <div class="activity">
+            <h3>📋 Recent Activity</h3>
+            <div id="activityList">
+                <div class="activity-item">
+                    <span>🟢 Bot started successfully</span>
+                    <span class="time">Just now</span>
+                </div>
+            </div>
+        </div>
+
+        <div style="text-align: center; margin-top: 20px; color: var(--text-secondary); font-size: 12px; border-top: 1px solid var(--border); padding-top: 15px;">
+            VIEDIET PREMIUM BOT • Fast • Secure • Reliable
+        </div>
+    </div>
+</div>
+
+<!-- OTP Modal -->
+<div class="modal" id="otpModal">
+    <div class="modal-content">
+        <span class="modal-close" onclick="closeModal('otpModal')">&times;</span>
+        <h2><i class="fas fa-mobile-alt" style="color: var(--accent);"></i> OTP Login</h2>
+        <input type="number" id="otpPhone" placeholder="10-digit phone number">
+        <button onclick="requestOTP()">Send OTP</button>
+        <div id="otpVerify" style="display: none; margin-top: 15px;">
+            <input type="number" id="otpCode" placeholder="Enter OTP">
+            <button onclick="verifyOTP()">Verify OTP</button>
+        </div>
+    </div>
+</div>
+
+<!-- JSON Modal -->
+<div class="modal" id="jsonModal">
+    <div class="modal-content">
+        <span class="modal-close" onclick="closeModal('jsonModal')">&times;</span>
+        <h2><i class="fas fa-file-code" style="color: var(--accent);"></i> JSON Login</h2>
+        <p style="color: var(--text-secondary); margin-bottom: 15px;">Paste your JSON session data below</p>
+        <textarea id="jsonData" rows="6" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text);"></textarea>
+        <button onclick="jsonLogin()">Login</button>
+    </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/js/all.min.js"></script>
+<script>
+const API_URL = window.location.origin;
+let userData = null;
+let token = localStorage.getItem('viediet_token');
+
+function showLogin() {
+    document.getElementById('loginPage').style.display = 'block';
+    document.getElementById('dashboardPage').style.display = 'none';
+}
+
+function showDashboard() {
+    document.getElementById('loginPage').style.display = 'none';
+    document.getElementById('dashboardPage').style.display = 'block';
+}
+
+async function handleLogin() {
+    const user_id = document.getElementById('loginUserId').value;
+    const password = document.getElementById('loginPassword').value || '123456';
     
-    if status_callback:
-        await status_callback(f"✅ **Complete!** +{earned} coins | {played_count}/{total} games | 💎{total_gems}")
-        await status_callback(f"━━━━━━━━━━━━━━━━━━━━━")
+    try {
+        const res = await fetch(`${API_URL}/api/web/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: parseInt(user_id), password })
+        });
+        const data = await res.json();
+        if (data.success) {
+            token = data.token;
+            localStorage.setItem('viediet_token', token);
+            userData = data.user;
+            showDashboard();
+            loadDashboard();
+        } else {
+            alert('Login failed: ' + (data.error || 'Unknown error'));
+        }
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
+}
+
+async function loadDashboard() {
+    if (!token) { showLogin(); return; }
+    try {
+        const res = await fetch(`${API_URL}/api/web/dashboard?token=${token}`);
+        const data = await res.json();
+        if (data.error) { showLogin(); return; }
+        userData = data;
+        updateUI(data);
+    } catch (e) {
+        showLogin();
+    }
+}
+
+function updateUI(data) {
+    document.getElementById('userBadge').textContent = '👤 ' + (data.user?.first_name || 'User');
+    document.getElementById('premiumBadge').textContent = data.user?.is_premium ? '⭐ Premium' : '⭐ Free';
+    document.getElementById('accCount').textContent = data.accounts || 0;
+    document.getElementById('refCount').textContent = data.referrals || 0;
+    document.getElementById('totalCoins').textContent = data.mining_stats?.total_coins || 0;
     
-    return result
+    const status = data.user?.mining_active ? '🟢 Mining...' : '🟡 Ready';
+    document.getElementById('miningStatus').innerHTML = status;
+}
 
-# ==================== AUTO MINING ENGINE ====================
-class AutoMiningEngine:
-    def __init__(self, bot, user_id, chat_id):
-        self.bot = bot
-        self.user_id = user_id
-        self.chat_id = chat_id
-        self.is_running = False
-        self.thread = None
-        self.total_earned = 0
-        self.total_gems = 0
-        self.total_played = 0
-        self.success_count = 0
-        self.status_msg_id = None
+async function startMining() {
+    if (!token) return;
+    try {
+        const res = await fetch(`${API_URL}/api/web/mining/start?token=${token}`, { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+            alert(`✅ Mining Complete!\nTotal Coins: ${data.total_coins}\nTotal Gems: ${data.total_gems}`);
+            loadDashboard();
+        } else {
+            alert('Mining failed: ' + (data.error || 'Unknown'));
+        }
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
+}
+
+function showOTPLogin() {
+    document.getElementById('otpModal').classList.add('active');
+    document.getElementById('otpVerify').style.display = 'none';
+}
+
+function showJSONLogin() {
+    document.getElementById('jsonModal').classList.add('active');
+}
+
+function closeModal(id) {
+    document.getElementById(id).classList.remove('active');
+}
+
+async function requestOTP() {
+    const phone = document.getElementById('otpPhone').value;
+    if (!phone || phone.length !== 10) {
+        alert('Enter valid 10-digit phone number');
+        return;
+    }
+    try {
+        const res = await fetch(`${API_URL}/api/web/otp/request`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone, token })
+        });
+        const data = await res.json();
+        if (data.success) {
+            document.getElementById('otpVerify').style.display = 'block';
+            alert('OTP sent to +91' + phone);
+        } else {
+            alert('Failed: ' + (data.error || 'Unknown'));
+        }
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
+}
+
+async function verifyOTP() {
+    const phone = document.getElementById('otpPhone').value;
+    const otp = document.getElementById('otpCode').value;
+    if (!otp || otp.length !== 6) {
+        alert('Enter valid 6-digit OTP');
+        return;
+    }
+    try {
+        const res = await fetch(`${API_URL}/api/web/otp/verify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone, otp, token })
+        });
+        const data = await res.json();
+        if (data.success) {
+            alert('✅ OTP Verified! Account added.');
+            closeModal('otpModal');
+            loadDashboard();
+        } else {
+            alert('Failed: ' + (data.error || 'Invalid OTP'));
+        }
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
+}
+
+async function jsonLogin() {
+    const jsonData = document.getElementById('jsonData').value;
+    if (!jsonData) {
+        alert('Please paste JSON data');
+        return;
+    }
+    try {
+        const res = await fetch(`${API_URL}/api/web/json/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ json_data: jsonData, token })
+        });
+        const data = await res.json();
+        if (data.success) {
+            alert('✅ JSON Login Successful!');
+            closeModal('jsonModal');
+            loadDashboard();
+        } else {
+            alert('Failed: ' + (data.error || 'Unknown'));
+        }
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
+}
+
+async function loadAccounts() {
+    if (!token) return;
+    try {
+        const res = await fetch(`${API_URL}/api/web/accounts?token=${token}`);
+        const data = await res.json();
+        if (data.accounts && data.accounts.length) {
+            let msg = '📋 MY ACCOUNTS\n\n';
+            data.accounts.forEach((acc, i) => {
+                msg += `${i+1}. +91${acc.phone} (${acc.login_method})\n`;
+            });
+            alert(msg);
+        } else {
+            alert('No accounts found. Add one using OTP or JSON login.');
+        }
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
+}
+
+async function loadHistory() {
+    if (!token) return;
+    try {
+        const res = await fetch(`${API_URL}/api/web/history?token=${token}`);
+        const data = await res.json();
+        if (data.history && data.history.length) {
+            let msg = '📊 MINING HISTORY\n\n';
+            data.history.forEach(h => {
+                msg += `+91${h.phone} | +${h.coins_earned} coins | 💎${h.gems_earned}\n`;
+            });
+            alert(msg);
+        } else {
+            alert('No mining history yet.');
+        }
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
+}
+
+function refreshDashboard() {
+    loadDashboard();
+    alert('🔄 Dashboard refreshed!');
+}
+
+function logout() {
+    localStorage.removeItem('viediet_token');
+    token = null;
+    userData = null;
+    showLogin();
+}
+
+// Check token on load
+if (token) {
+    loadDashboard();
+} else {
+    showLogin();
+}
+
+// Auto-refresh every 60 seconds
+setInterval(loadDashboard, 60000);
+</script>
+</body>
+</html>
+'''
+
+# ==================== WEB API ROUTES ====================
+
+@app.route('/')
+def index():
+    return DASHBOARD_HTML
+
+@app.route('/api/web/login', methods=['POST'])
+def web_login():
+    data = request.json
+    user_id = data.get('user_id')
+    password = data.get('password', '123456')
     
-    def start_auto_mining(self):
-        if self.is_running:
-            return "⚠️ Mining already in progress!"
-        
-        sessions = get_all_sessions(self.user_id)
-        if not sessions:
-            return "❌ No saved accounts! Please login first."
-        
-        self.is_running = True
-        self.total_earned = 0
-        self.total_gems = 0
-        self.total_played = 0
-        self.success_count = 0
-        update_user(self.user_id, mining_active=1)
-        
-        self.thread = threading.Thread(target=self._run_auto_mining, daemon=True)
-        self.thread.start()
-        return f"✅ Auto-mining started with {len(sessions)} accounts!"
-    
-    def _send_progress(self, msg):
-        try:
-            if self.status_msg_id:
-                self.bot.edit_message_text(
-                    msg,
-                    chat_id=self.chat_id,
-                    message_id=self.status_msg_id,
-                    parse_mode="Markdown"
-                )
-            else:
-                sent = self.bot.send_message(
-                    self.chat_id,
-                    msg,
-                    parse_mode="Markdown"
-                )
-                self.status_msg_id = sent.message_id
-        except Exception as e:
-            if "message is not modified" not in str(e):
-                sent = self.bot.send_message(
-                    self.chat_id,
-                    msg,
-                    parse_mode="Markdown"
-                )
-                self.status_msg_id = sent.message_id
-    
-    def _run_auto_mining(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        sessions = get_all_sessions(self.user_id)
-        
-        valid_sessions = []
-        for phone, session_data, login_method in sessions:
-            if isinstance(session_data, dict) and session_data:
-                valid_sessions.append((phone, session_data, login_method))
-            else:
-                logger.warning(f"Invalid session data for {phone}, skipping")
-        
-        if not valid_sessions:
-            self._send_progress("❌ No valid sessions found! Please re-login.")
-            update_user(self.user_id, mining_active=0)
-            self.is_running = False
-            return
-        
-        initial_msg = f"""
-🚀 **AUTO-MINING STARTED!**
-
-📱 **Accounts:** {len(valid_sessions)}
-⏳ Processing one by one...
-
-━━━━━━━━━━━━━━━━━━━━━
-"""
-        self._send_progress(initial_msg)
-        
-        async def status_callback(msg):
-            try:
-                current_msg = f"""
-🚀 **AUTO-MINING IN PROGRESS...**
-
-📱 Accounts: {len(valid_sessions)}
-✅ Completed: {self.success_count}
-💰 Total Earned: {self.total_earned} coins
-💎 Total Gems: {self.total_gems}
-
-━━━━━━━━━━━━━━━━━━━━━
-{msg}
-"""
-                self._send_progress(current_msg)
-            except Exception as e:
-                logger.error(f"Status callback error: {e}")
-        
-        async def run():
-            results = []
-            
-            for idx, (phone, session_data, login_method) in enumerate(valid_sessions):
-                session_data["phone"] = phone
-                session_data["user_id"] = self.user_id
-                
-                await status_callback(f"📱 **Account {idx+1}/{len(valid_sessions)}:** +91{phone}")
-                await status_callback(f"🔑 Login: {login_method}")
-                await status_callback(f"━━━━━━━━━━━━━━━━━━━━━")
-                
-                try:
-                    result = await mine_single_account(session_data, status_callback)
-                    results.append(result)
-                except Exception as e:
-                    logger.error(f"Mining error for {phone}: {e}")
-                    await status_callback(f"❌ Error: {str(e)[:50]}")
-                    results.append({"status": "fail", "phone": phone, "msg": str(e)})
-                
-                if result.get("status") == "success":
-                    self.success_count += 1
-                    self.total_earned += result.get("earned", 0)
-                    self.total_gems += result.get("gems", 0)
-                    self.total_played += result.get("played", 0)
-                    save_mining_history(self.user_id, phone, result.get("earned", 0), result.get("played", 0), result.get("gems", 0))
-                
-                await asyncio.sleep(2)
-            
-            summary_msg = f"""
-✅ **AUTO-MINING COMPLETE!**
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📱 **Accounts Mined:** {len(results)}
-✅ **Successful:** {self.success_count}
-💰 **Total Coins Earned:** {self.total_earned}
-💎 **Total Gems Earned:** {self.total_gems}
-🎮 **Total Games Played:** {self.total_played}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📌 **Next Steps:**
-• Click 🚀 AUTO MINE again for daily mining
-• Add more accounts via JSON or OTP Login
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-            
-            for r in results:
-                if r.get("status") == "success":
-                    summary_msg += f"\n✅ +91{r['phone']} → +{r['earned']} coins"
-                else:
-                    summary_msg += f"\n❌ +91{r.get('phone', '?')} → {r.get('msg', 'Failed')}"
-            
-            self._send_progress(summary_msg)
-            
-            update_user(self.user_id, mining_active=0)
-            self.is_running = False
-        
-        try:
-            loop.run_until_complete(run())
-        except Exception as e:
-            logger.error(f"Auto mining error: {e}")
-            self._send_progress(f"❌ **Error:** {str(e)[:100]}")
-            update_user(self.user_id, mining_active=0)
-            self.is_running = False
-        finally:
-            loop.close()
-
-# ==================== GLOBAL STATES ====================
-mining_engines = {}
-user_shopsy_state = {}
-shopsy_otp_data = {}
-
-# ==================== MENU FUNCTIONS ====================
-def locked_menu_text(user_id, first_name, referral_count, pending_count, is_premium=False):
-    remaining = max(0, REFERRAL_REQUIRED - referral_count)
-    max_accounts = 5 + referral_count
-    
-    if is_premium:
-        return f"""
-⭐ <b>VIEDIET SHOPSY ULTIMATE</b> ⭐
-
-👋 Welcome, <b>{first_name}</b>!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-👑 <b>Status:</b> PREMIUM UNLOCKED
-📱 <b>Account Limit:</b> UNLIMITED
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-✨ <b>Premium Features:</b>
-• Unlimited accounts
-• Auto-mining all accounts
-• Priority support
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🚀 Click <b>UNLOCKED MENU</b> to get started!
-"""
-    
-    return f"""
-🔒 <b>VIEDIET SHOPSY ULTIMATE</b>
-
-👋 Welcome, <b>{first_name}</b>!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔒 <b>Status:</b> LOCKED
-👥 <b>Referrals:</b> {referral_count}/{REFERRAL_REQUIRED}
-⏳ <b>Pending:</b> {pending_count}
-📱 <b>Account Limit:</b> {max_accounts}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>📌 Two Ways to Unlock:</b>
-
-1️⃣ <b>FREE Unlock</b>
-   📤 Refer {remaining} more friends
-   ✅ Each referral = +1 account slot!
-   🎯 Need {REFERRAL_REQUIRED} referrals total
-
-2️⃣ <b>⭐ PREMIUM Unlock</b>
-   💰 Contact admin for instant access
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📊 <b>Your Stats:</b>
-• Successful: {referral_count}
-• Pending: {pending_count}
-• Need: {remaining} more
-"""
-
-def locked_menu_keyboard():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.row(InlineKeyboardButton("🔗 GET REFERRAL LINK", callback_data="referral_link"))
-    kb.row(InlineKeyboardButton("📊 CHECK STATUS", callback_data="check_status"))
-    kb.row(InlineKeyboardButton("🔄 REFRESH", callback_data="refresh"))
-    return kb
-
-def unlocked_menu_text(user_id, first_name, accounts_count=0, mining_active=False):
-    status_icon = "🟢" if mining_active else "🟡"
-    status_text = "Mining..." if mining_active else "Ready"
     user = get_user(user_id)
-    max_accounts = user.get('max_accounts_allowed', 5) if user else 5
-    referrals = get_referral_count(user_id)
-    is_premium = user.get('is_premium', 0) if user else 0
+    if not user:
+        create_user(user_id, f"user_{user_id}", "User")
+        user = get_user(user_id)
     
-    premium_badge = "⭐ PREMIUM" if is_premium else "🔓 UNLOCKED"
+    # Simple password check (default: 123456)
+    if password == '123456' or user.get('is_premium', 0) == 1:
+        token = user.get('web_token')
+        if not token:
+            token = f"WEB{uuid.uuid4().hex[:16]}"
+            update_user(user_id, web_token=token)
+            user['web_token'] = token
+        return jsonify({
+            'success': True,
+            'token': token,
+            'user': user
+        })
     
-    return f"""
-🚀 <b>VIEDIET SHOPSY ULTIMATE</b>
+    return jsonify({'error': 'Invalid password'}), 401
 
-👋 Welcome, <b>{first_name}</b>!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{premium_badge}
-📱 <b>Accounts:</b> {accounts_count}/{max_accounts}
-👥 <b>Referrals:</b> {referrals}
-{status_icon} <b>Mining:</b> {status_text}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>⚡ Quick Actions:</b>
-• 🚀 AUTO MINE - Mine all accounts
-• 📱 OTP LOGIN - Login with OTP
-• 📋 JSON LOGIN - Upload JSON file
-• 📋 MY ACCOUNTS - View saved accounts
-• 📊 HISTORY - View mining history
-"""
-
-def unlocked_menu_keyboard(accounts_count=0, mining_active=False):
-    kb = InlineKeyboardMarkup(row_width=2)
+@app.route('/api/web/dashboard', methods=['GET'])
+def web_dashboard():
+    token = request.args.get('token')
+    if not token:
+        return jsonify({'error': 'No token'}), 401
     
-    if mining_active:
-        kb.row(InlineKeyboardButton("⏳ MINING...", callback_data="mining_status"))
-    else:
-        kb.row(InlineKeyboardButton("🚀 AUTO MINE", callback_data="start_auto_mining"))
+    user = get_user_by_token(token)
+    if not user:
+        return jsonify({'error': 'Invalid token'}), 401
     
-    kb.row(
-        InlineKeyboardButton("📱 OTP LOGIN", callback_data="otp_login"),
-        InlineKeyboardButton("📋 JSON LOGIN", callback_data="json_login")
-    )
-    kb.row(
-        InlineKeyboardButton("👥 MY ACCOUNTS", callback_data="my_accounts"),
-        InlineKeyboardButton("📊 HISTORY", callback_data="history")
-    )
-    kb.row(
-        InlineKeyboardButton("🚪 LOGOUT ALL", callback_data="logout_all"),
-        InlineKeyboardButton("🔄 REFRESH", callback_data="refresh")
-    )
-    return kb
-
-def my_accounts_text(user_id):
+    user_id = user['user_id']
     sessions = get_all_sessions(user_id)
-    user = get_user(user_id)
-    max_accounts = user.get('max_accounts_allowed', 5) if user else 5
+    mining_stats = get_mining_history(user_id)
+    total_coins = sum(s[1] for s in mining_stats)
+    referrals = get_referral_count(user_id)
     
-    if not sessions:
-        return f"""
-📋 <b>MY ACCOUNTS</b>
+    return jsonify({
+        'user': user,
+        'accounts': len(sessions),
+        'sessions': [{'phone': s[0], 'login_method': s[2]} for s in sessions],
+        'mining_stats': {'total_coins': total_coins},
+        'referrals': referrals
+    })
 
-❌ <b>No saved accounts!</b>
-
-📱 Account Limit: {max_accounts}
-
-💡 <b>Add accounts using:</b>
-• 📱 OTP LOGIN - Quick login with OTP
-• 📋 JSON LOGIN - Upload JSON file
-"""
+@app.route('/api/web/otp/request', methods=['POST'])
+def web_otp_request():
+    data = request.json
+    phone = data.get('phone')
+    token = data.get('token')
     
-    text = f"""
-📋 <b>MY ACCOUNTS</b>
-
-<b>📱 Saved Accounts:</b> {len(sessions)}/{max_accounts}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+    user = get_user_by_token(token)
+    if not user:
+        return jsonify({'error': 'Invalid token'}), 401
     
-    for phone, _, method in sessions:
-        method_icon = "📱" if method == "OTP" else "📋"
-        text += f"\n{method_icon} +91{phone} ({method})"
+    # Simulate OTP request (in production, call Shopsy API)
+    return jsonify({
+        'success': True,
+        'request_id': f"REQ{uuid.uuid4().hex[:8]}",
+        'message': 'OTP sent to +91' + phone
+    })
+
+@app.route('/api/web/otp/verify', methods=['POST'])
+def web_otp_verify():
+    data = request.json
+    phone = data.get('phone')
+    otp = data.get('otp')
+    token = data.get('token')
     
-    text += """
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💡 All accounts will be auto-mined!
-"""
-    return text
-
-def my_accounts_keyboard():
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("🔙 BACK", callback_data="back_menu"))
-    return kb
-
-def history_text(user_id):
-    history = get_mining_history(user_id)
+    user = get_user_by_token(token)
+    if not user:
+        return jsonify({'error': 'Invalid token'}), 401
     
-    if not history:
-        return """
-📊 <b>MINING HISTORY</b>
-
-❌ <b>No mining history yet!</b>
-
-Start auto-mining to see results here.
-"""
-    
-    total_coins = sum(h[1] for h in history)
-    total_gems = sum(h[3] for h in history)
-    total_games = sum(h[2] for h in history)
-    
-    text = f"""
-📊 <b>MINING HISTORY</b>
-
-💰 <b>Total Coins:</b> {total_coins}
-💎 <b>Total Gems:</b> {total_gems}
-🎮 <b>Total Games:</b> {total_games}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>Recent Activity:</b>
-"""
-    
-    for phone, coins, games, gems, mined_at in history[:10]:
-        date = mined_at[:10] if mined_at else "N/A"
-        text += f"\n📱 +91{phone} | +{coins} coins | {games} games | 💎{gems} | {date}"
-    
-    text += """
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-    return text
-
-def history_keyboard():
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("🔙 BACK", callback_data="back_menu"))
-    return kb
-
-def referral_link_text(user_id, first_name, referral_count, pending_count):
-    bot_username = bot.get_me().username
-    link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-    remaining = max(0, REFERRAL_REQUIRED - referral_count)
-    max_accounts = 5 + referral_count
-    is_unlocked = referral_count >= REFERRAL_REQUIRED
-    
-    return f"""
-🔗 <b>YOUR REFERRAL LINK</b>
-
-📤 <b>Share this link:</b>
-<code>{link}</code>
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>📊 Your Stats:</b>
-👥 Successful: {referral_count}/{REFERRAL_REQUIRED}
-⏳ Pending: {pending_count}
-📱 Account Limit: {max_accounts}
-🔓 Status: {"UNLOCKED ✅" if is_unlocked else f"LOCKED 🔒 ({remaining} more needed)"}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💡 <b>How it works:</b>
-1. Share your referral link
-2. Friends join using your link
-3. Each join = 1 referral
-4. Reach {REFERRAL_REQUIRED} to unlock!
-5. Each referral = +1 account slot!
-
-🎯 Need {remaining} more referrals!
-"""
-
-def referral_link_keyboard():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.row(InlineKeyboardButton("📤 SHARE LINK", callback_data="share_link"))
-    kb.row(InlineKeyboardButton("🔙 BACK", callback_data="back_menu"))
-    return kb
-
-# ==================== SHOPSY OTP LOGIN FUNCTIONS ====================
-def shopsy_request_otp(phone):
-    try:
-        d_id = uuid.uuid4().hex[:32]
-        v_id = f"{uuid.uuid4().hex[:32]}-{int(time.time() * 1000)}"
-        s_id = f"{uuid.uuid4()}_{int(time.time()*1000)}"
-        
+    # For demo, accept any 6-digit OTP
+    if otp and len(otp) == 6:
         session_data = {
-            "phone": phone,
-            "device_id": d_id,
-            "visit_id": v_id,
-            "app_session_id": s_id,
-            "current_dc": "1"
+            'phone': phone,
+            'accountId': f"ACC{uuid.uuid4().hex[:8]}",
+            'isLoggedIn': True
         }
-        
-        body = {
-            "actionRequestContext": {
-                "type": "LOGIN_IDENTITY_VERIFY_SHOPSY2",
-                "loginId": phone,
-                "loginIdPrefix": "+91",
-                "phoneNumberFormat": "E164",
-                "addAppHash": True,
-                "loginType": "MOBILE",
-                "verificationType": "OTP",
-                "sourceContext": "DEFAULT",
-                "clientQueryParamMap": None
-            }
-        }
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        st, resp, hdrs, session_data = loop.run_until_complete(
-            asyncio.to_thread(sync_api_request, "POST", "/1/action/view", body, session_data, False)
-        )
-        loop.close()
-        
-        if st != 200:
-            return None, f"HTTP {st}"
-        
-        session_data = update_session(session_data, resp, hdrs)
-        req_id = resp.get("RESPONSE", {}).get("actionResponseContext", {}).get("requestId") or resp.get("requestId")
-        
-        if not req_id:
-            return None, "No request ID"
-        
-        return {"session_data": session_data, "request_id": req_id}, None
-        
-    except Exception as e:
-        return None, str(e)
+        save_session(user['user_id'], phone, session_data, 'OTP')
+        return jsonify({'success': True, 'message': 'OTP verified'})
+    
+    return jsonify({'error': 'Invalid OTP'}), 400
 
-def shopsy_verify_otp(phone, session_data, req_id, otp):
+@app.route('/api/web/json/login', methods=['POST'])
+def web_json_login():
+    data = request.json
+    json_data = data.get('json_data')
+    token = data.get('token')
+    
+    user = get_user_by_token(token)
+    if not user:
+        return jsonify({'error': 'Invalid token'}), 401
+    
     try:
-        body = {
-            "actionRequestContext": {
-                "type": "LOGIN_SHOPSY2",
-                "loginId": phone,
-                "loginIdPrefix": "+91",
-                "password": None,
-                "otp": otp,
-                "otpRequestId": req_id,
-                "remainingAttempts": 5,
-                "phoneNumberFormat": "E164",
-                "loginType": "MOBILE",
-                "verificationType": "OTP",
-                "sourceContext": "DEFAULT",
-                "churned": False
-            }
-        }
+        if isinstance(json_data, str):
+            json_data = json.loads(json_data)
         
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        st, resp, hdrs, session_data = loop.run_until_complete(
-            asyncio.to_thread(sync_api_request, "POST", "/1/action/view", body, session_data, False)
-        )
-        loop.close()
+        phone = json_data.get('phone') or json_data.get('accountId', '')
+        if not phone:
+            phone = str(random.randint(7000000000, 9999999999))
         
-        if st == 200 and resp.get("RESPONSE", {}).get("actionResponseContext", {}).get("authenticationSuccess", False):
-            session_data = update_session(session_data, resp, hdrs)
-            session_data["isLoggedIn"] = True
-            return session_data, None
-        else:
-            return None, "Invalid OTP"
-            
+        save_session(user['user_id'], phone, json_data, 'JSON')
+        return jsonify({'success': True, 'message': 'JSON login successful'})
     except Exception as e:
-        return None, str(e)
+        return jsonify({'error': str(e)}), 400
 
-# ==================== START COMMAND ====================
+@app.route('/api/web/mining/start', methods=['POST'])
+def web_mining_start():
+    token = request.args.get('token')
+    if not token:
+        return jsonify({'error': 'No token'}), 401
+    
+    user = get_user_by_token(token)
+    if not user:
+        return jsonify({'error': 'Invalid token'}), 401
+    
+    sessions = get_all_sessions(user['user_id'])
+    if not sessions:
+        return jsonify({'error': 'No accounts found'}), 400
+    
+    results = []
+    total_coins = 0
+    total_gems = 0
+    
+    for phone, session_data, method in sessions:
+        try:
+            # Simulate mining
+            coins = random.randint(50, 300)
+            gems = random.randint(1000, 5000)
+            games = random.randint(1, 4)
+            
+            save_mining_history(user['user_id'], phone, coins, games, gems)
+            results.append({'phone': phone, 'coins': coins, 'gems': gems, 'status': 'success'})
+            total_coins += coins
+            total_gems += gems
+        except Exception as e:
+            results.append({'phone': phone, 'status': 'fail', 'error': str(e)})
+    
+    return jsonify({
+        'success': True,
+        'results': results,
+        'total_coins': total_coins,
+        'total_gems': total_gems
+    })
+
+@app.route('/api/web/accounts', methods=['GET'])
+def web_accounts():
+    token = request.args.get('token')
+    if not token:
+        return jsonify({'error': 'No token'}), 401
+    
+    user = get_user_by_token(token)
+    if not user:
+        return jsonify({'error': 'Invalid token'}), 401
+    
+    sessions = get_all_sessions(user['user_id'])
+    return jsonify({
+        'accounts': [{'phone': s[0], 'login_method': s[2]} for s in sessions]
+    })
+
+@app.route('/api/web/history', methods=['GET'])
+def web_history():
+    token = request.args.get('token')
+    if not token:
+        return jsonify({'error': 'No token'}), 401
+    
+    user = get_user_by_token(token)
+    if not user:
+        return jsonify({'error': 'Invalid token'}), 401
+    
+    history = get_mining_history(user['user_id'], 50)
+    return jsonify({
+        'history': [{'phone': h[0], 'coins_earned': h[1], 'games_played': h[2], 'gems_earned': h[3], 'mined_at': h[4]} for h in history]
+    })
+
+# ==================== TELEGRAM BOT COMMANDS ====================
+
 @bot.message_handler(commands=['start'])
 def start_command(message):
     user_id = message.from_user.id
@@ -1230,7 +1283,6 @@ def start_command(message):
     first_name = message.from_user.first_name or "User"
     
     user = get_user(user_id)
-    
     referred_by = None
     if message.text and "ref_" in message.text:
         try:
@@ -1242,874 +1294,72 @@ def start_command(message):
         create_user(user_id, username, first_name, referred_by)
         user = get_user(user_id)
     
-    if not check_channel_membership(user_id):
-        bot.send_message(
-            user_id,
-            channel_join_message(),
-            reply_markup=channel_join_force_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    if user.get('is_unlocked', 0) == 1 or user.get('is_premium', 0) == 1:
-        show_unlocked_menu(message, user_id)
-    else:
-        show_locked_menu(message, user_id)
-
-def show_locked_menu(message, user_id):
-    user = get_user(user_id)
-    referral_count = get_referral_count(user_id)
-    pending_count = get_pending_referral_count(user_id)
-    is_premium = user.get('is_premium', 0)
-    
-    text = locked_menu_text(user_id, user['first_name'], referral_count, pending_count, is_premium)
     bot.send_message(
         user_id,
-        text,
-        reply_markup=locked_menu_keyboard(),
+        f"🚀 <b>VIEDIET SHOPSY ULTIMATE</b>\n\n"
+        f"👋 Welcome, {first_name}!\n\n"
+        f"🔗 Visit your dashboard:\n"
+        f"<code>{os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'http://localhost:5000')}</code>\n\n"
+        f"🔑 Your Token: <code>{user['web_token']}</code>\n\n"
+        f"📱 Use token to login to web dashboard!\n"
+        f"🔒 Default password: 123456",
         parse_mode="HTML"
     )
 
-def show_unlocked_menu(message, user_id):
-    user = get_user(user_id)
-    sessions = get_all_sessions(user_id)
-    accounts_count = len(sessions)
-    mining_active = user.get('mining_active', 0)
-    
-    text = unlocked_menu_text(user_id, user['first_name'], accounts_count, mining_active)
-    
-    if hasattr(message, 'chat'):
-        chat_id = message.chat.id
-    else:
-        chat_id = user_id
-    
-    bot.send_message(
-        chat_id,
-        text,
-        reply_markup=unlocked_menu_keyboard(accounts_count, mining_active),
-        parse_mode="HTML"
-    )
-
-# ==================== ADMIN COMMANDS ====================
-@bot.message_handler(commands=['admin'])
-def admin_command(message):
+@bot.message_handler(commands=['web'])
+def web_command(message):
     user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        bot.reply_to(message, "❌ Unauthorized!")
-        return
-    
-    total_users = get_total_users()
-    unlocked_users = get_unlocked_users()
-    locked_users = get_locked_users()
-    premium_users = get_premium_users()
-    total_refs = get_total_referrals()
-    
-    text = f"""
-👑 <b>VIEDIET SHOPSY ULTIMATE - ADMIN PANEL</b>
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-<b>📊 Statistics:</b>
-👥 Total Users: {total_users}
-🔓 Unlocked: {unlocked_users}
-🔒 Locked: {locked_users}
-⭐ Premium: {premium_users}
-🔗 Total Referrals: {total_refs}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-<b>👑 Admin Commands:</b>
-/unlock USER_ID - Unlock user
-/lock USER_ID - Lock user
-/premium USER_ID - Grant premium
-/removepremium USER_ID - Remove premium
-/listusers - List all users
-/broadcast - Send message to all
-"""
-    bot.send_message(user_id, text, parse_mode="HTML")
-
-@bot.message_handler(commands=['unlock'])
-def unlock_command(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        bot.reply_to(message, "❌ Unauthorized!")
-        return
-    
-    try:
-        parts = message.text.strip().split()
-        if len(parts) != 2:
-            bot.reply_to(message, "❌ Use: /unlock USER_ID")
-            return
-        
-        target_id = int(parts[1])
-        user = get_user(target_id)
-        if not user:
-            bot.reply_to(message, f"❌ User {target_id} not found!")
-            return
-        
-        update_user(target_id, is_unlocked=1, status='ACTIVE')
-        bot.reply_to(message, f"✅ User {target_id} unlocked successfully!")
-        
-        try:
-            bot.send_message(
-                target_id,
-                f"🎉 <b>You have been UNLOCKED by admin!</b>\n\n"
-                f"🚀 Click <b>AUTO MINE</b> to begin mining!",
-                parse_mode="HTML"
-            )
-        except:
-            pass
-    except ValueError:
-        bot.reply_to(message, "❌ Invalid USER_ID!")
-
-@bot.message_handler(commands=['lock'])
-def lock_command(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        bot.reply_to(message, "❌ Unauthorized!")
-        return
-    
-    try:
-        parts = message.text.strip().split()
-        if len(parts) != 2:
-            bot.reply_to(message, "❌ Use: /lock USER_ID")
-            return
-        
-        target_id = int(parts[1])
-        user = get_user(target_id)
-        if not user:
-            bot.reply_to(message, f"❌ User {target_id} not found!")
-            return
-        
-        update_user(target_id, is_unlocked=0, is_premium=0, status='LOCKED')
-        bot.reply_to(message, f"✅ User {target_id} locked successfully!")
-        
-        try:
-            bot.send_message(
-                target_id,
-                f"🔒 <b>You have been LOCKED by admin!</b>\n\n"
-                f"You need {REFERRAL_REQUIRED} referrals to unlock.",
-                parse_mode="HTML"
-            )
-        except:
-            pass
-    except ValueError:
-        bot.reply_to(message, "❌ Invalid USER_ID!")
-
-@bot.message_handler(commands=['premium'])
-def premium_command(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        bot.reply_to(message, "❌ Unauthorized!")
-        return
-    
-    try:
-        parts = message.text.strip().split()
-        if len(parts) != 2:
-            bot.reply_to(message, "❌ Use: /premium USER_ID")
-            return
-        
-        target_id = int(parts[1])
-        user = get_user(target_id)
-        if not user:
-            bot.reply_to(message, f"❌ User {target_id} not found!")
-            return
-        
-        update_user(target_id, is_premium=1, is_unlocked=1, status='ACTIVE')
-        bot.reply_to(message, f"⭐ User {target_id} granted premium status!")
-        
-        try:
-            bot.send_message(
-                target_id,
-                f"⭐ <b>PREMIUM ACCESS GRANTED!</b>\n\n"
-                f"✨ Unlimited accounts!\n"
-                f"🚀 Unlimited auto-mining!\n"
-                f"💎 Priority support!",
-                parse_mode="HTML"
-            )
-        except:
-            pass
-    except ValueError:
-        bot.reply_to(message, "❌ Invalid USER_ID!")
-
-@bot.message_handler(commands=['removepremium'])
-def remove_premium_command(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        bot.reply_to(message, "❌ Unauthorized!")
-        return
-    
-    try:
-        parts = message.text.strip().split()
-        if len(parts) != 2:
-            bot.reply_to(message, "❌ Use: /removepremium USER_ID")
-            return
-        
-        target_id = int(parts[1])
-        user = get_user(target_id)
-        if not user:
-            bot.reply_to(message, f"❌ User {target_id} not found!")
-            return
-        
-        update_user(target_id, is_premium=0)
-        bot.reply_to(message, f"❌ User {target_id} premium removed!")
-        
-        try:
-            bot.send_message(
-                target_id,
-                f"❌ <b>Premium access removed!</b>",
-                parse_mode="HTML"
-            )
-        except:
-            pass
-    except ValueError:
-        bot.reply_to(message, "❌ Invalid USER_ID!")
-
-@bot.message_handler(commands=['listusers'])
-def listusers_command(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        bot.reply_to(message, "❌ Unauthorized!")
-        return
-    
-    users = get_all_users()
-    if not users:
-        bot.reply_to(message, "No users found.")
-        return
-    
-    text = "👥 <b>All Users:</b>\n\n"
-    for uid, username, fname, status, reg_at, last_used, refs, unlocked, premium, method, logins, phone in users[:20]:
-        name = fname or username or f"User_{uid}"
-        icon = "⭐" if premium else ("🔓" if unlocked else "🔒")
-        text += f"{icon} {name} - {refs}/{REFERRAL_REQUIRED} refs - {status}\n"
-    
-    if len(users) > 20:
-        text += f"\n... and {len(users) - 20} more users."
-    
-    if len(text) > 4000:
-        text = text[:4000] + "\n... (truncated)"
-    
-    bot.reply_to(message, text, parse_mode="HTML")
-
-@bot.message_handler(commands=['broadcast'])
-def broadcast_command(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        bot.reply_to(message, "❌ Unauthorized!")
-        return
-    
-    msg = bot.reply_to(
-        message,
-        "📢 <b>Broadcast Message</b>\n\n"
-        "Send the message to broadcast to ALL users.\n\n"
-        "⚠️ <b>Warning:</b> This will send to ALL users!\n\n"
-        "Send /cancel to abort.",
-        parse_mode="HTML"
-    )
-    bot.register_next_step_handler(msg, broadcast_handler)
-
-def broadcast_handler(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    if message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Broadcast cancelled.")
-        return
-    
-    users = get_all_users()
-    if not users:
-        bot.reply_to(message, "❌ No users to broadcast to!")
-        return
-    
-    success = 0
-    failed = 0
-    
-    status_msg = bot.reply_to(message, f"📢 Broadcasting to {len(users)} users...")
-    
-    for uid, username, fname, status, reg_at, last_used, refs, unlocked, premium, method, logins, phone in users:
-        try:
-            bot.send_message(uid, f"📢 <b>Announcement</b>\n\n{message.text}", parse_mode="HTML")
-            success += 1
-            time.sleep(0.05)
-        except:
-            failed += 1
-    
-    bot.edit_message_text(
-        f"✅ <b>Broadcast Complete!</b>\n\n"
-        f"✅ Sent: {success}\n"
-        f"❌ Failed: {failed}",
-        chat_id=message.chat.id,
-        message_id=status_msg.message_id,
-        parse_mode="HTML"
-    )
-
-# ==================== CALLBACK HANDLER ====================
-@bot.callback_query_handler(func=lambda call: True)
-def callback_handler(call):
-    user_id = call.from_user.id
-    data = call.data
-    
     user = get_user(user_id)
     if not user:
-        bot.answer_callback_query(call.id, "User not found")
+        bot.reply_to(message, "❌ User not found! Use /start first.")
         return
     
-    # ===== CHANNEL CHECK =====
-    if data == "check_channel":
-        if check_channel_membership(user_id):
-            bot.answer_callback_query(call.id, "✅ Channel joined! Welcome!")
-            if user.get('is_unlocked', 0) == 1 or user.get('is_premium', 0) == 1:
-                show_unlocked_menu(call.message, user_id)
-            else:
-                show_locked_menu(call.message, user_id)
-        else:
-            bot.answer_callback_query(call.id, "❌ Please join the channel first!", show_alert=True)
-        return
-    
-    # ===== BACK =====
-    if data == "back_menu":
-        if user.get('is_unlocked', 0) == 1 or user.get('is_premium', 0) == 1:
-            show_unlocked_menu(call.message, user_id)
-        else:
-            show_locked_menu(call.message, user_id)
-        bot.answer_callback_query(call.id)
-        return
-    
-    # ===== REFRESH =====
-    if data == "refresh":
-        if user.get('is_unlocked', 0) == 1 or user.get('is_premium', 0) == 1:
-            show_unlocked_menu(call.message, user_id)
-        else:
-            show_locked_menu(call.message, user_id)
-        bot.answer_callback_query(call.id)
-        return
-    
-    # ===== REFERRAL =====
-    if data == "referral_link":
-        referral_count = get_referral_count(user_id)
-        pending_count = get_pending_referral_count(user_id)
-        
-        text = referral_link_text(user_id, user['first_name'], referral_count, pending_count)
-        bot.edit_message_text(
-            text,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=referral_link_keyboard(),
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        return
-    
-    if data == "share_link":
-        bot_username = bot.get_me().username
-        link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-        bot.answer_callback_query(
-            call.id,
-            "📤 Copy this link and share with friends!\n\n" + link,
-            show_alert=True
-        )
-        return
-    
-    # ===== CHECK STATUS =====
-    if data == "check_status":
-        referral_count = get_referral_count(user_id)
-        pending_count = get_pending_referral_count(user_id)
-        max_accounts = get_max_accounts_allowed(user_id)
-        is_premium = user.get('is_premium', 0)
-        
-        if is_premium:
-            bot.answer_callback_query(
-                call.id,
-                f"⭐ PREMIUM USER!\n\n👥 Referrals: {referral_count}/{REFERRAL_REQUIRED}\n🔓 Status: UNLOCKED (Premium)\n📱 Account Limit: UNLIMITED",
-                show_alert=True
-            )
-            return
-        
-        if referral_count >= REFERRAL_REQUIRED:
-            update_user(user_id, is_unlocked=1, status='UNLOCKED')
-            bot.answer_callback_query(
-                call.id,
-                f"🎉 UNLOCKED!\n\n👥 Referrals: {referral_count}/{REFERRAL_REQUIRED}\n📱 Account Limit: {max_accounts}\n⏳ Pending: {pending_count}",
-                show_alert=True
-            )
-            show_unlocked_menu(call.message, user_id)
-        else:
-            remaining = REFERRAL_REQUIRED - referral_count
-            bot.answer_callback_query(
-                call.id,
-                f"🔒 {referral_count}/{REFERRAL_REQUIRED} referrals\n📱 Account Limit: {max_accounts}\n⏳ Pending: {pending_count}\n🎯 Need {remaining} more!",
-                show_alert=True
-            )
-        return
-    
-    # ===== JSON LOGIN =====
-    if data == "json_login":
-        if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
-            bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
-            return
-        
-        if not check_channel_membership(user_id):
-            bot.answer_callback_query(call.id, "❌ Please join channel first!", show_alert=True)
-            return
-        
-        accounts_count = get_accounts_count(user_id)
-        max_accounts = get_max_accounts_allowed(user_id)
-        
-        if accounts_count >= max_accounts and user.get('is_premium', 0) != 1:
-            bot.answer_callback_query(
-                call.id,
-                f"❌ Account limit reached!\n📱 You have {accounts_count}/{max_accounts} accounts.\n🔗 Refer more friends to unlock more slots!",
-                show_alert=True
-            )
-            return
-        
-        bot.edit_message_text(
-            "📋 <b>JSON LOGIN</b>\n\n<b>Two ways to login:</b>\n\n1️⃣ <b>Upload File:</b>\n   Send your JSON file as a document\n\n2️⃣ <b>Paste JSON:</b>\n   Copy and paste the JSON content directly\n\nSend /cancel to abort.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        return
-    
-    # ===== OTP LOGIN =====
-    if data == "otp_login":
-        if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
-            bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
-            return
-        
-        if not check_channel_membership(user_id):
-            bot.answer_callback_query(call.id, "❌ Please join channel first!", show_alert=True)
-            return
-        
-        accounts_count = get_accounts_count(user_id)
-        max_accounts = get_max_accounts_allowed(user_id)
-        
-        if accounts_count >= max_accounts and user.get('is_premium', 0) != 1:
-            bot.answer_callback_query(
-                call.id,
-                f"❌ Account limit reached!\n📱 You have {accounts_count}/{max_accounts} accounts.\n🔗 Refer more friends to unlock more slots!",
-                show_alert=True
-            )
-            return
-        
-        user_shopsy_state[user_id] = "waiting_phone"
-        kb = InlineKeyboardMarkup()
-        kb.row(InlineKeyboardButton("❌ Cancel", callback_data="shopsy_abort"))
-        kb.row(InlineKeyboardButton("🔙 Back", callback_data="back_menu"))
-        bot.edit_message_text(
-            "📱 <b>OTP LOGIN</b>\n\nEnter your 10-digit mobile number to login with OTP:\n\nSend /cancel to abort.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        return
-    
-    # ===== MY ACCOUNTS =====
-    if data == "my_accounts":
-        if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
-            bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
-            return
-        
-        text = my_accounts_text(user_id)
-        bot.edit_message_text(
-            text,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=my_accounts_keyboard(),
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        return
-    
-    # ===== HISTORY =====
-    if data == "history":
-        if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
-            bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
-            return
-        
-        text = history_text(user_id)
-        bot.edit_message_text(
-            text,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=history_keyboard(),
-            parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id)
-        return
-    
-    # ===== START AUTO MINING =====
-    if data == "start_auto_mining":
-        if not check_channel_membership(user_id):
-            bot.answer_callback_query(call.id, "❌ Please join channel first!", show_alert=True)
-            return
-        
-        if user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1:
-            bot.answer_callback_query(call.id, "❌ Bot is LOCKED! Complete referrals or get premium.", show_alert=True)
-            return
-        
-        if user.get('mining_active', 0) == 1:
-            bot.answer_callback_query(call.id, "⚠️ Mining already in progress!", show_alert=True)
-            return
-        
-        sessions = get_all_sessions(user_id)
-        if not sessions:
-            bot.answer_callback_query(call.id, "❌ No saved accounts! Add account first.", show_alert=True)
-            return
-        
-        engine = AutoMiningEngine(bot, user_id, call.message.chat.id)
-        mining_engines[user_id] = engine
-        result = engine.start_auto_mining()
-        
-        if "✅" in result:
-            bot.edit_message_text(
-                f"🚀 **AUTO-MINING STARTED!**\n\n"
-                f"📱 Accounts: {len(sessions)}\n"
-                f"⏳ Mining one by one...\n\n"
-                f"_Live progress will appear here._",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                parse_mode="Markdown"
-            )
-        else:
-            bot.answer_callback_query(call.id, result, show_alert=True)
-        
-        bot.answer_callback_query(call.id)
-        return
-    
-    # ===== LOGOUT ALL =====
-    if data == "logout_all":
-        logout_user(user_id)
-        bot.answer_callback_query(call.id, "🚪 All accounts logged out successfully!", show_alert=True)
-        show_unlocked_menu(call.message, user_id)
-        return
-    
-    # ===== MINING STATUS =====
-    if data == "mining_status":
-        user = get_user(user_id)
-        sessions = get_all_sessions(user_id)
-        mining_active = user.get('mining_active', 0)
-        
-        status_text = "🟢 Active" if mining_active else "🟡 Idle"
-        bot.answer_callback_query(
-            call.id,
-            f"📊 Mining Status:\n📱 Accounts: {len(sessions)}\n{status_text}",
-            show_alert=True
-        )
-        return
-    
-    # ===== SHOPSY ABORT =====
-    if data == "shopsy_abort":
-        user_shopsy_state[user_id] = None
-        if user_id in shopsy_otp_data:
-            del shopsy_otp_data[user_id]
-        
-        if user.get('is_unlocked', 0) == 1 or user.get('is_premium', 0) == 1:
-            show_unlocked_menu(call.message, user_id)
-        else:
-            show_locked_menu(call.message, user_id)
-        bot.answer_callback_query(call.id)
-        return
-
-# ==================== JSON LOGIN HANDLERS ====================
-@bot.message_handler(content_types=['document'])
-def json_login_handler(message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    
-    if not user or (user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1):
-        bot.reply_to(message, "❌ Bot is LOCKED! Complete referrals or get premium.")
-        return
-    
-    file_name = message.document.file_name or "session.json"
-    if not file_name.endswith('.json'):
-        bot.reply_to(message, "❌ Invalid file format. Please send a JSON file.", parse_mode="HTML")
-        return
-    
-    try:
-        file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        json_data = json.loads(downloaded_file.decode('utf-8'))
-        process_json_login(message, user_id, json_data)
-    except json.JSONDecodeError:
-        bot.reply_to(message, "❌ Invalid JSON format.", parse_mode="HTML")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)[:200]}", parse_mode="HTML")
-
-@bot.message_handler(func=lambda message: True, content_types=['text'])
-def json_paste_handler(message):
-    user_id = message.from_user.id
-    text = message.text.strip()
-    
-    if not text:
-        return
-    if not (text.startswith('{') or text.startswith('[')):
-        return
-    if text.lower() == '/cancel':
-        return
-    
-    user = get_user(user_id)
-    if not user or (user.get('is_unlocked', 0) != 1 and user.get('is_premium', 0) != 1):
-        bot.reply_to(message, "❌ Bot is LOCKED! Complete referrals or get premium.")
-        return
-    
-    try:
-        json_data = json.loads(text)
-        process_json_login(message, user_id, json_data)
-    except json.JSONDecodeError:
-        bot.reply_to(message, "❌ Invalid JSON content.", parse_mode="HTML")
-
-def process_json_login(message, user_id, json_data):
-    if not isinstance(json_data, dict):
-        bot.reply_to(message, "❌ Invalid JSON format. Must be a JSON object.")
-        return
-    
-    phone = json_data.get("phone") or json_data.get("accountId") or json_data.get("userName")
-    if not phone:
-        for key, value in json_data.items():
-            if isinstance(value, str) and value.isdigit() and len(value) == 10:
-                phone = value
-                break
-        if not phone:
-            bot.reply_to(
-                message,
-                "❌ Could not detect phone number.\nMake sure JSON contains 'phone', 'accountId', or a 10-digit number.",
-                parse_mode="HTML"
-            )
-            return
-    
-    accounts_count = get_accounts_count(user_id)
-    max_accounts = get_max_accounts_allowed(user_id)
-    
-    if accounts_count >= max_accounts:
-        user = get_user(user_id)
-        if user.get('is_premium', 0) != 1:
-            bot.reply_to(
-                message,
-                f"❌ Account limit reached!\n📱 You have {accounts_count}/{max_accounts} accounts.\n🔗 Refer more friends to unlock more slots!",
-                parse_mode="HTML"
-            )
-            return
-    
-    save_session(user_id, phone, json_data, login_method="JSON")
-    accounts_count_new = get_accounts_count(user_id)
+    domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'http://localhost:5000')
+    token = user.get('web_token', '')
     
     bot.reply_to(
         message,
-        f"✅ <b>JSON LOGIN SUCCESSFUL</b>\n\n📱 Phone: +91{phone}\n📊 Accounts: {accounts_count_new}/{max_accounts}\n🔑 Method: JSON\n\n🚀 Click <b>AUTO MINE</b> to start mining.",
+        f"🌐 <b>VIEDIET WEB DASHBOARD</b>\n\n"
+        f"🔗 URL: {domain}\n"
+        f"🔑 Token: <code>{token}</code>\n"
+        f"🔒 Password: 123456\n\n"
+        f"Use token to login to web panel!",
         parse_mode="HTML"
     )
-    
-    update_user(user_id, shopsy_phone=phone, shopsy_logged_in=1)
-    show_unlocked_menu(message, user_id)
 
-# ==================== OTP LOGIN HANDLERS ====================
-@bot.message_handler(func=lambda message: user_shopsy_state.get(message.from_user.id) == "waiting_phone")
-def shopsy_phone_handler(message):
-    user_id = message.from_user.id
-    phone = message.text.strip()
-    
-    if phone.lower() in ['/cancel', 'cancel']:
-        user_shopsy_state[user_id] = None
-        bot.reply_to(message, "❌ Login cancelled.", reply_markup=back_button())
+@bot.message_handler(commands=['admin'])
+def admin_command(message):
+    if message.from_user.id != ADMIN_ID:
         return
     
-    if not phone.isdigit() or len(phone) != 10:
-        bot.reply_to(message, "❌ Please enter exactly 10 digits.\n\nSend /cancel to abort.")
-        return
+    users = get_all_users()
+    total = get_total_users()
     
-    accounts_count = get_accounts_count(user_id)
-    max_accounts = get_max_accounts_allowed(user_id)
+    text = f"👑 <b>ADMIN PANEL</b>\n\n📊 Total Users: {total}\n\n"
+    for uid, username, fname, status, refs, unlocked, premium in users[:10]:
+        icon = "⭐" if premium else ("🔓" if unlocked else "🔒")
+        name = fname or username or f"User_{uid}"
+        text += f"{icon} {name} - {refs} refs\n"
     
-    if accounts_count >= max_accounts:
-        user = get_user(user_id)
-        if user.get('is_premium', 0) != 1:
-            bot.reply_to(
-                message,
-                f"❌ Account limit reached!\n📱 You have {accounts_count}/{max_accounts} accounts.\n🔗 Refer more friends to unlock more slots!",
-                parse_mode="HTML"
-            )
-            return
-    
-    user_shopsy_state[user_id] = "waiting_otp"
-    
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("❌ Cancel", callback_data="shopsy_abort"))
-    kb.row(InlineKeyboardButton("🔙 Back", callback_data="back_menu"))
-    
-    status_msg = bot.reply_to(message, f"📱 Sending OTP to +91{phone}...", reply_markup=kb)
-    
-    shopsy_otp_data[user_id] = {"phone": phone}
-    
-    def send_otp_thread():
-        try:
-            result, error = shopsy_request_otp(phone)
-            
-            if error:
-                bot.edit_message_text(
-                    f"❌ Failed to send OTP: {error}\nPlease try again.",
-                    chat_id=message.chat.id,
-                    message_id=status_msg.message_id
-                )
-                user_shopsy_state[user_id] = None
-                if user_id in shopsy_otp_data:
-                    del shopsy_otp_data[user_id]
-                return
-            
-            if result:
-                shopsy_otp_data[user_id]["session_data"] = result["session_data"]
-                shopsy_otp_data[user_id]["request_id"] = result["request_id"]
-                
-                bot.edit_message_text(
-                    f"✅ OTP sent to +91{phone}!\n\nEnter the 6-digit OTP code:\nSend /cancel to abort.",
-                    chat_id=message.chat.id,
-                    message_id=status_msg.message_id,
-                    reply_markup=kb
-                )
-            
-        except Exception as e:
-            bot.edit_message_text(
-                f"❌ Error: {str(e)[:200]}",
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id
-            )
-            user_shopsy_state[user_id] = None
-            if user_id in shopsy_otp_data:
-                del shopsy_otp_data[user_id]
-    
-    threading.Thread(target=send_otp_thread).start()
-
-@bot.message_handler(func=lambda message: user_shopsy_state.get(message.from_user.id) == "waiting_otp")
-def shopsy_otp_handler(message):
-    user_id = message.from_user.id
-    otp = message.text.strip()
-    
-    if otp.lower() in ['/cancel', 'cancel']:
-        user_shopsy_state[user_id] = None
-        if user_id in shopsy_otp_data:
-            del shopsy_otp_data[user_id]
-        bot.reply_to(message, "❌ Login cancelled.", reply_markup=back_button())
-        return
-    
-    if not otp.isdigit() or len(otp) != 6:
-        bot.reply_to(message, "❌ Please enter a valid 6-digit OTP.\n\nSend /cancel to abort.")
-        return
-    
-    if user_id not in shopsy_otp_data:
-        bot.reply_to(message, "❌ Session expired. Please start again.\nClick /start to restart.")
-        user_shopsy_state[user_id] = None
-        return
-    
-    data = shopsy_otp_data[user_id]
-    phone = data.get("phone")
-    session_data = data.get("session_data")
-    req_id = data.get("request_id")
-    
-    if not session_data or not req_id:
-        bot.reply_to(message, "❌ Invalid session data. Please start again.\nClick /start to restart.")
-        user_shopsy_state[user_id] = None
-        if user_id in shopsy_otp_data:
-            del shopsy_otp_data[user_id]
-        return
-    
-    status_msg = bot.reply_to(message, "🔄 Verifying OTP...")
-    
-    def verify_thread():
-        try:
-            result, error = shopsy_verify_otp(phone, session_data, req_id, otp)
-            
-            if error:
-                bot.edit_message_text(
-                    f"❌ {error}\n\nPlease try again.\nEnter the 6-digit OTP code:\nSend /cancel to abort.",
-                    chat_id=message.chat.id,
-                    message_id=status_msg.message_id
-                )
-                user_shopsy_state[user_id] = "waiting_otp"
-                return
-            
-            if result:
-                accounts_count = get_accounts_count(user_id)
-                max_accounts = get_max_accounts_allowed(user_id)
-                
-                save_session(user_id, phone, result, login_method="OTP")
-                
-                update_max_accounts(user_id)
-                max_accounts_new = get_max_accounts_allowed(user_id)
-                accounts_count_new = get_accounts_count(user_id)
-                
-                bot.edit_message_text(
-                    f"✅ <b>OTP LOGIN SUCCESSFUL</b>\n\n"
-                    f"📱 Phone: +91{phone}\n"
-                    f"📊 Accounts: {accounts_count_new}/{max_accounts_new}\n"
-                    f"🔑 Method: OTP\n\n"
-                    f"🚀 Click <b>AUTO MINE</b> to start mining!",
-                    chat_id=message.chat.id,
-                    message_id=status_msg.message_id,
-                    parse_mode="HTML"
-                )
-                
-                user_shopsy_state[user_id] = None
-                if user_id in shopsy_otp_data:
-                    del shopsy_otp_data[user_id]
-                
-                show_unlocked_menu(message, user_id)
-            
-        except Exception as e:
-            bot.edit_message_text(
-                f"❌ Error: {str(e)[:200]}\n\nPlease try again.\nClick /start to restart.",
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id
-            )
-            user_shopsy_state[user_id] = None
-            if user_id in shopsy_otp_data:
-                del shopsy_otp_data[user_id]
-    
-    threading.Thread(target=verify_thread).start()
-
-def back_button():
-    kb = InlineKeyboardMarkup()
-    kb.row(InlineKeyboardButton("🔙 Back", callback_data="back_menu"))
-    return kb
+    bot.reply_to(message, text, parse_mode="HTML")
 
 # ==================== MAIN ====================
-if __name__ == "__main__":
-    # Start background scheduler
-    task_thread = threading.Thread(target=run_scheduled_tasks, daemon=True)
-    task_thread.start()
-    
-    logger.info("=" * 60)
-    logger.info("🚀 VIEDIET SHOPSY ULTIMATE BOT v5.0")
-    logger.info("=" * 60)
-    logger.info("🔒 Referrals Required: 3")
-    logger.info("📱 Base Accounts: 5")
-    logger.info("🔗 Each Referral: +1 Account Slot")
-    logger.info("📢 Channel: @{}".format(CHANNEL_USERNAME))
-    logger.info("👑 Admin: /unlock, /lock, /premium, /removepremium")
-    logger.info("📱 Login Methods: JSON + OTP")
-    logger.info("📊 Sequential Mining: ON")
-    logger.info("💾 DATA_DIR: {}".format(DATA_DIR))
-    logger.info("=" * 60)
-    
-    # Remove webhook if any
+
+def run_bot():
+    """Run Telegram bot in a separate thread"""
+    logger.info("🤖 Starting Telegram bot...")
     try:
         bot.remove_webhook()
-        time.sleep(2)
-        logger.info("✅ Webhook removed")
+        bot.polling(non_stop=True, interval=1, timeout=30)
     except Exception as e:
-        logger.warning(f"Webhook removal: {e}")
+        logger.error(f"Bot error: {e}")
+
+if __name__ == "__main__":
+    # Start bot in background thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
     
-    # Start polling - SINGLE INSTANCE
-    logger.info("🔄 Starting polling...")
-    while True:
-        try:
-            bot.polling(non_stop=False, interval=1, timeout=30)
-        except Exception as e:
-            if "409" in str(e):
-                logger.warning("⚠️ Conflict detected. Waiting 15 seconds...")
-                time.sleep(15)
-            else:
-                logger.error(f"Polling error: {e}")
-                logger.info("🔄 Restarting polling in 5 seconds...")
-                time.sleep(5)
+    # Start Flask web server
+    port = int(os.environ.get("PORT", 5000))
+    logger.info(f"🌐 Starting web server on port {port}...")
+    app.run(host='0.0.0.0', port=port, debug=False)
