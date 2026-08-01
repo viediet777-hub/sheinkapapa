@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-SWIGGY BUZZ AUTO-COLLECTOR - DIRECT API VERSION
-₹100/DAY WORKING - NO PROXY NEEDED
+SWIGGY BUZZ AUTO-COLLECTOR - WITH AUTO-ACCEPT
+₹100/DAY WORKING
 Made by Viediet
 """
 
@@ -40,17 +40,34 @@ if not BOT_TOKEN:
     print("❌ BOT_TOKEN required!")
     os._exit(1)
 
-ADMIN_IDS = [1364476174]  # Change to your Telegram ID
+ADMIN_IDS = [1364476174]
 DB_PATH = "swiggy_buzz.db"
 BRAND = "⚡ Made by Viediet"
 
-# ===== SWIGGY DIRECT API ENDPOINTS =====
+# ===== SWIGGY DIRECT API =====
 BASE_URL = "https://profile.swiggy.com/api/v3/app"
 SMS_OTP_URL = f"{BASE_URL}/sms_otp"
 LOGIN_VERIFY_URL = f"{BASE_URL}/login/verify"
 SPNS_BASE = "https://spns.swiggy.com/api/v1/campaign"
 REWARDS_URL = f"{SPNS_BASE}/rewards"
 ACTION_URL = f"{SPNS_BASE}/action"
+
+# ===== TARGET USERS =====
+TARGET_USERS = [
+    "9905454846", "8302374884", "9569907686", "6019557067",
+    "8103200020", "9793231470", "6075716540", "6057085260",
+    "6529467214", "4742565540", "2159541308", "5711812412",
+    "4805096977", "6306972524", "5810763039", "5767374231",
+    "5255411320", "9263536039", "9656243680", "7028403798",
+    "2022592103", "4339594714", "9315838951", "5021810039",
+    "4179533661", "3969482763", "5378219742", "4622672366",
+    "6529938009", "8841032307", "7847081991", "8476578440",
+    "4958316534", "6089374148", "3974751011", "9076113237",
+    "2405719218", "8557791891", "5237191585", "7504061044",
+    "7239858845", "5773101973", "9292974443", "8481419410",
+    "4219735233", "9104704566", "3923205642", "1106827431",
+    "9066285442", "8745675335"
+]
 
 # ============================== DATABASE ==============================
 
@@ -158,7 +175,7 @@ class Database:
 
 db = Database()
 
-# ============================== SWIGGY CLIENT (DIRECT API) ==============================
+# ============================== SWIGGY CLIENT ==============================
 
 class SwiggyClient:
     def __init__(self):
@@ -169,7 +186,6 @@ class SwiggyClient:
         self.token = ""
         self.secrettoken = ""
         self.customer_id = ""
-        self.phone = ""
 
     def _headers(self, extra=None):
         headers = {
@@ -202,28 +218,20 @@ class SwiggyClient:
         return headers
 
     def send_otp(self, phone):
-        """Step 1: Send OTP - DIRECT API"""
         self.phone = phone
         url = f"{SMS_OTP_URL}?mobile={phone}"
-        log.info(f"[DEBUG] Sending OTP to {phone}")
-        
         resp = self.session.get(url, headers=self._headers(), timeout=30)
         if resp.status_code != 200:
             return {"status": "error", "message": f"HTTP {resp.status_code}"}
-        
         data = resp.json()
-        log.info(f"[DEBUG] OTP response: {json.dumps(data)[:500]}")
-        
         if data.get("statusCode") == 0:
             self.tid = data.get("tid", "")
             self.sid = data.get("sid", "")
             self.device_id = data.get("deviceId", self.device_id)
-            return {"status": "ok", "data": data}
-        else:
-            return {"status": "error", "message": data.get("statusMessage", "Unknown error")}
+            return {"status": "ok"}
+        return {"status": "error", "message": data.get("statusMessage", "Unknown error")}
 
     def verify_otp(self, phone, otp):
-        """Step 2: Verify OTP - DIRECT API"""
         self.phone = phone
         url = f"{LOGIN_VERIFY_URL}?otp_source=Sms-manual"
         body = {
@@ -237,18 +245,13 @@ class SwiggyClient:
             },
             "otp": otp,
         }
-        
         headers = self._headers()
         headers["manufacturer"] = "GOOGLE"
         headers["model-name"] = "PIXEL 4"
-        
         resp = self.session.post(url, headers=headers, json=body, timeout=30)
         if resp.status_code != 200:
             return {"status": "error", "message": f"HTTP {resp.status_code}"}
-        
         data = resp.json()
-        log.info(f"[DEBUG] Verify response: {json.dumps(data)[:500]}")
-        
         if data.get("statusCode") == 0:
             inner = data.get("data", {})
             self.token = inner.get("token", "")
@@ -257,35 +260,24 @@ class SwiggyClient:
             self.customer_id = str(inner.get("customer_id", ""))
             self.device_id = data.get("deviceId", self.device_id)
             self.secrettoken = self.token
-            
             return {
                 "status": "ok",
-                "token": self.token,
-                "tid": self.tid,
-                "sid": self.sid,
-                "customer_id": self.customer_id,
-                "device_id": self.device_id,
-                "secrettoken": self.secrettoken,
                 "name": inner.get("name", ""),
-                "mobile": inner.get("mobile", phone),
+                "secrettoken": self.secrettoken,
+                "customer_id": self.customer_id,
             }
-        else:
-            return {"status": "error", "message": data.get("statusMessage", "Verification failed")}
+        return {"status": "error", "message": data.get("statusMessage", "Verification failed")}
 
     def _spns_headers(self, secrettoken=None):
-        """Headers for SPNS endpoints"""
         token = secrettoken or self.secrettoken
         headers = {
             "client-id": "portal",
-            "user-agent": "Mozilla/5.0 (Linux; Android 11; Pixel 4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.120 Mobile Safari/537.36",
+            "user-agent": "Mozilla/5.0 (Linux; Android 11; Pixel 4) AppleWebKit/537.36",
             "content-type": "application/json",
             "accept": "*/*",
             "origin": "https://webviews.swiggy.com",
             "x-requested-with": "in.swiggy.android",
             "referer": "https://webviews.swiggy.com/moments-iw/buzz-your-friend/",
-            "sec-fetch-site": "same-site",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-dest": "empty",
         }
         if token:
             headers["token"] = token
@@ -296,33 +288,23 @@ class SwiggyClient:
         return headers
 
     def check_buzz(self, secrettoken=None):
-        """Step 3: Check current buzz status - DIRECT API"""
         url = REWARDS_URL
         body = {
             "generalContext": {"requestContext": {"clientId": "portal_banner"}},
-            "campaignRewardRequests": [
-                {
-                    "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
-                    "campaignId": "ougwl",
-                    "rollingFreecashParams": {
-                        "forceRefresh": True,
-                        "requestParams": {
-                            "dataRequested": "wallet,connections,transactions",
-                            "source": "banner",
-                        },
-                    },
+            "campaignRewardRequests": [{
+                "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
+                "campaignId": "ougwl",
+                "rollingFreecashParams": {
+                    "forceRefresh": True,
+                    "requestParams": {"dataRequested": "wallet,connections,transactions", "source": "banner"}
                 }
-            ],
+            }]
         }
-        
         headers = self._spns_headers(secrettoken)
         resp = self.session.post(url, headers=headers, json=body, timeout=30)
-        data = resp.json() if resp.content else {}
-        log.info(f"[DEBUG] Check buzz response: {json.dumps(data)[:500]}")
-        return data
+        return resp.json() if resp.content else {}
 
     def initiate_buzz(self, target_user_id, secrettoken=None):
-        """Step 4: Initiate buzz - DIRECT API"""
         url = ACTION_URL
         body = {
             "generalContext": {"requestContext": {"clientId": "portal_banner"}},
@@ -330,21 +312,14 @@ class SwiggyClient:
             "campaignUserActionRequest": {
                 "campaignId": "ougwl",
                 "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
-                "action": {
-                    "actionType": "ACTION_TYPE_CONNECT",
-                    "targetEntityId": target_user_id
-                }
+                "action": {"actionType": "ACTION_TYPE_CONNECT", "targetEntityId": target_user_id}
             }
         }
-        
         headers = self._spns_headers(secrettoken)
         resp = self.session.post(url, headers=headers, json=body, timeout=30)
-        data = resp.json() if resp.content else {}
-        log.info(f"[DEBUG] Initiate buzz for {target_user_id}: {json.dumps(data)[:500]}")
-        return data
+        return resp.json() if resp.content else {}
 
     def complete_buzz(self, target_user_id, secrettoken=None):
-        """Step 5: Complete buzz - DIRECT API"""
         url = ACTION_URL
         body = {
             "generalContext": {"requestContext": {"clientId": "portal_banner"}},
@@ -352,83 +327,73 @@ class SwiggyClient:
             "campaignUserActionRequest": {
                 "campaignId": "ougwl",
                 "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
-                "action": {
-                    "actionType": "ACTION_TYPE_ACCEPT",
-                    "targetEntityId": target_user_id
-                }
+                "action": {"actionType": "ACTION_TYPE_ACCEPT", "targetEntityId": target_user_id}
             }
         }
-        
         headers = self._spns_headers(secrettoken)
         resp = self.session.post(url, headers=headers, json=body, timeout=30)
-        data = resp.json() if resp.content else {}
-        log.info(f"[DEBUG] Complete buzz for {target_user_id}: {json.dumps(data)[:500]}")
-        return data
+        return resp.json() if resp.content else {}
+
+    def auto_accept_incoming(self, secrettoken=None):
+        """Auto-accept ALL pending requests from others"""
+        token = secrettoken or self.secrettoken
+        accepted = 0
+        
+        status = self.check_buzz(token)
+        connections = status.get("data", {}).get("campaignRewardResponses", [{}])[0].get("connections", {}).get("connections", [])
+        
+        for conn in connections:
+            progress = conn.get("progress", {})
+            if progress.get("status") == "PROGRESS_STATUS_IN_PROGRESS_ACCEPT_INVITE_PENDING":
+                user_id = conn.get("connectedUserId")
+                resp = self.complete_buzz(user_id, token)
+                if resp.get("statusCode") == 0:
+                    accepted += 1
+                    log.info(f"✅ Auto-accepted: {user_id}")
+                time.sleep(0.3)
+        
+        return accepted
 
     def run_buzz_collection(self, secrettoken=None):
-        """Full buzz collection - DIRECT API"""
-        results = {
-            "total_earned": 0,
-            "successful": 0,
-            "failed": 0,
-            "details": []
-        }
-        
         token = secrettoken or self.secrettoken
+        results = {"total_earned": 0, "successful": 0, "failed": 0}
+        
         if not token:
             results["failed"] = 1
             return results
         
-        # Get target users from the website's list
-        target_users = [
-            "9905454846", "8302374884", "9569907686", "6019557067",
-            "8103200020", "9793231470", "6075716540", "6057085260",
-            "6529467214", "4742565540", "2159541308", "5711812412",
-            "4805096977", "6306972524", "5810763039", "5767374231",
-            "5255411320", "9263536039", "9656243680", "7028403798",
-            "2022592103", "4339594714", "9315838951", "5021810039",
-            "4179533661", "3969482763", "5378219742", "4622672366",
-            "6529938009", "8841032307", "7847081991", "8476578440",
-            "4958316534", "6089374148", "3974751011", "9076113237",
-            "2405719218", "8557791891", "5237191585", "7504061044",
-            "7239858845", "5773101973", "9292974443", "8481419410",
-            "4219735233", "9104704566", "3923205642", "1106827431",
-            "9066285442", "8745675335"
-        ]
+        # STEP 1: Auto-accept incoming requests
+        accepted = self.auto_accept_incoming(token)
+        log.info(f"✅ Auto-accepted {accepted} incoming requests")
         
-        # Check initial balance
+        # STEP 2: Check initial balance
         status = self.check_buzz(token)
         initial_earned = self._extract_earned(status)
         log.info(f"[DEBUG] Initial earned: ₹{initial_earned}")
         
-        for user_id in target_users:
+        # STEP 3: Send new requests
+        for user_id in TARGET_USERS:
             try:
-                # 1. Initiate
                 init_resp = self.initiate_buzz(user_id, token)
                 if init_resp.get("statusCode") != 0:
                     results["failed"] += 1
-                    results["details"].append({"user": user_id, "status": "initiate_failed"})
                     continue
                 
-                time.sleep(0.5)
+                time.sleep(0.3)
                 
-                # 2. Complete (ACCEPT)
                 comp_resp = self.complete_buzz(user_id, token)
                 if comp_resp.get("statusCode") == 0:
                     results["successful"] += 1
-                    results["details"].append({"user": user_id, "status": "success", "amount": 2})
                 else:
                     results["failed"] += 1
-                    results["details"].append({"user": user_id, "status": "complete_failed"})
                 
-                time.sleep(0.5)
+                time.sleep(0.3)
                 
             except Exception as e:
-                log.error(f"Error processing {user_id}: {e}")
+                log.error(f"Error: {e}")
                 results["failed"] += 1
-                results["details"].append({"user": user_id, "status": "error", "error": str(e)})
         
-        # Check final balance
+        # STEP 4: Check final balance
         final_status = self.check_buzz(token)
         final_earned = self._extract_earned(final_status)
         results["total_earned"] = final_earned - initial_earned
@@ -436,7 +401,6 @@ class SwiggyClient:
         return results
 
     def _extract_earned(self, data):
-        """Extract total earned from response"""
         total = 0.0
         try:
             responses = data.get("data", {}).get("campaignRewardResponses", [])
@@ -517,7 +481,6 @@ async def phone_received(update, context):
     user_id = tg_id(update)
     raw = update.message.text.strip()
     phone = re.sub(r"\D", "", raw)
-    
     if len(phone) != 10:
         await update.message.reply_text("❌ Invalid number. Enter 10 digits only:")
         return PHONE
@@ -533,18 +496,13 @@ async def phone_received(update, context):
         await update.message.reply_text(f"❌ {result.get('message', 'Unknown error')}\nTry again:")
         return PHONE
     
-    login_sessions[user_id] = {
-        "phone": phone,
-        "client": client,
-    }
-    
+    login_sessions[user_id] = {"phone": phone, "client": client}
     await update.message.reply_text(f"✅ <b>OTP sent to +91 {phone}!</b>\n\nEnter the 6-digit OTP:")
     return OTP
 
 async def otp_received(update, context):
     user_id = tg_id(update)
     session = login_sessions.get(user_id)
-    
     if not session:
         await update.message.reply_text("⏳ Session expired. Start /start again.")
         return ConversationHandler.END
@@ -567,18 +525,10 @@ async def otp_received(update, context):
         await update.message.reply_text(f"❌ {result.get('message', 'Invalid OTP')}\nTry again:")
         return OTP
     
-    # Save account
     db.add_account(
-        user_id,
-        phone,
-        client.device_id,
-        client.token,
-        client.tid,
-        client.sid,
-        client.secrettoken,
-        client.customer_id,
+        user_id, phone, client.device_id, client.token,
+        client.tid, client.sid, client.secrettoken, client.customer_id
     )
-    
     login_sessions.pop(user_id, None)
     
     await update.message.reply_text(
@@ -603,8 +553,6 @@ async def conv_fallback(update, context):
     await answer(update, "👈 Login reset.", main_menu(update))
     return ConversationHandler.END
 
-# ============================== COLLECTION ==============================
-
 async def collect_buzz(update, context):
     user_id = tg_id(update)
     cid = chat_id(update)
@@ -621,20 +569,11 @@ async def collect_buzz(update, context):
     
     already, streak = db.has_collected_today(account["id"])
     if already:
-        await answer(
-            update,
-            f"✅ Already collected today!\n"
-            f"🔥 Streak: {streak} days\n"
-            f"📅 Next collection: Tomorrow",
-            main_menu(update)
-        )
+        await answer(update, f"✅ Already collected today!\n🔥 Streak: {streak} days", main_menu(update))
         return
     
     await answer(update, "🔄 <b>Starting collection...</b>\n\n⏳ Processing 50 users...\nThis will take 1-2 minutes.")
-    
-    collecting_tasks[cid] = asyncio.create_task(
-        run_collection(update, context, account)
-    )
+    collecting_tasks[cid] = asyncio.create_task(run_collection(update, context, account))
 
 async def run_collection(update, context, account):
     cid = chat_id(update)
@@ -646,16 +585,12 @@ async def run_collection(update, context, account):
         client.secrettoken = account.get("secrettoken", "")
         client.customer_id = account.get("customer_id", "")
         client.device_id = account.get("device_id", "")
-        client.phone = account.get("phone", "")
         
         results = await asyncio.to_thread(client.run_buzz_collection, client.secrettoken)
         
         amount = results.get("total_earned", 0)
         if amount > 0:
             db.add_earned(account["id"], amount)
-            for detail in results.get("details", []):
-                if detail.get("status") == "success":
-                    db.log(account["id"], detail.get("user"), "complete", 2, "ok")
             db.finish_collection(account["id"])
         
         text = (
@@ -674,8 +609,6 @@ async def run_collection(update, context, account):
     finally:
         collecting_tasks.pop(cid, None)
 
-# ============================== MENU HANDLERS ==============================
-
 async def accounts_menu(update):
     user_id = tg_id(update)
     accounts = db.get_accounts(user_id)
@@ -683,33 +616,7 @@ async def accounts_menu(update):
         await answer(update, "❌ No accounts linked.", main_menu(update))
         return
     lines = [f"{'🟢' if a['active'] else '⚪'} <b>+{a['phone']}</b> — ₹{a['total_earned']:.2f}" for a in accounts]
-    rows = [
-        [
-            InlineKeyboardButton(f"{'✅' if a['active'] else '👆'} +{a['phone']}", callback_data=f"pick_{a['id']}"),
-            InlineKeyboardButton("🗑️", callback_data=f"logout_{a['id']}"),
-        ]
-        for a in accounts
-    ]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_back")])
-    await answer(update, "👤 <b>Your Accounts</b>\n\n" + "\n".join(lines), InlineKeyboardMarkup(rows))
-
-async def pick_account(update, account_id):
-    user_id = tg_id(update)
-    account = db.get_account(int(account_id))
-    if not account or account["telegram_id"] != user_id:
-        await answer(update, "❌ Account not found.", main_menu(update))
-        return
-    db.set_active(user_id, int(account_id))
-    await answer(update, f"✅ Active: +{account['phone']}", main_menu(update))
-
-async def logout_account(update, account_id):
-    user_id = tg_id(update)
-    account = db.get_account(int(account_id))
-    if not account or account["telegram_id"] != user_id:
-        await answer(update, "❌ Account not found.", main_menu(update))
-        return
-    db.remove_account(int(account_id))
-    await answer(update, f"🗑️ Removed +{account['phone']}", main_menu(update))
+    await answer(update, "👤 <b>Your Accounts</b>\n\n" + "\n".join(lines), main_menu(update))
 
 async def stats_menu(update):
     user_id = tg_id(update)
@@ -718,18 +625,8 @@ async def stats_menu(update):
     if not accounts:
         await answer(update, "❌ No accounts.", main_menu(update))
         return
-    lines = []
-    for a in accounts:
-        streak = a.get("streak_days") or 0
-        line = f"📱 +{a['phone']} → ₹{a['total_earned']:.2f}"
-        if a["active"]:
-            line += " 🟢"
-        if streak > 0:
-            line += f" | 🔥 {streak}d"
-        lines.append(line)
-    await answer(update, "📊 <b>Your Stats</b>\n\n" + "\n".join(lines) + f"\n\n💰 <b>Total: ₹{total:.2f}</b>\n\n{BRAND}", main_menu(update))
-
-# ============================== ADMIN HANDLERS ==============================
+    lines = [f"📱 +{a['phone']} → ₹{a['total_earned']:.2f}" for a in accounts]
+    await answer(update, "📊 <b>Your Stats</b>\n\n" + "\n".join(lines) + f"\n\n💰 <b>Total: ₹{total:.2f}</b>", main_menu(update))
 
 async def admin_menu_handler(update):
     await answer(update, "👑 <b>Admin Panel</b>", admin_menu())
@@ -748,8 +645,6 @@ async def admin_earnings(update):
     text = f"💰 <b>Total System Earnings: ₹{total:.2f}</b>\n\n"
     lines = [f"📱 +{a['phone']} → ₹{a['total_earned']:.2f}" for a in accounts[:40]]
     await answer(update, text + "\n".join(lines), admin_menu())
-
-# ============================== CALLBACK HANDLER ==============================
 
 async def on_callback(update, context):
     query = update.callback_query
@@ -774,10 +669,6 @@ async def on_callback(update, context):
         elif data == "btn_admin":
             if is_admin(user_id):
                 await admin_menu_handler(update)
-        elif data.startswith("pick_"):
-            await pick_account(update, data.split("_", 1)[1])
-        elif data.startswith("logout_"):
-            await logout_account(update, data.split("_", 1)[1])
         elif data == "adm_collect":
             if is_admin(user_id):
                 await collect_buzz(update, context)
@@ -793,8 +684,6 @@ async def on_callback(update, context):
 
 async def error_handler(update, context):
     log.error("Update %s caused error %s", update, context.error)
-
-# ============================== MAIN ==============================
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
