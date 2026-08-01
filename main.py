@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+SWIGGY BUZZ AUTO-COLLECTOR BOT
+Complete Single Script - Railway Ready - FIXED OTP
+Made by @viediet
+"""
+
 import asyncio
 import html
 import json
@@ -28,11 +37,22 @@ log = logging.getLogger("buzzbot")
 
 # ============================== CONFIG ==============================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
-ADMIN_IDS = [
-    int(x) for x in os.getenv("ADMIN_IDS", "YOUR_TELEGRAM_ID").split(",")
-    if x.strip().lstrip("-").isdigit()
-]
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    print("❌ BOT_TOKEN environment variable required!")
+    os._exit(1)
+
+ADMIN_IDS = []
+admin_ids_str = os.getenv("ADMIN_IDS", "")
+if admin_ids_str:
+    for x in admin_ids_str.split(","):
+        try:
+            ADMIN_IDS.append(int(x.strip()))
+        except:
+            pass
+if not ADMIN_IDS:
+    ADMIN_IDS = [1364476174]
+
 DB_PATH = os.getenv("DB_PATH", "swiggy_buzz.db")
 MAX_EARN_PER_ACCOUNT = float(os.getenv("MAX_EARN_PER_ACCOUNT", "1000"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.8"))
@@ -232,7 +252,7 @@ def extract_campaign_id(url):
 
 
 def find_key(node, key, depth=0):
-    if depth > 6 or not isinstance(node, (dict, list)):
+    if depth > 10 or not isinstance(node, (dict, list)):
         return None
     if isinstance(node, dict):
         for k, v in node.items():
@@ -250,16 +270,45 @@ def find_key(node, key, depth=0):
 
 
 def parse_session(data):
-    root = data.get("data") if isinstance(data, dict) else None
-    if not isinstance(root, dict):
-        root = data
-    customer = find_key(root, "customer_id") or find_key(root, "customerId")
-    return {
-        "token": find_key(root, "token"),
-        "tid": find_key(root, "tid"),
-        "sid": find_key(root, "sid"),
-        "customer_id": str(customer) if customer is not None else "",
+    """Parse login response to extract token, tid, sid, customer_id"""
+    log.info("Parsing session data...")
+    
+    result = {
+        "token": "",
+        "tid": "",
+        "sid": "",
+        "customer_id": "",
     }
+    
+    if isinstance(data, dict):
+        # Direct fields from response
+        result["tid"] = data.get("tid", "")
+        result["sid"] = data.get("sid", "")
+        
+        # Get data from inner data object
+        inner_data = data.get("data", {})
+        if isinstance(inner_data, dict):
+            # Token is directly in data
+            result["token"] = inner_data.get("token", "")
+            result["customer_id"] = str(inner_data.get("customer_id", ""))
+            
+            # Also check juspay for customer_id
+            if not result["customer_id"]:
+                juspay = inner_data.get("juspay", {})
+                if isinstance(juspay, dict):
+                    result["customer_id"] = str(juspay.get("customer_id", ""))
+        
+        # If token still not found, search deeper
+        if not result["token"]:
+            result["token"] = find_key(data, "token") or ""
+        
+        if not result["customer_id"]:
+            customer_id = find_key(data, "customer_id")
+            if customer_id:
+                result["customer_id"] = str(customer_id)
+    
+    log.info(f"Parsed: token={result['token'][:30] if result['token'] else 'None'}...")
+    return result
 
 
 def parse_amount(payload):
@@ -346,11 +395,14 @@ class SwiggyClient:
         return resp.json()
 
     def _auth_headers(self, account):
-        return self._headers({
-            "token": account.get("token", ""),
-            "tid": account.get("tid", ""),
-            "sid": account.get("sid", ""),
-        })
+        headers = self._headers()
+        if account.get("token"):
+            headers["token"] = account["token"]
+        if account.get("tid"):
+            headers["tid"] = account["tid"]
+        if account.get("sid"):
+            headers["sid"] = account["sid"]
+        return headers
 
     def _post(self, url, headers, body, attempts=2):
         last_exc = None
@@ -548,17 +600,24 @@ async def otp_received(update, context):
         return OTP
     client = session["client"]
     try:
+        log.info(f"Verifying OTP: {otp} for phone: {session['phone']}")
         data = await asyncio.to_thread(client.verify_otp, session["phone"], otp)
+        log.info(f"Verify response received")
     except Exception as exc:
+        log.error(f"OTP verification error: {exc}")
         await update.message.reply_text(
             f"❌ OTP verification failed: {html.escape(str(exc)[:200])}\n\nTry again:",
             parse_mode=ParseMode.HTML,
         )
         return OTP
+    
     login_info = parse_session(data)
+    log.info(f"Parsed login info: token={login_info['token'][:30] if login_info['token'] else 'None'}...")
+    
     if not login_info.get("token"):
         await update.message.reply_text("❌ Login failed. Check the OTP and try again.", parse_mode=ParseMode.HTML)
         return OTP
+    
     account_id = db.add_account(
         user_id,
         session["phone"],
