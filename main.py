@@ -3,7 +3,7 @@
 
 """
 SWIGGY BUZZ AUTO-COLLECTOR BOT
-Complete Single Script - Railway Ready - FIXED
+Complete Single Script - Railway Ready
 Made by @viediet
 """
 
@@ -14,7 +14,6 @@ import time
 import re
 import sqlite3
 import threading
-import asyncio
 import logging
 import html
 import uuid
@@ -255,44 +254,31 @@ def find_key(node, key, depth=0):
     return None
 
 def parse_session(data):
-    """Parse login response to extract token, tid, sid, customer_id"""
-    log.info(f"Parsing session data: {json.dumps(data)[:500]}")
-    
+    log.info(f"Parsing session data...")
     result = {
         "token": "",
         "tid": "",
         "sid": "",
         "customer_id": "",
     }
-    
-    # Try to get from data.data first
     if isinstance(data, dict):
-        # Direct fields in response
         result["tid"] = data.get("tid", "")
         result["sid"] = data.get("sid", "")
-        
-        # Get token from data.data
         inner_data = data.get("data", {})
         if isinstance(inner_data, dict):
             result["token"] = inner_data.get("token", "")
             result["customer_id"] = str(inner_data.get("customer_id", ""))
-            
-            # Also check juspay for customer_id
             if not result["customer_id"]:
                 juspay = inner_data.get("juspay", {})
                 if isinstance(juspay, dict):
                     result["customer_id"] = str(juspay.get("customer_id", ""))
-        
-        # If token still not found, search deeper
         if not result["token"]:
             result["token"] = find_key(data, "token") or ""
-        
         if not result["customer_id"]:
             customer_id = find_key(data, "customer_id")
             if customer_id:
                 result["customer_id"] = str(customer_id)
-    
-    log.info(f"Parsed: token={result['token'][:30] if result['token'] else 'None'}..., tid={result['tid'][:30] if result['tid'] else 'None'}...")
+    log.info(f"Parsed: token={result['token'][:30] if result['token'] else 'None'}...")
     return result
 
 def parse_amount(payload):
@@ -348,7 +334,7 @@ class SwiggyClient:
         except ValueError:
             return {"status": "error", "message": "Invalid response from server"}
         if "captcha" in json.dumps(data).lower():
-            return {"status": "captcha", "message": "OTP blocked by captcha. Try again later or from a fresh device."}
+            return {"status": "captcha", "message": "OTP blocked by captcha"}
         if not isinstance(data, dict) or data.get("errorCode") or data.get("errorMessage"):
             return {"status": "error", "message": str(data)[:300]}
         return {"status": "ok", "data": data}
@@ -530,7 +516,7 @@ async def phone_received(update, context):
         return "PHONE"
     client = SwiggyClient()
     try:
-        status = await asyncio.to_thread(client.send_otp, phone)
+        status = client.send_otp(phone)
     except Exception as exc:
         await update.message.reply_text(
             f"❌ Could not send OTP: {html.escape(str(exc)[:200])}\n\nTry again:",
@@ -565,7 +551,7 @@ async def otp_received(update, context):
     client = session["client"]
     try:
         log.info(f"Verifying OTP: {otp} for phone: {session['phone']}")
-        data = await asyncio.to_thread(client.verify_otp, session["phone"], otp)
+        data = client.verify_otp(session["phone"], otp)
         log.info(f"Verify response received")
     except Exception as exc:
         log.error(f"OTP verification error: {exc}")
@@ -601,19 +587,81 @@ async def otp_received(update, context):
         f"✅ <b>Logged in as +{html.escape(session['phone'])}</b>\n\n🎁 Auto-collection started...",
         parse_mode=ParseMode.HTML,
     )
-    start_collection(update, account)
+    # Start collection in background thread
+    threading.Thread(target=lambda: run_collection_sync(update, account)).start()
     await update.message.reply_text("🔹 <b>Main Menu</b>\n\n" + BRAND, reply_markup=main_menu(update), parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
-def start_collection(update, account):
+def run_collection_sync(update, account):
+    try:
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_collection(update, account))
+    except Exception as e:
+        log.error(f"Collection error: {e}")
+
+async def run_collection(update, account):
     cid = chat_id(update)
-    if not cid:
-        return
-    existing = collecting_tasks.get(cid)
-    if existing and not existing.done():
-        log.info("collection already running for chat %s", cid)
-        return
-    collecting_tasks[cid] = asyncio.create_task(run_collection(update, account))
+    client = SwiggyClient(device_id=account["device_id"], swuid=account["swuid"])
+    links = db.get_all_links()
+    total_new = 0.0
+    done = 0
+    last_ok = True
+    try:
+        if not links:
+            await send_plain(update, "📭 No buzz links added yet. Ask an admin to add links first.")
+            return
+        first = await send_plain(update, "🎁 <b>Collecting... [0/0]</b>\n\nStarting...")
+        if first is not None:
+            progress_messages[cid] = first.message_id
+        
+        for index, link in enumerate(links, 1):
+            row = db.get_account(account["id"])
+            if not row:
+                break
+            if row["total_earned"] >= MAX_EARN_PER_ACCOUNT:
+                await edit_progress(
+                    cid,
+                    update,
+                    f"🏆 <b>Max limit ₹{MAX_EARN_PER_ACCOUNT:g} reached!</b>\n\n"
+                    f"Total earned: ₹{row['total_earned']:.2f}\n\n{BRAND}",
+                )
+                return
+            gained = 0.0
+            try:
+                result = client.collect_campaign(row, link["campaign_id"], "web")
+                gained += parse_amount(result)
+                db.log(row["id"], link["id"], "open", parse_amount(result), "ok")
+                last_ok = True
+            except Exception as exc:
+                db.log(row["id"], link["id"], "open", 0, "failed")
+                last_ok = False
+                log.warning("open failed for %s: %s", link["campaign_id"], exc)
+            try:
+                back = client.buzz_back(row, link["campaign_id"])
+                back_amt = parse_amount(back)
+                gained += back_amt
+                db.log(row["id"], link["id"], "buzz_back", back_amt, "ok")
+            except Exception as exc:
+                db.log(row["id"], link["id"], "buzz_back", 0, "failed")
+                log.warning("buzz_back failed for %s: %s", link["campaign_id"], exc)
+            db.add_earned(row["id"], gained)
+            total_new += gained
+            done += 1
+            await edit_progress(cid, update, progress_text(done, len(links), total_new, last_ok))
+            await asyncio.sleep(REQUEST_DELAY)
+        row = db.get_account(account["id"])
+        final_total = row["total_earned"] if row else total_new
+        await edit_progress(cid, update, final_text(done, len(links), total_new, final_total))
+    except Exception as exc:
+        log.exception("collection crashed")
+        try:
+            await edit_progress(cid, update, f"❌ <b>Collection stopped:</b> {html.escape(str(exc)[:200])}")
+        except Exception:
+            pass
+    finally:
+        progress_messages.pop(cid, None)
 
 def progress_text(done, total, earned, last_ok):
     bar_len = 12
@@ -648,208 +696,62 @@ async def edit_progress(cid, update, text):
     except Exception as exc:
         log.warning("progress edit failed: %s", exc)
 
-async def run_collection(update, account):
-    cid = chat_id(update)
-    client = SwiggyClient(device_id=account["device_id"], swuid=account["swuid"])
-    links = db.get_all_links()
-    total_new = 0.0
-    done = 0
-    last_ok = True
-    try:
-        if not links:
-            await send_plain(update, "📭 No buzz links added yet. Ask an admin to add links first.")
-            return
-        first = await send_plain(update, "🎁 <b>Collecting... [0/0]</b>\n\nStarting...")
-        if first is not None:
-            progress_messages[cid] = first.message_id
-        for index, link in enumerate(links, 1):
-            row = db.get_account(account["id"])
-            if not row:
-                break
-            if row["total_earned"] >= MAX_EARN_PER_ACCOUNT:
-                await edit_progress(
-                    cid,
-                    update,
-                    f"🏆 <b>Max limit ₹{MAX_EARN_PER_ACCOUNT:g} reached!</b>\n\n"
-                    f"Total earned: ₹{row['total_earned']:.2f}\n\n{BRAND}",
-                )
-                return
-            gained = 0.0
-            try:
-                result = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"], "web")
-                gained += parse_amount(result)
-                db.log(row["id"], link["id"], "open", parse_amount(result), "ok")
-                last_ok = True
-            except Exception as exc:
-                db.log(row["id"], link["id"], "open", 0, "failed")
-                last_ok = False
-                log.warning("open failed for %s: %s", link["campaign_id"], exc)
-            try:
-                back = await asyncio.to_thread(client.buzz_back, row, link["campaign_id"])
-                back_amt = parse_amount(back)
-                gained += back_amt
-                db.log(row["id"], link["id"], "buzz_back", back_amt, "ok")
-            except Exception as exc:
-                db.log(row["id"], link["id"], "buzz_back", 0, "failed")
-                log.warning("buzz_back failed for %s: %s", link["campaign_id"], exc)
-            db.add_earned(row["id"], gained)
-            total_new += gained
-            done += 1
-            await edit_progress(cid, update, progress_text(done, len(links), total_new, last_ok))
-            await asyncio.sleep(REQUEST_DELAY)
-        row = db.get_account(account["id"])
-        final_total = row["total_earned"] if row else total_new
-        await edit_progress(cid, update, final_text(done, len(links), total_new, final_total))
-    except Exception as exc:
-        log.exception("collection crashed")
-        try:
-            await edit_progress(cid, update, f"❌ <b>Collection stopped:</b> {html.escape(str(exc)[:200])}")
-        except Exception:
-            pass
-    finally:
-        progress_messages.pop(cid, None)
-        collecting_tasks.pop(cid, None)
+# ==================== MAIN ====================
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
 
-async def accounts_menu(update):
-    user_id = tg_id(update)
-    accounts = db.get_accounts(user_id)
-    if not accounts:
-        await answer(update, "❌ No accounts linked yet.\n\nTap 🔐 Login Account to add one.", main_menu(update))
-        return
-    lines = [
-        f"{'🟢' if a['active'] else '⚪'} <b>+{html.escape(a['phone'])}</b> — ₹{a['total_earned']:.2f}"
-        for a in accounts
-    ]
-    rows = [
-        [
-            InlineKeyboardButton(f"{'✅' if a['active'] else '👆'} +{a['phone']}", callback_data=f"pick_{a['id']}"),
-            InlineKeyboardButton("🗑️", callback_data=f"logout_{a['id']}"),
-        ]
-        for a in accounts
-    ]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_back")])
-    text = "👤 <b>Your Accounts</b>\n\n" + "\n".join(lines) + "\n\nTap to switch active account. 🗑️ removes it."
-    await answer(update, text, InlineKeyboardMarkup(rows))
+    app.add_handler(CommandHandler("start", start))
 
-async def pick_account(update, account_id):
-    user_id = tg_id(update)
-    try:
-        account_id = int(account_id)
-    except (TypeError, ValueError):
-        return
-    account = db.get_account(account_id)
-    if not account or account["telegram_id"] != user_id:
-        await answer(update, "❌ Account not found.", main_menu(update))
-        return
-    db.set_active(user_id, account_id)
-    await answer(
-        update,
-        f"✅ Active account set to <b>+{html.escape(account['phone'])}</b>\n\n🎁 Tap Collect Buzz to start collecting.",
-        main_menu(update),
+    login_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(login_start, pattern="^btn_login$")],
+        states={
+            "PHONE": [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received)],
+            "OTP": [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_received)],
+        },
+        fallbacks=[
+            CallbackQueryHandler(conv_fallback, pattern="^btn_"),
+            CommandHandler("start", start),
+            CommandHandler("cancel", cancel_login),
+        ],
+        allow_reentry=True,
     )
+    app.add_handler(login_conv)
 
-async def logout_account(update, account_id):
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_links_received))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(error_handler)
+
+    log.info("🤖 Swiggy Buzz Auto-Collector Bot is running...")
+    log.info(f"👑 Admin IDs: {ADMIN_IDS}")
+    log.info(f"⚡ Made by @viediet")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+async def admin_links_received(update, context):
     user_id = tg_id(update)
-    try:
-        account_id = int(account_id)
-    except (TypeError, ValueError):
+    if not context.user_data.get("adm_add"):
         return
-    account = db.get_account(account_id)
-    if not account or account["telegram_id"] != user_id:
-        await answer(update, "❌ Account not found.", main_menu(update))
-        return
-    db.remove_account(account_id)
-    remaining = db.get_active_account(user_id)
-    if not remaining:
-        others = db.get_accounts(user_id)
-        if others:
-            db.set_active(user_id, others[0]["id"])
-    await answer(update, f"🗑️ Removed <b>+{html.escape(account['phone'])}</b>.", main_menu(update))
-
-async def collect_menu(update):
-    user_id = tg_id(update)
-    cid = chat_id(update)
-    existing = collecting_tasks.get(cid)
-    if existing and not existing.done():
-        await answer(update, "⏳ Collection is already running. Please wait...", main_menu(update))
-        return
-    accounts = db.get_accounts(user_id)
-    if not accounts:
-        await answer(update, "❌ No accounts linked yet. Tap 🔐 Login Account first.", main_menu(update))
-        return
-    active = db.get_active_account(user_id)
-    if len(accounts) == 1 or active:
-        account = active or accounts[0]
-        start_collection(update, account)
-        await answer(update, f"🎁 Starting collection for <b>+{html.escape(account['phone'])}</b>...", main_menu(update))
-        return
-    rows = [[InlineKeyboardButton(f"📱 +{a['phone']}", callback_data=f"pick_{a['id']}")] for a in accounts]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_back")])
-    await answer(update, "🎁 <b>Choose an account to collect with:</b>", InlineKeyboardMarkup(rows))
-
-async def stats_menu(update):
-    user_id = tg_id(update)
-    accounts, total = db.get_stats(user_id)
-    if not accounts:
-        await answer(update, "❌ No accounts yet.", main_menu(update))
-        return
-    lines = [
-        f"📱 +{html.escape(a['phone'])} → ₹{a['total_earned']:.2f}{' 🟢' if a['active'] else ''}"
-        for a in accounts
-    ]
-    text = (
-        "📊 <b>Your Stats</b>\n\n"
-        + "\n".join(lines)
-        + f"\n\n💰 <b>Total earned: ₹{total:.2f}</b>\n\n{BRAND}"
-    )
-    await answer(update, text, main_menu(update))
-
-async def help_menu(update):
-    text = (
-        "<b>🤖 How to use Swiggy Buzz Auto-Collector</b>\n\n"
-        "1️⃣ Tap <b>🔐 Login Account</b>\n"
-        "2️⃣ Enter your phone number with country code\n"
-        "3️⃣ Enter the OTP you receive\n"
-        "4️⃣ Buzz rewards are collected automatically\n\n"
-        "💰 Opening a link + buzz-back = ₹2-10 per link\n"
-        f"🏆 Max ₹{MAX_EARN_PER_ACCOUNT:g} per account\n\n"
-        f"{BRAND}"
-    )
-    await answer(update, text, main_menu(update))
-
-async def view_links(update):
-    links = db.get_all_links()
-    if not links:
-        await answer(update, "📋 <b>No links yet.</b>\n\nUse ➕ Add Links to add buzz links.", admin_menu())
-        return
-    total = len(links)
-    lines = [f"{i}. <code>{html.escape(l['campaign_id'])}</code>" for i, l in enumerate(links[:50], 1)]
-    more = f"\n... and {total - 50} more" if total > 50 else ""
-    await answer(update, f"📋 <b>Total links: {total}</b>\n\n" + "\n".join(lines) + more, admin_menu())
-
-async def delete_menu(update):
-    links = db.get_all_links()
-    if not links:
-        await answer(update, "📋 No links to delete.", admin_menu())
-        return
-    rows = [
-        [InlineKeyboardButton(f"🗑 {html.escape(l['campaign_id'])}", callback_data=f"del_{l['id']}")]
-        for l in links[:30]
-    ]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_admin")])
-    await answer(update, "🗑 <b>Tap a link to delete it:</b>", InlineKeyboardMarkup(rows))
-
-async def delete_link(update, link_id):
-    user_id = tg_id(update)
     if not is_admin(user_id):
-        await answer(update, "⛔ Admin only.", main_menu(update))
+        context.user_data["adm_add"] = False
         return
-    try:
-        link_id = int(link_id)
-    except (TypeError, ValueError):
+    context.user_data["adm_add"] = False
+    text = (update.message.text or "").strip()
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        cid = extract_campaign_id(line)
+        if cid:
+            entries.append((line, cid))
+    if not entries:
+        await update.message.reply_text(
+            "❌ No valid buzz links found. Campaign IDs must look like <code>ougwl_xxxxx</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
-    db.delete_link(link_id)
-    await delete_menu(update)
+    added = db.add_links(entries, user_id)
+    await update.message.reply_text(
+        f"✅ Added <b>{added}</b> new links (out of {len(entries)} valid).",
+        parse_mode=ParseMode.HTML,
+    )
 
 async def admin_actions(update, context, data):
     user_id = tg_id(update)
@@ -890,32 +792,143 @@ async def admin_actions(update, context, data):
         text += "\n".join(lines[:40])
         await answer(update, text, admin_menu())
 
-async def admin_links_received(update, context):
+async def view_links(update):
+    links = db.get_all_links()
+    if not links:
+        await answer(update, "📋 <b>No links yet.</b>\n\nUse ➕ Add Links to add buzz links.", admin_menu())
+        return
+    total = len(links)
+    lines = [f"{i}. <code>{html.escape(l['campaign_id'])}</code>" for i, l in enumerate(links[:50], 1)]
+    more = f"\n... and {total - 50} more" if total > 50 else ""
+    await answer(update, f"📋 <b>Total links: {total}</b>\n\n" + "\n".join(lines) + more, admin_menu())
+
+async def delete_menu(update):
+    links = db.get_all_links()
+    if not links:
+        await answer(update, "📋 No links to delete.", admin_menu())
+        return
+    rows = [
+        [InlineKeyboardButton(f"🗑 {html.escape(l['campaign_id'])}", callback_data=f"del_{l['id']}")]
+        for l in links[:30]
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_admin")])
+    await answer(update, "🗑 <b>Tap a link to delete it:</b>", InlineKeyboardMarkup(rows))
+
+async def delete_link(update, link_id):
     user_id = tg_id(update)
-    if not context.user_data.get("adm_add"):
-        return
     if not is_admin(user_id):
-        context.user_data["adm_add"] = False
+        await answer(update, "⛔ Admin only.", main_menu(update))
         return
-    context.user_data["adm_add"] = False
-    text = (update.message.text or "").strip()
-    entries = []
-    for line in text.splitlines():
-        line = line.strip()
-        cid = extract_campaign_id(line)
-        if cid:
-            entries.append((line, cid))
-    if not entries:
-        await update.message.reply_text(
-            "❌ No valid buzz links found. Campaign IDs must look like <code>ougwl_xxxxx</code>",
-            parse_mode=ParseMode.HTML,
-        )
+    try:
+        link_id = int(link_id)
+    except (TypeError, ValueError):
         return
-    added = db.add_links(entries, user_id)
-    await update.message.reply_text(
-        f"✅ Added <b>{added}</b> new links (out of {len(entries)} valid).",
-        parse_mode=ParseMode.HTML,
+    db.delete_link(link_id)
+    await delete_menu(update)
+
+async def pick_account(update, account_id):
+    user_id = tg_id(update)
+    try:
+        account_id = int(account_id)
+    except (TypeError, ValueError):
+        return
+    account = db.get_account(account_id)
+    if not account or account["telegram_id"] != user_id:
+        await answer(update, "❌ Account not found.", main_menu(update))
+        return
+    db.set_active(user_id, account_id)
+    await answer(
+        update,
+        f"✅ Active account set to <b>+{html.escape(account['phone'])}</b>\n\n🎁 Tap Collect Buzz to start collecting.",
+        main_menu(update),
     )
+
+async def logout_account(update, account_id):
+    user_id = tg_id(update)
+    try:
+        account_id = int(account_id)
+    except (TypeError, ValueError):
+        return
+    account = db.get_account(account_id)
+    if not account or account["telegram_id"] != user_id:
+        await answer(update, "❌ Account not found.", main_menu(update))
+        return
+    db.remove_account(account_id)
+    remaining = db.get_active_account(user_id)
+    if not remaining:
+        others = db.get_accounts(user_id)
+        if others:
+            db.set_active(user_id, others[0]["id"])
+    await answer(update, f"🗑️ Removed <b>+{html.escape(account['phone'])}</b>.", main_menu(update))
+
+async def collect_menu(update):
+    user_id = tg_id(update)
+    cid = chat_id(update)
+    accounts = db.get_accounts(user_id)
+    if not accounts:
+        await answer(update, "❌ No accounts linked yet. Tap 🔐 Login Account first.", main_menu(update))
+        return
+    active = db.get_active_account(user_id)
+    if len(accounts) == 1 or active:
+        account = active or accounts[0]
+        # Start collection in background thread
+        threading.Thread(target=lambda: run_collection_sync(update, account)).start()
+        await answer(update, f"🎁 Starting collection for <b>+{html.escape(account['phone'])}</b>...", main_menu(update))
+        return
+    rows = [[InlineKeyboardButton(f"📱 +{a['phone']}", callback_data=f"pick_{a['id']}")] for a in accounts]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_back")])
+    await answer(update, "🎁 <b>Choose an account to collect with:</b>", InlineKeyboardMarkup(rows))
+
+async def accounts_menu(update):
+    user_id = tg_id(update)
+    accounts = db.get_accounts(user_id)
+    if not accounts:
+        await answer(update, "❌ No accounts linked yet.\n\nTap 🔐 Login Account to add one.", main_menu(update))
+        return
+    lines = [
+        f"{'🟢' if a['active'] else '⚪'} <b>+{html.escape(a['phone'])}</b> — ₹{a['total_earned']:.2f}"
+        for a in accounts
+    ]
+    rows = [
+        [
+            InlineKeyboardButton(f"{'✅' if a['active'] else '👆'} +{a['phone']}", callback_data=f"pick_{a['id']}"),
+            InlineKeyboardButton("🗑️", callback_data=f"logout_{a['id']}"),
+        ]
+        for a in accounts
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_back")])
+    text = "👤 <b>Your Accounts</b>\n\n" + "\n".join(lines) + "\n\nTap to switch active account. 🗑️ removes it."
+    await answer(update, text, InlineKeyboardMarkup(rows))
+
+async def stats_menu(update):
+    user_id = tg_id(update)
+    accounts, total = db.get_stats(user_id)
+    if not accounts:
+        await answer(update, "❌ No accounts yet.", main_menu(update))
+        return
+    lines = [
+        f"📱 +{html.escape(a['phone'])} → ₹{a['total_earned']:.2f}{' 🟢' if a['active'] else ''}"
+        for a in accounts
+    ]
+    text = (
+        "📊 <b>Your Stats</b>\n\n"
+        + "\n".join(lines)
+        + f"\n\n💰 <b>Total earned: ₹{total:.2f}</b>\n\n{BRAND}"
+    )
+    await answer(update, text, main_menu(update))
+
+async def help_menu(update):
+    text = (
+        "<b>🤖 How to use Swiggy Buzz Auto-Collector</b>\n\n"
+        "1️⃣ Tap <b>🔐 Login Account</b>\n"
+        "2️⃣ Enter your phone number with country code\n"
+        "3️⃣ Enter the OTP you receive\n"
+        "4️⃣ Buzz rewards are collected automatically\n\n"
+        "💰 Opening a link + buzz-back = ₹2-10 per link\n"
+        f"🏆 Max ₹{MAX_EARN_PER_ACCOUNT:g} per account\n\n"
+        f"{BRAND}"
+    )
+    await answer(update, text, main_menu(update))
 
 async def on_callback(update, context):
     query = update.callback_query
@@ -954,37 +967,5 @@ async def on_callback(update, context):
 async def error_handler(update, context):
     log.error("Update %s caused error %s", update, context.error)
 
-# ==================== MAIN ====================
-async def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-
-    login_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(login_start, pattern="^btn_login$")],
-        states={
-            "PHONE": [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received)],
-            "OTP": [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_received)],
-        },
-        fallbacks=[
-            CallbackQueryHandler(conv_fallback, pattern="^btn_"),
-            CommandHandler("start", start),
-            CommandHandler("cancel", cancel_login),
-        ],
-        allow_reentry=True,
-    )
-    app.add_handler(login_conv)
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_links_received))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_error_handler(error_handler)
-
-    log.info("🤖 Swiggy Buzz Auto-Collector Bot is running...")
-    log.info(f"👑 Admin IDs: {ADMIN_IDS}")
-    log.info(f"⚡ Made by @viediet")
-    
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
