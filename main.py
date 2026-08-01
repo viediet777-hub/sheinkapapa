@@ -3,7 +3,7 @@
 
 """
 SWIGGY BUZZ AUTO-COLLECTOR BOT
-Complete Single Script - Railway Ready - NO aiohttp
+Complete Single Script - Railway Ready
 Made by @viediet
 """
 
@@ -36,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("papu")
 
 # ===================== CONFIG =====================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8607959399:AAFhSjG2DZm-9cTy-ufhe0W_rC9TnxDbLAY")
 CHANNEL_USERNAME = "viedietlooters"
 CHANNEL_LINK = "https://t.me/viedietlooters"
 MAX_ACCOUNTS = 2
@@ -506,7 +506,7 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"claimed ₹{a['total_claimed']} · bonus {'done' if a['bonus_claimed'] else 'pending'}\n"
                 f"   Cash expires: {expiry_text(a['last_claimed_at'])}"
             )
-    await update.message.reply_text("👤 Your accounts:\n\n" + "\n.join(lines))
+    await update.message.reply_text("👤 Your accounts:\n\n" + "\n".join(lines))
 
 @require_member
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
