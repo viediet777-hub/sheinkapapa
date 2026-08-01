@@ -183,11 +183,14 @@ def join_button():
         [[InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)]]
     )
 
+# ===================== FIXED CHANNEL CHECK =====================
 async def is_channel_member(context, user_id):
     try:
-        member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        # Try with @username format
+        member = await context.bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
         return member.status in ("member", "administrator", "creator")
-    except Exception:
+    except Exception as e:
+        logger.error(f"Channel check error: {e}")
         return False
 
 def require_member(f):
