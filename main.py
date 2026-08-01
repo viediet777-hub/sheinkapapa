@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-SWIGGY BUZZ AUTO-COLLECTOR - ₹100/DAY WORKING SCRIPT
+SWIGGY BUZZ AUTO-COLLECTOR - ₹100/DAY WORKING
+Based on lookupinfo.in/swiggy/ exact flow
 Complete Single Script - Railway Ready
 """
 
@@ -16,7 +17,6 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -52,21 +52,21 @@ SPNS_BASE = "https://spns.swiggy.com/api/v1/campaign"
 REWARDS_URL = f"{SPNS_BASE}/rewards"
 ACTION_URL = f"{SPNS_BASE}/action"
 
-# ===== HARDCODED TARGET USERS (FROM THE WEBSITE) =====
+# ===== TARGET USERS IN EXACT ORDER (FROM WEBSITE) =====
 TARGET_USERS = [
-    "1106827431", "2022592103", "2159541308", "2405719218",
-    "3923205642", "3969482763", "3974751011", "4179533661",
-    "4219735233", "4339594714", "4622672366", "4742565540",
-    "4805096977", "4958316534", "5021810039", "5237191585",
-    "5255411320", "5378219742", "5711812412", "5767374231",
-    "5773101973", "5810763039", "6019557067", "6057085260",
-    "6075716540", "6089374148", "6306972524", "6529467214",
-    "6529938009", "7028403798", "7239858845", "7504061044",
-    "7847081991", "8103200020", "8302374884", "8476578440",
-    "8481419410", "8557791891", "8745675335", "8841032307",
-    "9066285442", "9076113237", "9104704566", "9263536039",
-    "9292974443", "9315838951", "9569907686", "9656243680",
-    "9793231470", "9905454846"
+    "9905454846", "8302374884", "9569907686", "6019557067",
+    "8103200020", "9793231470", "6075716540", "6057085260",
+    "6529467214", "4742565540", "2159541308", "5711812412",
+    "4805096977", "6306972524", "5810763039", "5767374231",
+    "5255411320", "9263536039", "9656243680", "7028403798",
+    "2022592103", "4339594714", "9315838951", "5021810039",
+    "4179533661", "3969482763", "5378219742", "4622672366",
+    "6529938009", "8841032307", "7847081991", "8476578440",
+    "4958316534", "6089374148", "3974751011", "9076113237",
+    "2405719218", "8557791891", "5237191585", "7504061044",
+    "7239858845", "5773101973", "9292974443", "8481419410",
+    "4219735233", "9104704566", "3923205642", "1106827431",
+    "9066285442", "8745675335"
 ]
 
 # ============================== DATABASE ==============================
@@ -179,7 +179,7 @@ db = Database()
 
 class SwiggyClient:
     def __init__(self):
-        self.device_id = uuid.uuid4().hex[:16]  # ✅ FIXED - NO str() wrapper
+        self.device_id = uuid.uuid4().hex[:16]
         self.session = requests.Session()
         self.tid = ""
         self.sid = ""
@@ -271,7 +271,7 @@ class SwiggyClient:
             self.customer_id = str(inner.get("customer_id", ""))
             self.device_id = data.get("deviceId", self.device_id)
             
-            # Generate secrettoken (this is what the website does)
+            # Generate secrettoken (website's method)
             self.secrettoken = self.token if self.token else str(uuid.uuid4())
             
             return {
@@ -357,7 +357,7 @@ class SwiggyClient:
         return data
 
     def complete_buzz(self, target_user_id, secrettoken=None):
-        """Step 5: Complete buzz (accept connection)"""
+        """Step 5: Complete buzz"""
         url = ACTION_URL
         body = {
             "generalContext": {"requestContext": {"clientId": "portal_banner"}},
@@ -379,7 +379,7 @@ class SwiggyClient:
         return data
 
     def run_buzz_collection(self, secrettoken=None):
-        """Full buzz collection - initiate + complete for all target users"""
+        """Full buzz collection - EXACTLY like website"""
         results = {
             "total_earned": 0,
             "successful": 0,
@@ -392,28 +392,30 @@ class SwiggyClient:
         initial_earned = self._extract_earned(status)
         log.info(f"[DEBUG] Initial earned: ₹{initial_earned}")
         
+        # Process each target in EXACT order
         for user_id in TARGET_USERS:
             try:
-                # Initiate
+                # 1. Initiate
                 init_resp = self.initiate_buzz(user_id, secrettoken)
                 if init_resp.get("statusCode") != 0:
                     results["failed"] += 1
                     results["details"].append({"user": user_id, "status": "initiate_failed"})
                     continue
                 
-                # Small delay
-                time.sleep(0.5)
+                # 2. Small delay
+                time.sleep(0.3)
                 
-                # Complete
+                # 3. Complete (accept)
                 comp_resp = self.complete_buzz(user_id, secrettoken)
                 if comp_resp.get("statusCode") == 0:
                     results["successful"] += 1
-                    results["details"].append({"user": user_id, "status": "success"})
+                    results["details"].append({"user": user_id, "status": "success", "amount": 2})
                 else:
                     results["failed"] += 1
                     results["details"].append({"user": user_id, "status": "complete_failed"})
                 
-                time.sleep(0.5)
+                # 4. Delay between users
+                time.sleep(0.3)
                 
             except Exception as e:
                 log.error(f"Error processing {user_id}: {e}")
@@ -623,7 +625,7 @@ async def collect_buzz(update, context):
         )
         return
     
-    await answer(update, "🔄 <b>Starting collection...</b>\n\n⏳ This will take 1-2 minutes...")
+    await answer(update, "🔄 <b>Starting collection...</b>\n\n⏳ Processing 50 users...\nThis will take 1-2 minutes.")
     
     collecting_tasks[cid] = asyncio.create_task(
         run_collection(update, context, account)
