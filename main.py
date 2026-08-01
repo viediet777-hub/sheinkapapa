@@ -1,8 +1,24 @@
-import asyncio
-import html
-import logging
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+"""
+SWIGGY BUZZ AUTO-COLLECTOR BOT
+Complete Single Script Version
+Made by @viediet
+"""
+
+import os
+import json
+import time
+import re
+import sqlite3
+import threading
+import asyncio
+import logging
+import html
+import uuid
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -14,35 +30,359 @@ from telegram.ext import (
     filters,
 )
 
-import config
-from database import Database
-from swiggy_api import SwiggyClient, extract_campaign_id, parse_amount, parse_session
+# ==================== CONFIG ====================
+BOT_TOKEN = "8714473259:AAF3PCTX82kjhMvXDcPuqTl8qGgZvU_S5Qo"
+ADMIN_IDS = [1364476174]
+DB_PATH = "swiggy_buzz.db"
+MAX_EARN_PER_ACCOUNT = 1000
+REQUEST_DELAY = 0.8
+BRAND = "⚡ Made by @viediet"
 
+BASE_HEADERS = {
+    "pl-version": "138",
+    "version-code": "1795",
+    "app-version": "4.113.0",
+    "os-version": "11",
+    "latitude": "22.7421633",
+    "longitude": "75.907875",
+    "accept": "application/json",
+    "content-type": "application/json",
+    "user-agent": "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+}
+
+OTP_URL = "https://profile.swiggy.com/api/v3/app/sms_otp"
+VERIFY_URL = "https://profile.swiggy.com/api/v3/app/login/verify"
+REWARDS_URL = "https://spns.swiggy.com/api/v1/campaign/rewards"
+
+# ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("buzzbot")
 
+# ==================== DATABASE ====================
+class Database:
+    def __init__(self, path=DB_PATH):
+        self.path = path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    phone TEXT NOT NULL,
+                    token TEXT,
+                    tid TEXT,
+                    sid TEXT,
+                    device_id TEXT,
+                    swuid TEXT,
+                    customer_id TEXT,
+                    total_earned REAL DEFAULT 0,
+                    active INTEGER DEFAULT 0,
+                    created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS buzz_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    link_url TEXT UNIQUE NOT NULL,
+                    campaign_id TEXT NOT NULL,
+                    added_by INTEGER,
+                    created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS buzz_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    link_id INTEGER,
+                    action TEXT,
+                    amount REAL DEFAULT 0,
+                    status TEXT,
+                    created_at TEXT
+                );
+                """
+            )
+            self._conn.commit()
+
+    def _execute(self, sql, params=()):
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            self._conn.commit()
+            return cur
+
+    def now(self):
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def add_account(self, telegram_id, phone, device_id, swuid, token, tid, sid, customer_id):
+        now_s = self.now()
+        cur = self._execute(
+            "SELECT id FROM accounts WHERE telegram_id = ? AND phone = ?",
+            (telegram_id, phone),
+        )
+        row = cur.fetchone()
+        if row:
+            self._execute(
+                "UPDATE accounts SET token = ?, tid = ?, sid = ?, device_id = ?, swuid = ?, customer_id = ?, active = 1 WHERE id = ?",
+                (token, tid, sid, device_id, swuid, customer_id, row["id"]),
+            )
+            account_id = row["id"]
+        else:
+            cur = self._execute(
+                "INSERT INTO accounts (telegram_id, phone, token, tid, sid, device_id, swuid, customer_id, active, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                (telegram_id, phone, token, tid, sid, device_id, swuid, customer_id, now_s),
+            )
+            account_id = cur.lastrowid
+        self._execute("UPDATE accounts SET active = 0 WHERE telegram_id = ? AND id != ?", (telegram_id, account_id))
+        return account_id
+
+    def get_accounts(self, telegram_id):
+        cur = self._execute("SELECT * FROM accounts WHERE telegram_id = ? ORDER BY id", (telegram_id,))
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_account(self, account_id):
+        cur = self._execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_active_account(self, telegram_id):
+        cur = self._execute("SELECT * FROM accounts WHERE telegram_id = ? AND active = 1", (telegram_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def set_active(self, telegram_id, account_id):
+        self._execute("UPDATE accounts SET active = 0 WHERE telegram_id = ?", (telegram_id,))
+        self._execute("UPDATE accounts SET active = 1 WHERE id = ? AND telegram_id = ?", (account_id, telegram_id))
+
+    def remove_account(self, account_id):
+        self._execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+
+    def add_links(self, entries, added_by):
+        count = 0
+        for url, campaign_id in entries:
+            cur = self._execute(
+                "INSERT OR IGNORE INTO buzz_links (link_url, campaign_id, added_by, created_at) VALUES (?, ?, ?, ?)",
+                (url, campaign_id, added_by, self.now()),
+            )
+            if cur.rowcount:
+                count += 1
+        return count
+
+    def get_all_links(self):
+        cur = self._execute("SELECT * FROM buzz_links ORDER BY id")
+        return [dict(r) for r in cur.fetchall()]
+
+    def delete_link(self, link_id):
+        self._execute("DELETE FROM buzz_links WHERE id = ?", (link_id,))
+
+    def log(self, account_id, link_id, action, amount, status):
+        self._execute(
+            "INSERT INTO buzz_logs (account_id, link_id, action, amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (account_id, link_id, action, amount, status, self.now()),
+        )
+
+    def add_earned(self, account_id, amount):
+        self._execute("UPDATE accounts SET total_earned = total_earned + ? WHERE id = ?", (amount, account_id))
+
+    def get_stats(self, telegram_id):
+        accounts = self.get_accounts(telegram_id)
+        total = sum(a["total_earned"] for a in accounts)
+        return accounts, total
+
+    def all_accounts(self):
+        cur = self._execute("SELECT * FROM accounts ORDER BY telegram_id, id")
+        return [dict(r) for r in cur.fetchall()]
+
+    def total_earnings(self):
+        cur = self._execute("SELECT COALESCE(SUM(amount), 0) AS total FROM buzz_logs")
+        return cur.fetchone()["total"]
+
+    def total_logs(self):
+        cur = self._execute("SELECT COUNT(*) AS total FROM buzz_logs")
+        return cur.fetchone()["total"]
+
 db = Database()
 
-PHONE, OTP = range(2)
+# ==================== SWIGGY API ====================
+CAMPAIGN_ID_RE = re.compile(r"buzzstreaks/([^/?#\s]+)")
+FALLBACK_CAMPAIGN_RE = re.compile(r"([A-Za-z0-9]{4,}_[A-Za-z0-9]{3,})")
+REWARD_KEYS = ("amount", "rewardvalue", "reward_amount", "points", "earned", "cashback")
 
+def generate_device_id():
+    return str(uuid.uuid4()).upper()
+
+def generate_swuid():
+    return "SW-" + uuid.uuid4().hex[:12].upper()
+
+def extract_campaign_id(url):
+    if not url:
+        return None
+    match = CAMPAIGN_ID_RE.search(url)
+    if match:
+        return match.group(1)
+    match = FALLBACK_CAMPAIGN_RE.search(url)
+    return match.group(1) if match else None
+
+def find_key(node, key, depth=0):
+    if depth > 6 or not isinstance(node, (dict, list)):
+        return None
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if str(k).lower() == key.lower():
+                return v
+            found = find_key(v, key, depth + 1)
+            if found:
+                return found
+    else:
+        for item in node:
+            found = find_key(item, key, depth + 1)
+            if found:
+                return found
+    return None
+
+def parse_session(data):
+    root = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(root, dict):
+        root = data
+    customer = find_key(root, "customer_id") or find_key(root, "customerId")
+    return {
+        "token": find_key(root, "token"),
+        "tid": find_key(root, "tid"),
+        "sid": find_key(root, "sid"),
+        "customer_id": str(customer) if customer is not None else "",
+    }
+
+def parse_amount(payload):
+    total = 0.0
+    def walk(node):
+        nonlocal total
+        if isinstance(node, dict):
+            for key, val in node.items():
+                lowered = str(key).lower()
+                if lowered in REWARD_KEYS and isinstance(val, (int, float)) and val > 0:
+                    total += float(val)
+                elif isinstance(val, (dict, list)):
+                    walk(val)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    walk(item)
+    walk(payload)
+    return round(total, 2)
+
+def is_success(data):
+    if not isinstance(data, dict):
+        return True
+    if data.get("errors"):
+        return False
+    code = data.get("statusCode", data.get("code"))
+    if isinstance(code, int):
+        return code in (0, 200)
+    if isinstance(code, str):
+        return code.lower() in ("success", "ok", "200", "0")
+    return True
+
+class SwiggyClient:
+    def __init__(self, device_id=None, swuid=None):
+        self.device_id = device_id or generate_device_id()
+        self.swuid = swuid or generate_swuid()
+        self.session = requests.Session()
+
+    def _headers(self, extra=None):
+        headers = dict(BASE_HEADERS)
+        headers["deviceid"] = self.device_id
+        headers["swuid"] = self.swuid
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def send_otp(self, phone):
+        try:
+            import requests
+        except:
+            pass
+        resp = self.session.get(f"{OTP_URL}?mobile={phone}", headers=self._headers(), timeout=30)
+        if resp.status_code != 200:
+            return {"status": "error", "message": f"HTTP {resp.status_code}"}
+        try:
+            data = resp.json()
+        except ValueError:
+            return {"status": "error", "message": "Invalid response from server"}
+        if "captcha" in json.dumps(data).lower():
+            return {"status": "captcha", "message": "OTP blocked by captcha. Try again later or from a fresh device."}
+        if not isinstance(data, dict) or data.get("errorCode") or data.get("errorMessage"):
+            return {"status": "error", "message": str(data)[:300]}
+        return {"status": "ok", "data": data}
+
+    def verify_otp(self, phone, otp):
+        body = {
+            "cloningSignalsData": {
+                "versionCode": 1795,
+                "appVersion": "4.113.0",
+                "osVersion": "11",
+                "osName": "android",
+                "deviceId": self.device_id,
+            },
+            "otp": otp,
+        }
+        resp = self.session.post(
+            f"{VERIFY_URL}?otp_source=Sms-manual",
+            headers=self._headers(),
+            json=body,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise Exception(f"Login verify returned HTTP {resp.status_code}")
+        return resp.json()
+
+    def _auth_headers(self, account):
+        return self._headers({
+            "token": account.get("token", ""),
+            "tid": account.get("tid", ""),
+            "sid": account.get("sid", ""),
+        })
+
+    def _post(self, url, headers, body, attempts=2):
+        last_exc = None
+        for attempt in range(attempts + 1):
+            try:
+                resp = self.session.post(url, headers=headers, json=body, timeout=30)
+                data = resp.json() if resp.content else {}
+                if not is_success(data):
+                    last_exc = Exception(f"API error: {json.dumps(data)[:300]}")
+                else:
+                    return data
+            except Exception as exc:
+                last_exc = Exception(f"network error: {exc}")
+            if attempt < attempts:
+                time.sleep(1.5 * (attempt + 1))
+        raise last_exc
+
+    def collect_campaign(self, account, campaign_id, client_id="web"):
+        body = {
+            "clientId": client_id,
+            "campaignIds": [campaign_id],
+            "userId": account.get("customer_id", ""),
+        }
+        return self._post(REWARDS_URL, self._auth_headers(account), body)
+
+    def buzz_back(self, account, campaign_id):
+        return self.collect_campaign(account, campaign_id, client_id="portal_invite")
+
+# ==================== BOT VARIABLES ====================
 login_sessions = {}
 progress_messages = {}
 collecting_tasks = {}
 
-
+# ==================== BOT HELPERS ====================
 def tg_id(update):
     user = update.effective_user
     return user.id if user else 0
-
 
 def chat_id(update):
     chat = update.effective_chat
     return chat.id if chat else 0
 
-
 def is_admin(user_id):
-    return user_id in config.ADMIN_IDS
-
+    return user_id in ADMIN_IDS
 
 def main_menu(update):
     user_id = tg_id(update)
@@ -61,7 +401,6 @@ def main_menu(update):
         rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="btn_admin")])
     return InlineKeyboardMarkup(rows)
 
-
 def admin_menu():
     return InlineKeyboardMarkup([
         [
@@ -76,7 +415,6 @@ def admin_menu():
         [InlineKeyboardButton("⬅️ Back", callback_data="btn_back")],
     ])
 
-
 async def answer(update, text, markup=None):
     query = update.callback_query
     if query is not None:
@@ -90,7 +428,6 @@ async def answer(update, text, markup=None):
     if message is not None:
         await message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
-
 async def send_plain(update, text):
     cid = chat_id(update)
     if not cid:
@@ -98,17 +435,16 @@ async def send_plain(update, text):
     bot = update.get_bot()
     return await bot.send_message(cid, text, parse_mode=ParseMode.HTML)
 
-
+# ==================== BOT HANDLERS ====================
 async def start(update, context):
     if not tg_id(update):
         return
     text = (
         "<b>🤖 Swiggy Buzz Auto-Collector</b>\n\n"
         "Collect all your Swiggy Buzz rewards automatically — no manual clicking!\n\n"
-        f"{config.BRAND}"
+        f"{BRAND}"
     )
     await update.message.reply_text(text, reply_markup=main_menu(update), parse_mode=ParseMode.HTML)
-
 
 async def cancel_login(update, context):
     user_id = tg_id(update)
@@ -117,13 +453,11 @@ async def cancel_login(update, context):
         await update.message.reply_text("❌ Login cancelled.", reply_markup=main_menu(update), parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
-
 async def conv_fallback(update, context):
     user_id = tg_id(update)
     login_sessions.pop(user_id, None)
     await answer(update, "👈 Login flow reset.\n\nUse the buttons below.", main_menu(update))
     return ConversationHandler.END
-
 
 async def login_start(update, context):
     user_id = tg_id(update)
@@ -137,8 +471,7 @@ async def login_start(update, context):
         "Example: <code>919876543210</code>\n\n"
         "Send /cancel to abort.",
     )
-    return PHONE
-
+    return "PHONE"
 
 async def phone_received(update, context):
     user_id = tg_id(update)
@@ -150,7 +483,7 @@ async def phone_received(update, context):
             "❌ Invalid phone number. Use digits only, e.g. <code>919876543210</code>",
             parse_mode=ParseMode.HTML,
         )
-        return PHONE
+        return "PHONE"
     client = SwiggyClient()
     try:
         status = await asyncio.to_thread(client.send_otp, phone)
@@ -159,20 +492,19 @@ async def phone_received(update, context):
             f"❌ Could not send OTP: {html.escape(str(exc)[:200])}\n\nTry again:",
             parse_mode=ParseMode.HTML,
         )
-        return PHONE
+        return "PHONE"
     if status.get("status") != "ok":
         await update.message.reply_text(
             f"❌ OTP request failed:\n{html.escape(str(status.get('message', 'unknown error'))[:200])}\n\nTry again:",
             parse_mode=ParseMode.HTML,
         )
-        return PHONE
+        return "PHONE"
     login_sessions[user_id] = {"phone": phone, "client": client}
     await update.message.reply_text(
         "✅ <b>OTP sent!</b>\n\nEnter the 6-digit OTP you received on your phone:",
         parse_mode=ParseMode.HTML,
     )
-    return OTP
-
+    return "OTP"
 
 async def otp_received(update, context):
     user_id = tg_id(update)
@@ -185,7 +517,7 @@ async def otp_received(update, context):
     otp = (update.message.text or "").strip()
     if not otp.isdigit() or len(otp) != 6:
         await update.message.reply_text("❌ Invalid OTP. Enter the 6-digit code:")
-        return OTP
+        return "OTP"
     client = session["client"]
     try:
         data = await asyncio.to_thread(client.verify_otp, session["phone"], otp)
@@ -194,11 +526,11 @@ async def otp_received(update, context):
             f"❌ OTP verification failed: {html.escape(str(exc)[:200])}\n\nTry again:",
             parse_mode=ParseMode.HTML,
         )
-        return OTP
+        return "OTP"
     login_info = parse_session(data)
     if not login_info.get("token"):
         await update.message.reply_text("❌ Login failed. Check the OTP and try again.", parse_mode=ParseMode.HTML)
-        return OTP
+        return "OTP"
     account_id = db.add_account(
         user_id,
         session["phone"],
@@ -219,9 +551,8 @@ async def otp_received(update, context):
         parse_mode=ParseMode.HTML,
     )
     start_collection(update, account)
-    await update.message.reply_text("🔹 <b>Main Menu</b>\n\n" + config.BRAND, reply_markup=main_menu(update), parse_mode=ParseMode.HTML)
+    await update.message.reply_text("🔹 <b>Main Menu</b>\n\n" + BRAND, reply_markup=main_menu(update), parse_mode=ParseMode.HTML)
     return ConversationHandler.END
-
 
 def start_collection(update, account):
     cid = chat_id(update)
@@ -232,7 +563,6 @@ def start_collection(update, account):
         log.info("collection already running for chat %s", cid)
         return
     collecting_tasks[cid] = asyncio.create_task(run_collection(update, account))
-
 
 def progress_text(done, total, earned, last_ok):
     bar_len = 12
@@ -246,15 +576,13 @@ def progress_text(done, total, earned, last_ok):
         f"Last result: {mark}"
     )
 
-
 def final_text(done, total, earned, account_total):
     return (
         f"✅ <b>Collection finished! [{done}/{total}]</b>\n\n"
         f"💰 This run: ₹{earned:.2f}\n"
         f"🏆 Account total: ₹{account_total:.2f}\n\n"
-        f"{config.BRAND}"
+        f"{BRAND}"
     )
-
 
 async def edit_progress(cid, update, text):
     msg_id = progress_messages.get(cid)
@@ -268,7 +596,6 @@ async def edit_progress(cid, update, text):
             log.warning("progress edit failed: %s", exc)
     except Exception as exc:
         log.warning("progress edit failed: %s", exc)
-
 
 async def run_collection(update, account):
     cid = chat_id(update)
@@ -288,12 +615,12 @@ async def run_collection(update, account):
             row = db.get_account(account["id"])
             if not row:
                 break
-            if row["total_earned"] >= config.MAX_EARN_PER_ACCOUNT:
+            if row["total_earned"] >= MAX_EARN_PER_ACCOUNT:
                 await edit_progress(
                     cid,
                     update,
-                    f"🏆 <b>Max limit ₹{config.MAX_EARN_PER_ACCOUNT:g} reached!</b>\n\n"
-                    f"Total earned: ₹{row['total_earned']:.2f}\n\n{config.BRAND}",
+                    f"🏆 <b>Max limit ₹{MAX_EARN_PER_ACCOUNT:g} reached!</b>\n\n"
+                    f"Total earned: ₹{row['total_earned']:.2f}\n\n{BRAND}",
                 )
                 return
             gained = 0.0
@@ -318,7 +645,7 @@ async def run_collection(update, account):
             total_new += gained
             done += 1
             await edit_progress(cid, update, progress_text(done, len(links), total_new, last_ok))
-            await asyncio.sleep(config.REQUEST_DELAY)
+            await asyncio.sleep(REQUEST_DELAY)
         row = db.get_account(account["id"])
         final_total = row["total_earned"] if row else total_new
         await edit_progress(cid, update, final_text(done, len(links), total_new, final_total))
@@ -331,7 +658,6 @@ async def run_collection(update, account):
     finally:
         progress_messages.pop(cid, None)
         collecting_tasks.pop(cid, None)
-
 
 async def accounts_menu(update):
     user_id = tg_id(update)
@@ -354,7 +680,6 @@ async def accounts_menu(update):
     text = "👤 <b>Your Accounts</b>\n\n" + "\n".join(lines) + "\n\nTap to switch active account. 🗑️ removes it."
     await answer(update, text, InlineKeyboardMarkup(rows))
 
-
 async def pick_account(update, account_id):
     user_id = tg_id(update)
     try:
@@ -371,7 +696,6 @@ async def pick_account(update, account_id):
         f"✅ Active account set to <b>+{html.escape(account['phone'])}</b>\n\n🎁 Tap Collect Buzz to start collecting.",
         main_menu(update),
     )
-
 
 async def logout_account(update, account_id):
     user_id = tg_id(update)
@@ -390,7 +714,6 @@ async def logout_account(update, account_id):
         if others:
             db.set_active(user_id, others[0]["id"])
     await answer(update, f"🗑️ Removed <b>+{html.escape(account['phone'])}</b>.", main_menu(update))
-
 
 async def collect_menu(update):
     user_id = tg_id(update)
@@ -413,7 +736,6 @@ async def collect_menu(update):
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_back")])
     await answer(update, "🎁 <b>Choose an account to collect with:</b>", InlineKeyboardMarkup(rows))
 
-
 async def stats_menu(update):
     user_id = tg_id(update)
     accounts, total = db.get_stats(user_id)
@@ -427,10 +749,9 @@ async def stats_menu(update):
     text = (
         "📊 <b>Your Stats</b>\n\n"
         + "\n".join(lines)
-        + f"\n\n💰 <b>Total earned: ₹{total:.2f}</b>\n\n{config.BRAND}"
+        + f"\n\n💰 <b>Total earned: ₹{total:.2f}</b>\n\n{BRAND}"
     )
     await answer(update, text, main_menu(update))
-
 
 async def help_menu(update):
     text = (
@@ -440,11 +761,10 @@ async def help_menu(update):
         "3️⃣ Enter the OTP you receive\n"
         "4️⃣ Buzz rewards are collected automatically\n\n"
         "💰 Opening a link + buzz-back = ₹2-10 per link\n"
-        f"🏆 Max ₹{config.MAX_EARN_PER_ACCOUNT:g} per account\n\n"
-        f"{config.BRAND}"
+        f"🏆 Max ₹{MAX_EARN_PER_ACCOUNT:g} per account\n\n"
+        f"{BRAND}"
     )
     await answer(update, text, main_menu(update))
-
 
 async def view_links(update):
     links = db.get_all_links()
@@ -455,7 +775,6 @@ async def view_links(update):
     lines = [f"{i}. <code>{html.escape(l['campaign_id'])}</code>" for i, l in enumerate(links[:50], 1)]
     more = f"\n... and {total - 50} more" if total > 50 else ""
     await answer(update, f"📋 <b>Total links: {total}</b>\n\n" + "\n".join(lines) + more, admin_menu())
-
 
 async def delete_menu(update):
     links = db.get_all_links()
@@ -469,7 +788,6 @@ async def delete_menu(update):
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_admin")])
     await answer(update, "🗑 <b>Tap a link to delete it:</b>", InlineKeyboardMarkup(rows))
 
-
 async def delete_link(update, link_id):
     user_id = tg_id(update)
     if not is_admin(user_id):
@@ -481,7 +799,6 @@ async def delete_link(update, link_id):
         return
     db.delete_link(link_id)
     await delete_menu(update)
-
 
 async def admin_actions(update, context, data):
     user_id = tg_id(update)
@@ -522,7 +839,6 @@ async def admin_actions(update, context, data):
         text += "\n".join(lines[:40])
         await answer(update, text, admin_menu())
 
-
 async def admin_links_received(update, context):
     user_id = tg_id(update)
     if not context.user_data.get("adm_add"):
@@ -550,7 +866,6 @@ async def admin_links_received(update, context):
         parse_mode=ParseMode.HTML,
     )
 
-
 async def on_callback(update, context):
     query = update.callback_query
     user_id = tg_id(update)
@@ -561,7 +876,7 @@ async def on_callback(update, context):
     await query.answer()
     try:
         if data == "btn_back":
-            await answer(update, "🔹 <b>Main Menu</b>\n\n" + config.BRAND, main_menu(update))
+            await answer(update, "🔹 <b>Main Menu</b>\n\n" + BRAND, main_menu(update))
         elif data == "btn_accounts":
             await accounts_menu(update)
         elif data == "btn_collect":
@@ -585,21 +900,20 @@ async def on_callback(update, context):
         log.exception("callback error")
         await answer(update, f"❌ Something went wrong: {html.escape(str(exc)[:150])}", main_menu(update))
 
-
 async def error_handler(update, context):
     log.error("Update %s caused error %s", update, context.error)
 
-
+# ==================== MAIN ====================
 def main():
-    app = Application.builder().token(config.BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
 
     login_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(login_start, pattern="^btn_login$")],
         states={
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received)],
-            OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_received)],
+            "PHONE": [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received)],
+            "OTP": [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_received)],
         },
         fallbacks=[
             CallbackQueryHandler(conv_fallback, pattern="^btn_"),
@@ -614,9 +928,10 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(error_handler)
 
-    log.info("Swiggy Buzz bot starting...")
+    log.info("🤖 Swiggy Buzz Auto-Collector Bot is running...")
+    log.info(f"👑 Admin IDs: {ADMIN_IDS}")
+    log.info(f"⚡ Made by @viediet")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
