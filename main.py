@@ -23,6 +23,7 @@ SPNS_BASE = "https://spns.swiggy.com/api/v1/campaign"
 REWARDS_URL = f"{SPNS_BASE}/rewards"
 ACTION_URL = f"{SPNS_BASE}/action"
 
+# 50 target users – you can update this list
 TARGET_USERS = [
     "9905454846", "8302374884", "9569907686", "6019557067",
     "8103200020", "9793231470", "6075716540", "6057085260",
@@ -218,7 +219,7 @@ def send_connect(secrettoken, target_id, customer_id, tid, sid):
     resp = requests.post(url, headers=spns_headers(secrettoken, tid, sid), json=body, timeout=30)
     return resp.json() if resp.content else {}
 
-def send_accept(secrettoken, target_id, customer_id, tid, sid):
+def accept_connection(secrettoken, target_id, customer_id, tid, sid):
     url = ACTION_URL
     body = {
         "generalContext": {"requestContext": {"clientId": "portal_banner"}},
@@ -231,6 +232,17 @@ def send_accept(secrettoken, target_id, customer_id, tid, sid):
     }
     resp = requests.post(url, headers=spns_headers(secrettoken, tid, sid), json=body, timeout=30)
     return resp.json() if resp.content else {}
+
+def get_pending_incoming(secrettoken, tid, sid):
+    """Fetch list of users who sent you a connection request (pending)."""
+    status = check_buzz(secrettoken, tid, sid)
+    connections = status.get("data", {}).get("campaignRewardResponses", [{}])[0].get("connections", {}).get("connections", [])
+    pending = []
+    for conn in connections:
+        progress = conn.get("progress", {})
+        if progress.get("status") == "PROGRESS_STATUS_IN_PROGRESS_ACCEPT_INVITE_PENDING":
+            pending.append(conn.get("connectedUserId"))
+    return pending
 
 # ==================== FLASK ENDPOINTS ====================
 @app.route('/send-otp', methods=['POST', 'OPTIONS'])
@@ -247,7 +259,6 @@ def send_otp_endpoint():
 
 @app.route('/json-login', methods=['POST', 'OPTIONS'])
 def json_login():
-    """Direct login using secrettoken (JSON login)"""
     if request.method == 'OPTIONS': return '', 200
     data = request.get_json()
     secrettoken = data.get('secrettoken', '').strip()
@@ -388,28 +399,42 @@ def collect():
     if last and last['last_collection_date'] == today:
         return jsonify({"status": "error", "message": "Already collected today!"}), 400
     
-    # Run collection
-    successful, failed = 0, 0
+    # Initial balance
     initial_data = check_buzz(secrettoken, tid, sid)
     initial_earned = extract_earned(initial_data)
     
+    # --- Step 1: Send connect requests to all targets ---
+    connect_success = 0
+    connect_fail = 0
     for target in TARGET_USERS:
         try:
-            connect_resp = send_connect(secrettoken, target, customer_id, tid, sid)
-            if connect_resp.get('statusCode') != 0:
-                failed += 1
-                continue
-            time.sleep(0.5)
-            accept_resp = send_accept(secrettoken, target, customer_id, tid, sid)
-            if accept_resp.get('statusCode') == 0:
-                successful += 1
+            resp = send_connect(secrettoken, target, customer_id, tid, sid)
+            if resp.get('statusCode') == 0:
+                connect_success += 1
             else:
-                failed += 1
+                connect_fail += 1
             time.sleep(0.5)
         except Exception as e:
-            log.error(f"Error: {e}")
-            failed += 1
+            log.error(f"Connect error {target}: {e}")
+            connect_fail += 1
     
+    # --- Step 2: Auto-accept incoming pending requests ---
+    pending = get_pending_incoming(secrettoken, tid, sid)
+    accept_success = 0
+    accept_fail = 0
+    for target_id in pending:
+        try:
+            resp = accept_connection(secrettoken, target_id, customer_id, tid, sid)
+            if resp.get('statusCode') == 0:
+                accept_success += 1
+            else:
+                accept_fail += 1
+            time.sleep(0.5)
+        except Exception as e:
+            log.error(f"Accept error {target_id}: {e}")
+            accept_fail += 1
+    
+    # Final balance
     final_data = check_buzz(secrettoken, tid, sid)
     final_earned = extract_earned(final_data)
     earned_amount = final_earned - initial_earned
@@ -436,9 +461,11 @@ def collect():
     return jsonify({
         "status": "ok",
         "earned": earned_amount,
-        "successful": successful,
-        "failed": failed,
-        "totalEarned": final_earned
+        "successful": connect_success + accept_success,
+        "failed": connect_fail + accept_fail,
+        "totalEarned": final_earned,
+        "connects": connect_success,
+        "accepts": accept_success
     })
 
 if __name__ == "__main__":
