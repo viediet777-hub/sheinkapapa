@@ -2,9 +2,10 @@ import os
 import re
 import time
 import uuid
+import json
 import logging
 import sqlite3
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import requests
 from datetime import datetime
@@ -23,7 +24,6 @@ SPNS_BASE = "https://spns.swiggy.com/api/v1/campaign"
 REWARDS_URL = f"{SPNS_BASE}/rewards"
 ACTION_URL = f"{SPNS_BASE}/action"
 
-# 50 target users – you can update this list
 TARGET_USERS = [
     "9905454846", "8302374884", "9569907686", "6019557067",
     "8103200020", "9793231470", "6075716540", "6057085260",
@@ -234,7 +234,6 @@ def accept_connection(secrettoken, target_id, customer_id, tid, sid):
     return resp.json() if resp.content else {}
 
 def get_pending_incoming(secrettoken, tid, sid):
-    """Fetch list of users who sent you a connection request (pending)."""
     status = check_buzz(secrettoken, tid, sid)
     connections = status.get("data", {}).get("campaignRewardResponses", [{}])[0].get("connections", {}).get("connections", [])
     pending = []
@@ -385,7 +384,6 @@ def collect():
     
     user_id, tid, sid, customer_id = row['id'], row['tid'], row['sid'], row['customer_id']
     
-    # Check if already collected today
     today = datetime.now().date().isoformat()
     conn = get_db()
     cur = conn.cursor()
@@ -395,17 +393,13 @@ def collect():
         cur.execute("SELECT last_collection_date FROM users WHERE id = %s", (user_id,))
     last = cur.fetchone()
     conn.close()
-    
     if last and last['last_collection_date'] == today:
         return jsonify({"status": "error", "message": "Already collected today!"}), 400
     
-    # Initial balance
     initial_data = check_buzz(secrettoken, tid, sid)
     initial_earned = extract_earned(initial_data)
     
-    # --- Step 1: Send connect requests to all targets ---
-    connect_success = 0
-    connect_fail = 0
+    connect_success, connect_fail = 0, 0
     for target in TARGET_USERS:
         try:
             resp = send_connect(secrettoken, target, customer_id, tid, sid)
@@ -414,14 +408,11 @@ def collect():
             else:
                 connect_fail += 1
             time.sleep(0.5)
-        except Exception as e:
-            log.error(f"Connect error {target}: {e}")
+        except:
             connect_fail += 1
     
-    # --- Step 2: Auto-accept incoming pending requests ---
     pending = get_pending_incoming(secrettoken, tid, sid)
-    accept_success = 0
-    accept_fail = 0
+    accept_success, accept_fail = 0, 0
     for target_id in pending:
         try:
             resp = accept_connection(secrettoken, target_id, customer_id, tid, sid)
@@ -430,16 +421,13 @@ def collect():
             else:
                 accept_fail += 1
             time.sleep(0.5)
-        except Exception as e:
-            log.error(f"Accept error {target_id}: {e}")
+        except:
             accept_fail += 1
     
-    # Final balance
     final_data = check_buzz(secrettoken, tid, sid)
     final_earned = extract_earned(final_data)
     earned_amount = final_earned - initial_earned
     
-    # Update DB
     conn = get_db()
     with conn:
         if USE_SQLITE:
@@ -467,6 +455,93 @@ def collect():
         "connects": connect_success,
         "accepts": accept_success
     })
+
+# ==================== NEW SSE ENDPOINT ====================
+@app.route('/collect-stream', methods=['GET', 'OPTIONS'])
+def collect_stream():
+    if request.method == 'OPTIONS':
+        return '', 200
+    secrettoken = request.args.get('secrettoken')
+    if not secrettoken:
+        return jsonify({"status": "error", "message": "Missing secrettoken"}), 400
+
+    def generate():
+        conn = get_db()
+        cur = conn.cursor()
+        if USE_SQLITE:
+            cur.execute("SELECT id, tid, sid, customer_id FROM users WHERE secrettoken = ?", (secrettoken,))
+        else:
+            cur.execute("SELECT id, tid, sid, customer_id FROM users WHERE secrettoken = %s", (secrettoken,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            yield f"data: {json.dumps({'error': 'User not found'})}\n\n"
+            return
+
+        user_id, tid, sid, customer_id = row['id'], row['tid'], row['sid'], row['customer_id']
+
+        today = datetime.now().date().isoformat()
+        conn = get_db()
+        cur = conn.cursor()
+        if USE_SQLITE:
+            cur.execute("SELECT last_collection_date FROM users WHERE id = ?", (user_id,))
+        else:
+            cur.execute("SELECT last_collection_date FROM users WHERE id = %s", (user_id,))
+        last = cur.fetchone()
+        conn.close()
+        if last and last['last_collection_date'] == today:
+            yield f"data: {json.dumps({'error': 'Already collected today!'})}\n\n"
+            return
+
+        initial_data = check_buzz(secrettoken, tid, sid)
+        initial_earned = extract_earned(initial_data)
+
+        # Connect phase
+        for idx, target in enumerate(TARGET_USERS, 1):
+            try:
+                resp = send_connect(secrettoken, target, customer_id, tid, sid)
+                status = resp.get('statusCode') == 0
+                yield f"data: {json.dumps({'type': 'connect', 'index': idx, 'total': len(TARGET_USERS), 'target': target, 'success': status})}\n\n"
+                time.sleep(0.5)
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'connect', 'index': idx, 'total': len(TARGET_USERS), 'target': target, 'success': False, 'error': str(e)})}\n\n"
+
+        # Accept phase
+        pending = get_pending_incoming(secrettoken, tid, sid)
+        for idx, target_id in enumerate(pending, 1):
+            try:
+                resp = accept_connection(secrettoken, target_id, customer_id, tid, sid)
+                status = resp.get('statusCode') == 0
+                yield f"data: {json.dumps({'type': 'accept', 'index': idx, 'total': len(pending), 'target': target_id, 'success': status})}\n\n"
+                time.sleep(0.5)
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'accept', 'index': idx, 'total': len(pending), 'target': target_id, 'success': False, 'error': str(e)})}\n\n"
+
+        final_data = check_buzz(secrettoken, tid, sid)
+        final_earned = extract_earned(final_data)
+        earned_amount = final_earned - initial_earned
+
+        conn = get_db()
+        with conn:
+            if USE_SQLITE:
+                conn.execute("""
+                    UPDATE users SET total_earned = total_earned + ?,
+                        last_collection_date = ?,
+                        streak_days = streak_days + 1
+                    WHERE id = ?
+                """, (earned_amount, today, user_id))
+            else:
+                conn.execute("""
+                    UPDATE users SET total_earned = total_earned + %s,
+                        last_collection_date = %s,
+                        streak_days = streak_days + 1
+                    WHERE id = %s
+                """, (earned_amount, today, user_id))
+        conn.close()
+
+        yield f"data: {json.dumps({'type': 'summary', 'earned': earned_amount, 'totalEarned': final_earned})}\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
