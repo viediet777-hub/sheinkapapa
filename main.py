@@ -65,9 +65,15 @@ BASE_HEADERS = {
     "os-version": "11",
     "latitude": "22.7421633",
     "longitude": "75.907875",
-    "accept": "application/json",
-    "content-type": "application/json",
-    "user-agent": "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+    "current-latitude": "22.7421633",
+    "current-longitude": "75.907875",
+    "accessibility_enabled": "false",
+    "x-network-quality": "GOOD",
+    "faw-flags": "1354",
+    "accept": "application/json; charset=utf-8",
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "user-agent": "Swiggy-Android",
 }
 
 OTP_URL = "https://profile.swiggy.com/api/v3/app/sms_otp"
@@ -392,12 +398,18 @@ class SwiggyClient:
     def __init__(self, device_id=None, swuid=None):
         self.device_id = device_id or generate_device_id()
         self.swuid = swuid or generate_swuid()
+        self.tid = ""
+        self.sid = ""
         self.session = requests.Session()
 
     def _headers(self, extra=None):
         headers = dict(BASE_HEADERS)
         headers["deviceid"] = self.device_id
         headers["swuid"] = self.swuid
+        if self.tid:
+            headers["tid"] = self.tid
+        if self.sid:
+            headers["sid"] = self.sid
         if extra:
             headers.update(extra)
         return headers
@@ -426,28 +438,47 @@ class SwiggyClient:
             return {"status": "captcha", "message": "OTP blocked by captcha. Try again later or from a fresh device."}
         if not isinstance(data, dict) or data.get("errorCode") or data.get("errorMessage"):
             return {"status": "error", "message": str(data)[:300]}
-        return {"status": "ok", "data": data}
+        if isinstance(data, dict):
+            if data.get("tid"):
+                self.tid = str(data["tid"])
+            if data.get("sid"):
+                self.sid = str(data["sid"])
+        log.info("[DEBUG] Stored session from OTP send: tid_len=%s sid=%s", len(self.tid), self.sid)
+        return {"status": "ok", "data": data, "tid": self.tid, "sid": self.sid}
 
     def verify_otp(self, phone, otp):
         phone = normalize_phone(phone)
         if not phone:
             raise ApiError("Invalid phone number (must be 10 digits)")
-        log.info("[DEBUG] Verifying OTP for phone=%s otp=%s", phone, otp)
+        if not self.tid:
+            log.warning("[DEBUG] verify_otp called without a tid from send_otp!")
+        log.info(
+            "[DEBUG] Verifying OTP for phone=%s otp=%s tid=%s sid=%s device=%s swuid=%s",
+            phone,
+            otp,
+            self.tid[:40] if self.tid else "None",
+            self.sid or "None",
+            self.device_id,
+            self.swuid,
+        )
         body = {
             "cloningSignalsData": {
-                "versionCode": 1795,
-                "appVersion": "4.113.0",
-                "osVersion": "11",
-                "osName": "android",
-                "deviceId": self.device_id,
+                "appFilesDirPathInvalid": 0,
+                "developerModeEnabled": 1,
+                "deviceModelVmos": 0,
+                "emulatorStatus": 0,
+                "packageName": "in.swiggy.android",
+                "workProfileEnabled": 0,
             },
             "otp": otp,
-            "mobile": phone,
         }
-        url = f"{VERIFY_URL}?otp_source=Sms-manual&mobile={phone}"
+        url = f"{VERIFY_URL}?otp_source=Sms-manual"
+        headers = self._headers()
+        headers.setdefault("manufacturer", "GOOGLE")
+        headers.setdefault("model-name", "PIXEL 4")
         resp = self.session.post(
             url,
-            headers=self._headers(),
+            headers=headers,
             json=body,
             timeout=30,
         )
@@ -458,6 +489,11 @@ class SwiggyClient:
         code, msg = api_status(data)
         if code is not None and not is_success(data):
             raise ApiError(f"{msg or 'Verification failed'} (statusCode {code})", data)
+        if isinstance(data, dict):
+            if data.get("tid"):
+                self.tid = str(data["tid"])
+            if data.get("sid"):
+                self.sid = str(data["sid"])
         return data
 
     def _auth_headers(self, account):
@@ -660,7 +696,13 @@ async def phone_received(update, context):
                 parse_mode=ParseMode.HTML,
             )
         return PHONE
-    login_sessions[user_id] = {"phone": phone, "client": client}
+    login_sessions[user_id] = {
+        "phone": phone,
+        "client": client,
+        "tid": client.tid,
+        "sid": client.sid,
+    }
+    log.info("[DEBUG] Session stored for phone=%s tid_len=%s sid=%s", phone, len(client.tid), client.sid)
     await update.message.reply_text(
         f"✅ <b>OTP sent to +91 {phone}!</b>\n\nEnter the 6-digit OTP you received:",
         parse_mode=ParseMode.HTML,
@@ -681,6 +723,12 @@ async def otp_received(update, context):
         await update.message.reply_text("❌ Invalid OTP. Enter the 6-digit code:")
         return OTP
     client = session["client"]
+    log.info(
+        "[DEBUG] Verifying OTP for phone=%s with session tid_len=%s sid=%s",
+        session["phone"],
+        len(session.get("tid", "")),
+        session.get("sid", ""),
+    )
     try:
         log.info(f"Verifying OTP: {otp} for phone: {session['phone']}")
         data = await asyncio.to_thread(client.verify_otp, session["phone"], otp)
