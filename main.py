@@ -15,6 +15,31 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("buzz-api")
 
+# ------------------- CONSTANTS (YAHI MISSING THE) -------------------
+BASE_URL = "https://profile.swiggy.com/api/v3/app"
+SMS_OTP_URL = f"{BASE_URL}/sms_otp"
+LOGIN_VERIFY_URL = f"{BASE_URL}/login/verify"
+SPNS_BASE = "https://spns.swiggy.com/api/v1/campaign"
+REWARDS_URL = f"{SPNS_BASE}/rewards"
+ACTION_URL = f"{SPNS_BASE}/action"
+
+# 50 target users (from your data)
+TARGET_USERS = [
+    "9905454846", "8302374884", "9569907686", "6019557067",
+    "8103200020", "9793231470", "6075716540", "6057085260",
+    "6529467214", "4742565540", "2159541308", "5711812412",
+    "4805096977", "6306972524", "5810763039", "5767374231",
+    "5255411320", "9263536039", "9656243680", "7028403798",
+    "2022592103", "4339594714", "9315838951", "5021810039",
+    "4179533661", "3969482763", "5378219742", "4622672366",
+    "6529938009", "8841032307", "7847081991", "8476578440",
+    "4958316534", "6089374148", "3974751011", "9076113237",
+    "2405719218", "8557791891", "5237191585", "7504061044",
+    "7239858845", "5773101973", "9292974443", "8481419410",
+    "4219735233", "9104704566", "3923205642", "1106827431",
+    "9066285442", "8745675335"
+]
+
 # ------------------- DATABASE (SQLite fallback) -------------------
 DATABASE_URL = os.environ.get("DATABASE_URL")
 USE_SQLITE = not DATABASE_URL
@@ -95,7 +120,7 @@ def init_db():
 
 init_db()
 
-# ------------------- SWIGGY CLIENT -------------------
+# ------------------- SWIGGY API HELPERS -------------------
 def generate_device_id():
     return uuid.uuid4().hex[:16]
 
@@ -139,6 +164,19 @@ def spns_headers(secrettoken="", tid="", sid=""):
     if sid: headers["sid"] = sid
     return headers
 
+def extract_earned(data):
+    try:
+        responses = data.get("data", {}).get("campaignRewardResponses", [])
+        for resp in responses:
+            for reward in resp.get("rewards", []):
+                rolling = reward.get("rollingFreecash", {})
+                earned = rolling.get("totalEarned", {})
+                return float(earned.get("units", 0))
+    except:
+        pass
+    return 0.0
+
+# ------------------- SWIGGY API CALLS -------------------
 def send_otp(phone):
     device_id = generate_device_id()
     url = f"{SMS_OTP_URL}?mobile={phone}"
@@ -187,7 +225,7 @@ def verify_otp(phone, otp, tid, sid, device_id):
             "device_id": data.get("deviceId", device_id),
             "customer_id": customer_id,
             "name": inner.get("name", ""),
-            "secrettoken": token,  # same as token for SPNS
+            "secrettoken": token,
         }
     return {"error": data.get("statusMessage", "Verification failed")}
 
@@ -207,7 +245,7 @@ def check_buzz(secrettoken, tid, sid):
     resp = requests.post(url, headers=spns_headers(secrettoken, tid, sid), json=body, timeout=30)
     return resp.json() if resp.content else {}
 
-def initiate_buzz(secrettoken, customer_id, tid, sid):
+def send_connect(secrettoken, target_id, customer_id, tid, sid):
     url = ACTION_URL
     body = {
         "generalContext": {"requestContext": {"clientId": "portal_banner"}},
@@ -215,13 +253,13 @@ def initiate_buzz(secrettoken, customer_id, tid, sid):
         "campaignUserActionRequest": {
             "campaignId": "ougwl",
             "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
-            "action": {"actionType": "ACTION_TYPE_CONNECT", "targetEntityId": TARGET_USERS[0]}  # placeholder
+            "action": {"actionType": "ACTION_TYPE_CONNECT", "targetEntityId": target_id}
         }
     }
     resp = requests.post(url, headers=spns_headers(secrettoken, tid, sid), json=body, timeout=30)
     return resp.json() if resp.content else {}
 
-def complete_buzz(secrettoken, target_entity_id, customer_id, tid, sid):
+def send_accept(secrettoken, target_id, customer_id, tid, sid):
     url = ACTION_URL
     body = {
         "generalContext": {"requestContext": {"clientId": "portal_banner"}},
@@ -229,47 +267,17 @@ def complete_buzz(secrettoken, target_entity_id, customer_id, tid, sid):
         "campaignUserActionRequest": {
             "campaignId": "ougwl",
             "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
-            "action": {"actionType": "ACTION_TYPE_ACCEPT", "targetEntityId": target_entity_id}
+            "action": {"actionType": "ACTION_TYPE_ACCEPT", "targetEntityId": target_id}
         }
     }
     resp = requests.post(url, headers=spns_headers(secrettoken, tid, sid), json=body, timeout=30)
     return resp.json() if resp.content else {}
-
-def extract_earned(data):
-    try:
-        responses = data.get("data", {}).get("campaignRewardResponses", [])
-        for resp in responses:
-            for reward in resp.get("rewards", []):
-                rolling = reward.get("rollingFreecash", {})
-                earned = rolling.get("totalEarned", {})
-                return float(earned.get("units", 0))
-    except:
-        pass
-    return 0.0
-
-def run_collection(secrettoken, customer_id, tid, sid):
-    results = {"successful": 0, "failed": 0, "total_earned": 0}
-    # check initial balance
-    initial_data = check_buzz(secrettoken, tid, sid)
-    initial_earned = extract_earned(initial_data)
-    
-    for user_id in TARGET_USERS:
-        # initiate (with target user)
-        init_resp = initiate_buzz(secrettoken, customer_id, tid, sid)
-        # but initiate uses a fixed target, we need to use the actual target from list
-        # We'll modify the initiate function to accept target
-        # For simplicity, let's use the complete_buzz with the user_id directly (since initiate already sent request)
-        # Actually the flow: initiate buzz without target? The API may return a target id. Better: we use the provided order.
-        # We'll use a different approach: for each user_id, we send connect request (initiate) and then accept (complete) 
-        # but we need to send the connect request to that specific user_id.
-        # Let's create a function send_connect and send_accept.
-        pass
-    # We'll reimplement inside the Flask endpoint
-    return results
 
 # ------------------- FLASK ENDPOINTS -------------------
-@app.route('/send-otp', methods=['POST'])
+@app.route('/send-otp', methods=['POST', 'OPTIONS'])
 def send_otp_endpoint():
+    if request.method == 'OPTIONS':
+        return '', 200
     data = request.get_json()
     phone = data.get('phone', '').strip()
     if not re.match(r'^[6-9]\d{9}$', phone):
@@ -279,8 +287,10 @@ def send_otp_endpoint():
         return jsonify({"status": "error", "message": res['error']}), 400
     return jsonify({"status": "ok", "tid": res['tid'], "sid": res['sid'], "deviceId": res['deviceId']})
 
-@app.route('/verify-otp', methods=['POST'])
+@app.route('/verify-otp', methods=['POST', 'OPTIONS'])
 def verify_otp_endpoint():
+    if request.method == 'OPTIONS':
+        return '', 200
     data = request.get_json()
     phone = data.get('phone')
     otp = data.get('otp')
@@ -290,20 +300,27 @@ def verify_otp_endpoint():
     res = verify_otp(phone, otp, tid, sid, device_id)
     if 'error' in res:
         return jsonify({"status": "error", "message": res['error']}), 400
-    # save user in DB
+    # Save user
     conn = get_db_connection()
     with conn:
-        conn.execute("""
-            INSERT INTO users (phone, token, tid, sid, device_id, secrettoken, customer_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (phone) DO UPDATE SET
-                token = EXCLUDED.token,
-                tid = EXCLUDED.tid,
-                sid = EXCLUDED.sid,
-                device_id = EXCLUDED.device_id,
-                secrettoken = EXCLUDED.secrettoken,
-                customer_id = EXCLUDED.customer_id
-        """, (phone, res['token'], res['tid'], res['sid'], res['device_id'], res['secrettoken'], res['customer_id']))
+        if USE_SQLITE:
+            conn.execute("""
+                INSERT OR REPLACE INTO users (phone, token, tid, sid, device_id, secrettoken, customer_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (phone, res['token'], res['tid'], res['sid'], res['device_id'], res['secrettoken'], res['customer_id']))
+        else:
+            conn.execute("""
+                INSERT INTO users (phone, token, tid, sid, device_id, secrettoken, customer_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (phone) DO UPDATE SET
+                    token = EXCLUDED.token,
+                    tid = EXCLUDED.tid,
+                    sid = EXCLUDED.sid,
+                    device_id = EXCLUDED.device_id,
+                    secrettoken = EXCLUDED.secrettoken,
+                    customer_id = EXCLUDED.customer_id
+            """, (phone, res['token'], res['tid'], res['sid'], res['device_id'], res['secrettoken'], res['customer_id']))
+    conn.close()
     return jsonify({
         "status": "ok",
         "name": res['name'],
@@ -311,75 +328,72 @@ def verify_otp_endpoint():
         "secrettoken": res['secrettoken']
     })
 
-@app.route('/check-balance', methods=['POST'])
+@app.route('/check-balance', methods=['POST', 'OPTIONS'])
 def check_balance():
+    if request.method == 'OPTIONS':
+        return '', 200
     data = request.get_json()
     secrettoken = data.get('secrettoken')
-    # we need tid, sid from DB or request
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT tid, sid FROM users WHERE secrettoken = %s", (secrettoken,))
+    if USE_SQLITE:
+        cur.execute("SELECT tid, sid, total_earned, streak_days, last_collection_date FROM users WHERE secrettoken = ?", (secrettoken,))
+    else:
+        cur.execute("SELECT tid, sid, total_earned, streak_days, last_collection_date FROM users WHERE secrettoken = %s", (secrettoken,))
     row = cur.fetchone()
     conn.close()
     if not row:
         return jsonify({"status": "error", "message": "User not found"}), 404
-    tid, sid = row['tid'], row['sid']
+    tid, sid, total_earned, streak, last_date = row['tid'], row['sid'], row['total_earned'], row['streak_days'], row['last_collection_date']
+    # Fetch fresh balance from Swiggy
     resp = check_buzz(secrettoken, tid, sid)
     earned = extract_earned(resp)
-    return jsonify({"status": "ok", "totalEarned": earned})
+    return jsonify({
+        "status": "ok",
+        "totalEarned": earned,
+        "streak": streak or 0,
+        "lastDate": last_date if last_date else "Never"
+    })
 
-@app.route('/collect', methods=['POST'])
+@app.route('/collect', methods=['POST', 'OPTIONS'])
 def collect():
+    if request.method == 'OPTIONS':
+        return '', 200
     data = request.get_json()
     secrettoken = data.get('secrettoken')
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id, tid, sid, customer_id FROM users WHERE secrettoken = %s", (secrettoken,))
+    if USE_SQLITE:
+        cur.execute("SELECT id, tid, sid, customer_id FROM users WHERE secrettoken = ?", (secrettoken,))
+    else:
+        cur.execute("SELECT id, tid, sid, customer_id FROM users WHERE secrettoken = %s", (secrettoken,))
     row = cur.fetchone()
     if not row:
         conn.close()
         return jsonify({"status": "error", "message": "User not found"}), 404
     user_id, tid, sid, customer_id = row['id'], row['tid'], row['sid'], row['customer_id']
     conn.close()
-    
+
+    # Check if already collected today
+    today = datetime.now().date().isoformat()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if USE_SQLITE:
+        cur.execute("SELECT last_collection_date FROM users WHERE id = ?", (user_id,))
+    else:
+        cur.execute("SELECT last_collection_date FROM users WHERE id = %s", (user_id,))
+    last = cur.fetchone()
+    conn.close()
+    if last and last['last_collection_date'] == today:
+        return jsonify({"status": "error", "message": "Already collected today!"}), 400
+
     # Perform 50 buzz loop
     successful = 0
     failed = 0
     initial_data = check_buzz(secrettoken, tid, sid)
     initial_earned = extract_earned(initial_data)
-    
+
     for target in TARGET_USERS:
-        # initiate
-        init_resp = initiate_buzz(secrettoken, customer_id, tid, sid)
-        # But this uses a placeholder target; we need to send connect to the specific target.
-        # Correct way: use ACTION_TYPE_CONNECT with targetEntityId = target
-        # Let's implement a dedicated function:
-        def send_connect(secrettoken, target_id, customer_id, tid, sid):
-            url = ACTION_URL
-            body = {
-                "generalContext": {"requestContext": {"clientId": "portal_banner"}},
-                "consumerContext": {"consumerId": customer_id},
-                "campaignUserActionRequest": {
-                    "campaignId": "ougwl",
-                    "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
-                    "action": {"actionType": "ACTION_TYPE_CONNECT", "targetEntityId": target_id}
-                }
-            }
-            return requests.post(url, headers=spns_headers(secrettoken, tid, sid), json=body, timeout=30).json()
-        # accept
-        def send_accept(secrettoken, target_id, customer_id, tid, sid):
-            url = ACTION_URL
-            body = {
-                "generalContext": {"requestContext": {"clientId": "portal_banner"}},
-                "consumerContext": {"consumerId": customer_id},
-                "campaignUserActionRequest": {
-                    "campaignId": "ougwl",
-                    "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
-                    "action": {"actionType": "ACTION_TYPE_ACCEPT", "targetEntityId": target_id}
-                }
-            }
-            return requests.post(url, headers=spns_headers(secrettoken, tid, sid), json=body, timeout=30).json()
-        
         try:
             connect_resp = send_connect(secrettoken, target, customer_id, tid, sid)
             if connect_resp.get('statusCode') != 0:
@@ -395,24 +409,40 @@ def collect():
         except Exception as e:
             log.error(f"Error with target {target}: {e}")
             failed += 1
-    
+
     final_data = check_buzz(secrettoken, tid, sid)
     final_earned = extract_earned(final_data)
     earned_amount = final_earned - initial_earned
-    
-    # update user's total_earned in DB
+
+    # Update DB
     conn = get_db_connection()
     with conn:
-        conn.execute("UPDATE users SET total_earned = total_earned + %s, last_collection_date = %s WHERE id = %s",
-                     (earned_amount, datetime.now().date(), user_id))
+        if USE_SQLITE:
+            conn.execute("""
+                UPDATE users
+                SET total_earned = total_earned + ?,
+                    last_collection_date = ?,
+                    streak_days = streak_days + 1
+                WHERE id = ?
+            """, (earned_amount, today, user_id))
+        else:
+            conn.execute("""
+                UPDATE users
+                SET total_earned = total_earned + %s,
+                    last_collection_date = %s,
+                    streak_days = streak_days + 1
+                WHERE id = %s
+            """, (earned_amount, today, user_id))
     conn.close()
-    
+
     return jsonify({
         "status": "ok",
         "earned": earned_amount,
         "successful": successful,
-        "failed": failed
+        "failed": failed,
+        "totalEarned": final_earned
     })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
