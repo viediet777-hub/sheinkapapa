@@ -3,14 +3,10 @@
 
 """
 SWIGGY BUZZ AUTO-COLLECTOR - ₹100/DAY WORKING SCRIPT
-Based on lookupinfo.in/swiggy/ API flow
 Complete Single Script - Railway Ready
 """
 
 import asyncio
-import base64
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -168,6 +164,14 @@ class Database:
 
     def add_earned(self, account_id, amount):
         self._execute("UPDATE accounts SET total_earned = total_earned + ? WHERE id = ?", (amount, account_id))
+    
+    def all_accounts(self):
+        cur = self._execute("SELECT * FROM accounts ORDER BY telegram_id, id")
+        return [dict(r) for r in cur.fetchall()]
+    
+    def total_earnings(self):
+        cur = self._execute("SELECT COALESCE(SUM(total_earned), 0) AS total FROM accounts")
+        return cur.fetchone()["total"]
 
 db = Database()
 
@@ -175,7 +179,7 @@ db = Database()
 
 class SwiggyClient:
     def __init__(self):
-        self.device_id = str(uuid.uuid4()).hex()[:16]
+        self.device_id = uuid.uuid4().hex[:16]  # ✅ FIXED - NO str() wrapper
         self.session = requests.Session()
         self.tid = ""
         self.sid = ""
@@ -268,7 +272,7 @@ class SwiggyClient:
             self.device_id = data.get("deviceId", self.device_id)
             
             # Generate secrettoken (this is what the website does)
-            self.secrettoken = self._generate_secrettoken()
+            self.secrettoken = self.token if self.token else str(uuid.uuid4())
             
             return {
                 "status": "ok",
@@ -283,12 +287,6 @@ class SwiggyClient:
             }
         else:
             return {"status": "error", "message": data.get("statusMessage", "Verification failed")}
-
-    def _generate_secrettoken(self):
-        """Generate secrettoken like the website does"""
-        # This is a simplified version - the website uses a complex encryption
-        # For now, we use the token as secrettoken
-        return self.token if self.token else str(uuid.uuid4())
 
     def _spns_headers(self, secrettoken=None):
         """Headers for SPNS endpoints"""
@@ -616,11 +614,9 @@ async def collect_buzz(update, context):
     
     already, streak = db.has_collected_today(account["id"])
     if already:
-        today_earned = db.today_earnings(account["id"])
         await answer(
             update,
             f"✅ Already collected today!\n"
-            f"💰 Today's earning: ₹{today_earned:.2f}\n"
             f"🔥 Streak: {streak} days\n"
             f"📅 Next collection: Tomorrow",
             main_menu(update)
@@ -644,9 +640,6 @@ async def run_collection(update, context, account):
         client.customer_id = account.get("customer_id", "")
         client.device_id = account.get("device_id", "")
         
-        # Show progress
-        await edit_progress(cid, context, "🔄 Sending connection requests...")
-        
         # Run collection
         results = await asyncio.to_thread(client.run_buzz_collection, client.secrettoken)
         
@@ -668,19 +661,13 @@ async def run_collection(update, context, account):
             f"🔥 Streak: {db.get_account(account['id']).get('streak_days', 0)} days\n\n"
             f"{BRAND}"
         )
-        await edit_progress(cid, context, text)
+        await context.bot.send_message(cid, text, parse_mode=ParseMode.HTML)
         
     except Exception as e:
         log.exception("collection failed")
-        await edit_progress(cid, context, f"❌ <b>Error:</b> {str(e)[:200]}")
+        await context.bot.send_message(cid, f"❌ <b>Error:</b> {str(e)[:200]}", parse_mode=ParseMode.HTML)
     finally:
         collecting_tasks.pop(cid, None)
-
-async def edit_progress(cid, context, text):
-    try:
-        await context.bot.send_message(cid, text, parse_mode=ParseMode.HTML)
-    except:
-        pass
 
 # ============================== MENU HANDLERS ==============================
 
