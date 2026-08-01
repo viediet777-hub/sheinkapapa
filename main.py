@@ -526,6 +526,9 @@ def parse_total_earned(payload):
 
     walk(payload)
     return round(total, 2)
+
+
+def is_success(data):
     if not isinstance(data, dict):
         return True
     if data.get("errors"):
