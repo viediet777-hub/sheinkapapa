@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-SWIGGY BUZZ AUTO-COLLECTOR - FIXED VERSION
-Using Website's API Proxy
-₹100/DAY WORKING
+SWIGGY BUZZ AUTO-COLLECTOR - DIRECT API VERSION
+₹100/DAY WORKING - NO PROXY NEEDED
 Made by Viediet
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -45,9 +45,13 @@ ADMIN_IDS = [1364476174]  # Change to your Telegram ID
 DB_PATH = "swiggy_buzz.db"
 BRAND = "⚡ Made by Viediet"
 
-# ===== USE WEBSITE'S API PROXY =====
-API_BASE = "https://lookupinfo.in/swiggy/api.php"
-# Alternatively: "https://yourdomain.com/api.php"
+# ===== SWIGGY DIRECT API ENDPOINTS =====
+BASE_URL = "https://profile.swiggy.com/api/v3/app"
+SMS_OTP_URL = f"{BASE_URL}/sms_otp"
+LOGIN_VERIFY_URL = f"{BASE_URL}/login/verify"
+SPNS_BASE = "https://spns.swiggy.com/api/v1/campaign"
+REWARDS_URL = f"{SPNS_BASE}/rewards"
+ACTION_URL = f"{SPNS_BASE}/action"
 
 # ===== TARGET USERS IN EXACT ORDER =====
 TARGET_USERS = [
@@ -86,6 +90,10 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     telegram_id INTEGER NOT NULL,
                     phone TEXT NOT NULL,
+                    token TEXT,
+                    tid TEXT,
+                    sid TEXT,
+                    device_id TEXT,
                     secrettoken TEXT,
                     customer_id TEXT,
                     total_earned REAL DEFAULT 0,
@@ -112,15 +120,17 @@ class Database:
             self._conn.commit()
             return cur
 
-    def add_account(self, telegram_id, phone, secrettoken, customer_id):
+    def add_account(self, telegram_id, phone, device_id, token, tid, sid, secrettoken, customer_id):
         cur = self._execute("SELECT id FROM accounts WHERE telegram_id = ? AND phone = ?", (telegram_id, phone))
         row = cur.fetchone()
         if row:
-            self._execute("UPDATE accounts SET secrettoken=?, customer_id=?, active=1 WHERE id=?", 
-                         (secrettoken, customer_id, row["id"]))
+            self._execute("""UPDATE accounts SET token=?, tid=?, sid=?, device_id=?, secrettoken=?, customer_id=?, active=1 
+                           WHERE id=?""", (token, tid, sid, device_id, secrettoken, customer_id, row["id"]))
             return row["id"]
-        cur = self._execute("INSERT INTO accounts (telegram_id, phone, secrettoken, customer_id, active, created_at) VALUES (?,?,?,?,1,?)",
-                           (telegram_id, phone, secrettoken, customer_id, now()))
+        cur = self._execute("""INSERT INTO accounts 
+                           (telegram_id, phone, token, tid, sid, device_id, secrettoken, customer_id, active, created_at) 
+                           VALUES (?,?,?,?,?,?,?,?,1,?)""",
+                           (telegram_id, phone, token, tid, sid, device_id, secrettoken, customer_id, now()))
         return cur.lastrowid
 
     def get_accounts(self, telegram_id):
@@ -166,94 +176,212 @@ class Database:
 
 db = Database()
 
-# ============================== API CLIENT (USING WEBSITE PROXY) ==============================
+# ============================== SWIGGY CLIENT (DIRECT API) ==============================
 
 class SwiggyClient:
     def __init__(self):
+        self.device_id = uuid.uuid4().hex[:16]
+        self.session = requests.Session()
+        self.tid = ""
+        self.sid = ""
+        self.token = ""
         self.secrettoken = ""
         self.customer_id = ""
-        self.phone = ""
 
-    def _api_request(self, action, data):
-        """Send request to website's API proxy"""
-        payload = {"action": action}
-        payload.update(data)
-        
-        log.info(f"[DEBUG] API Request: {action} -> {json.dumps(payload)[:200]}")
-        
-        try:
-            resp = requests.post(API_BASE, json=payload, timeout=30)
-            result = resp.json() if resp.content else {}
-            log.info(f"[DEBUG] API Response: {json.dumps(result)[:500]}")
-            return result
-        except Exception as e:
-            log.error(f"API request failed: {e}")
-            return {"status": "error", "message": str(e)}
+    def _headers(self, extra=None):
+        headers = {
+            "pl-version": "138",
+            "version-code": "1795",
+            "app-version": "4.113.0",
+            "os-version": "11",
+            "latitude": "22.7421633",
+            "longitude": "75.907875",
+            "current-latitude": "22.7421633",
+            "current-longitude": "75.907875",
+            "accessibility_enabled": "false",
+            "x-network-quality": "GOOD",
+            "faw-flags": "1354",
+            "accept": "application/json; charset=utf-8",
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-store",
+            "user-agent": "Swiggy-Android/4.113.0 (Android 11; Pixel 4)",
+            "deviceid": self.device_id,
+            "swuid": self.device_id,
+        }
+        if self.tid:
+            headers["tid"] = self.tid
+        if self.sid:
+            headers["sid"] = self.sid
+        if self.token:
+            headers["token"] = self.token
+        if extra:
+            headers.update(extra)
+        return headers
 
     def send_otp(self, phone):
-        """Step 1: Send OTP via website proxy"""
-        self.phone = phone
-        result = self._api_request("sendOtp", {"mobile": phone})
-        if result.get("status") == "ok":
-            return result
-        return {"status": "error", "message": result.get("message", "Failed to send OTP")}
+        """Step 1: Send OTP - DIRECT API"""
+        url = f"{SMS_OTP_URL}?mobile={phone}"
+        log.info(f"[DEBUG] Sending OTP to {phone}")
+        
+        resp = self.session.get(url, headers=self._headers(), timeout=30)
+        if resp.status_code != 200:
+            return {"status": "error", "message": f"HTTP {resp.status_code}"}
+        
+        data = resp.json()
+        log.info(f"[DEBUG] OTP response: {json.dumps(data)[:500]}")
+        
+        if data.get("statusCode") == 0:
+            self.tid = data.get("tid", "")
+            self.sid = data.get("sid", "")
+            self.device_id = data.get("deviceId", self.device_id)
+            return {"status": "ok", "data": data}
+        else:
+            return {"status": "error", "message": data.get("statusMessage", "Unknown error")}
 
     def verify_otp(self, phone, otp):
-        """Step 2: Verify OTP via website proxy"""
-        self.phone = phone
-        result = self._api_request("verifyOtp", {
-            "mobile": phone,
+        """Step 2: Verify OTP - DIRECT API"""
+        url = f"{LOGIN_VERIFY_URL}?otp_source=Sms-manual"
+        body = {
+            "cloningSignalsData": {
+                "appFilesDirPathInvalid": 0,
+                "developerModeEnabled": 1,
+                "deviceModelVmos": 0,
+                "emulatorStatus": 0,
+                "packageName": "in.swiggy.android",
+                "workProfileEnabled": 0,
+            },
             "otp": otp,
-            "sid": "",  # Website handles this
-            "tid": "",  # Website handles this
-            "deviceId": ""  # Website handles this
-        })
+        }
         
-        if result.get("status") == "ok":
-            self.secrettoken = result.get("secrettoken", "")
-            self.customer_id = result.get("user_id", "")
-            return result
-        return {"status": "error", "message": result.get("message", "Verification failed")}
+        headers = self._headers()
+        headers["manufacturer"] = "GOOGLE"
+        headers["model-name"] = "PIXEL 4"
+        
+        resp = self.session.post(url, headers=headers, json=body, timeout=30)
+        if resp.status_code != 200:
+            return {"status": "error", "message": f"HTTP {resp.status_code}"}
+        
+        data = resp.json()
+        log.info(f"[DEBUG] Verify response: {json.dumps(data)[:500]}")
+        
+        if data.get("statusCode") == 0:
+            inner = data.get("data", {})
+            self.token = inner.get("token", "")
+            self.tid = data.get("tid", "")
+            self.sid = data.get("sid", "")
+            self.customer_id = str(inner.get("customer_id", ""))
+            self.device_id = data.get("deviceId", self.device_id)
+            self.secrettoken = self.token
+            
+            return {
+                "status": "ok",
+                "token": self.token,
+                "tid": self.tid,
+                "sid": self.sid,
+                "customer_id": self.customer_id,
+                "device_id": self.device_id,
+                "secrettoken": self.secrettoken,
+                "name": inner.get("name", ""),
+                "mobile": inner.get("mobile", phone),
+            }
+        else:
+            return {"status": "error", "message": data.get("statusMessage", "Verification failed")}
+
+    def _spns_headers(self, secrettoken=None):
+        """Headers for SPNS endpoints"""
+        token = secrettoken or self.secrettoken
+        headers = {
+            "client-id": "portal",
+            "user-agent": "Mozilla/5.0 (Linux; Android 11; Pixel 4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.120 Mobile Safari/537.36",
+            "content-type": "application/json",
+            "accept": "*/*",
+            "origin": "https://webviews.swiggy.com",
+            "x-requested-with": "in.swiggy.android",
+            "referer": "https://webviews.swiggy.com/moments-iw/buzz-your-friend/",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+        }
+        if token:
+            headers["token"] = token
+        if self.tid:
+            headers["tid"] = self.tid
+        if self.sid:
+            headers["sid"] = self.sid
+        return headers
 
     def check_buzz(self, secrettoken=None):
-        """Step 3: Check buzz status via website proxy"""
-        token = secrettoken or self.secrettoken
-        if not token:
-            return {"status": "error", "message": "No secret token"}
+        """Step 3: Check current buzz status - DIRECT API"""
+        url = REWARDS_URL
+        body = {
+            "generalContext": {"requestContext": {"clientId": "portal_banner"}},
+            "campaignRewardRequests": [
+                {
+                    "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
+                    "campaignId": "ougwl",
+                    "rollingFreecashParams": {
+                        "forceRefresh": True,
+                        "requestParams": {
+                            "dataRequested": "wallet,connections,transactions",
+                            "source": "banner",
+                        },
+                    },
+                }
+            ],
+        }
         
-        result = self._api_request("checkBuzz", {"secrettoken": token})
-        if result.get("status") == "ok":
-            return result
-        return {"status": "error", "message": result.get("message", "Check failed")}
+        headers = self._spns_headers(secrettoken)
+        resp = self.session.post(url, headers=headers, json=body, timeout=30)
+        data = resp.json() if resp.content else {}
+        log.info(f"[DEBUG] Check buzz response: {json.dumps(data)[:500]}")
+        return data
 
-    def initiate_buzz(self, secrettoken=None):
-        """Step 4: Initiate buzz via website proxy"""
-        token = secrettoken or self.secrettoken
-        if not token:
-            return {"status": "error", "message": "No secret token"}
+    def initiate_buzz(self, target_user_id, secrettoken=None):
+        """Step 4: Initiate buzz - DIRECT API"""
+        url = ACTION_URL
+        body = {
+            "generalContext": {"requestContext": {"clientId": "portal_banner"}},
+            "consumerContext": {"consumerId": self.customer_id},
+            "campaignUserActionRequest": {
+                "campaignId": "ougwl",
+                "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
+                "action": {
+                    "actionType": "ACTION_TYPE_CONNECT",
+                    "targetEntityId": target_user_id
+                }
+            }
+        }
         
-        result = self._api_request("initiateBuzz", {"secrettoken": token})
-        if result.get("status") == "ok":
-            return result
-        return {"status": "error", "message": result.get("message", "Initiate failed")}
+        headers = self._spns_headers(secrettoken)
+        resp = self.session.post(url, headers=headers, json=body, timeout=30)
+        data = resp.json() if resp.content else {}
+        log.info(f"[DEBUG] Initiate buzz for {target_user_id}: {json.dumps(data)[:500]}")
+        return data
 
     def complete_buzz(self, target_user_id, secrettoken=None):
-        """Step 5: Complete buzz via website proxy"""
-        token = secrettoken or self.secrettoken
-        if not token:
-            return {"status": "error", "message": "No secret token"}
+        """Step 5: Complete buzz - DIRECT API"""
+        url = ACTION_URL
+        body = {
+            "generalContext": {"requestContext": {"clientId": "portal_banner"}},
+            "consumerContext": {"consumerId": self.customer_id},
+            "campaignUserActionRequest": {
+                "campaignId": "ougwl",
+                "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
+                "action": {
+                    "actionType": "ACTION_TYPE_ACCEPT",
+                    "targetEntityId": target_user_id
+                }
+            }
+        }
         
-        result = self._api_request("completeBuzz", {
-            "secrettoken": token,
-            "targetEntityId": target_user_id
-        })
-        if result.get("status") == "ok":
-            return result
-        return {"status": "error", "message": result.get("message", "Complete failed")}
+        headers = self._spns_headers(secrettoken)
+        resp = self.session.post(url, headers=headers, json=body, timeout=30)
+        data = resp.json() if resp.content else {}
+        log.info(f"[DEBUG] Complete buzz for {target_user_id}: {json.dumps(data)[:500]}")
+        return data
 
     def run_buzz_collection(self, secrettoken=None):
-        """Full buzz collection via website proxy"""
-        token = secrettoken or self.secrettoken
+        """Full buzz collection - DIRECT API"""
         results = {
             "total_earned": 0,
             "successful": 0,
@@ -261,52 +389,58 @@ class SwiggyClient:
             "details": []
         }
         
-        if not token:
-            results["failed"] = 1
-            return results
-        
-        # Check initial balance
-        status = self.check_buzz(token)
-        initial_earned = float(status.get("data", {}).get("totalEarned", 0))
+        status = self.check_buzz(secrettoken)
+        initial_earned = self._extract_earned(status)
         log.info(f"[DEBUG] Initial earned: ₹{initial_earned}")
         
-        # Process each target user
         for user_id in TARGET_USERS:
             try:
                 # 1. Initiate
-                init_resp = self.initiate_buzz(token)
-                target_id = init_resp.get("targetEntityId", user_id)
-                
-                if init_resp.get("status") != "ok":
+                init_resp = self.initiate_buzz(user_id, secrettoken)
+                if init_resp.get("statusCode") != 0:
                     results["failed"] += 1
                     results["details"].append({"user": user_id, "status": "initiate_failed"})
                     continue
                 
-                # 2. Small delay
-                time.sleep(0.3)
+                time.sleep(0.5)
                 
-                # 3. Complete
-                comp_resp = self.complete_buzz(target_id, token)
-                if comp_resp.get("status") == "ok" and comp_resp.get("statusCode") == 0:
+                # 2. Complete (ACCEPT)
+                comp_resp = self.complete_buzz(user_id, secrettoken)
+                if comp_resp.get("statusCode") == 0:
                     results["successful"] += 1
                     results["details"].append({"user": user_id, "status": "success", "amount": 2})
                 else:
                     results["failed"] += 1
                     results["details"].append({"user": user_id, "status": "complete_failed"})
                 
-                time.sleep(0.3)
+                time.sleep(0.5)
                 
             except Exception as e:
                 log.error(f"Error processing {user_id}: {e}")
                 results["failed"] += 1
                 results["details"].append({"user": user_id, "status": "error", "error": str(e)})
         
-        # Check final balance
-        final_status = self.check_buzz(token)
-        final_earned = float(final_status.get("data", {}).get("totalEarned", 0))
+        final_status = self.check_buzz(secrettoken)
+        final_earned = self._extract_earned(final_status)
         results["total_earned"] = final_earned - initial_earned
         
         return results
+
+    def _extract_earned(self, data):
+        """Extract total earned from response"""
+        total = 0.0
+        try:
+            responses = data.get("data", {}).get("campaignRewardResponses", [])
+            for resp in responses:
+                rewards = resp.get("rewards", [])
+                for reward in rewards:
+                    rolling = reward.get("rollingFreecash", {})
+                    earned = rolling.get("totalEarned", {})
+                    units = earned.get("units", "0")
+                    total = float(units)
+        except:
+            pass
+        return total
 
 # ============================== TELEGRAM BOT ==============================
 
@@ -424,10 +558,13 @@ async def otp_received(update, context):
         await update.message.reply_text(f"❌ {result.get('message', 'Invalid OTP')}\nTry again:")
         return OTP
     
-    # Save account
     db.add_account(
         user_id,
         phone,
+        client.device_id,
+        client.token,
+        client.tid,
+        client.sid,
         client.secrettoken,
         client.customer_id,
     )
@@ -493,14 +630,15 @@ async def run_collection(update, context, account):
     cid = chat_id(update)
     try:
         client = SwiggyClient()
+        client.tid = account.get("tid", "")
+        client.sid = account.get("sid", "")
+        client.token = account.get("token", "")
         client.secrettoken = account.get("secrettoken", "")
         client.customer_id = account.get("customer_id", "")
-        client.phone = account.get("phone", "")
+        client.device_id = account.get("device_id", "")
         
-        # Run collection
         results = await asyncio.to_thread(client.run_buzz_collection, client.secrettoken)
         
-        # Save earnings
         amount = results.get("total_earned", 0)
         if amount > 0:
             db.add_earned(account["id"], amount)
@@ -509,7 +647,6 @@ async def run_collection(update, context, account):
                     db.log(account["id"], detail.get("user"), "complete", 2, "ok")
             db.finish_collection(account["id"])
         
-        # Show results
         text = (
             f"✅ <b>Collection Complete!</b>\n\n"
             f"💰 <b>Earned: ₹{amount:.2f}</b>\n"
@@ -642,7 +779,6 @@ def main():
     
     log.info("🚀 Viediet Buzz bot starting...")
     log.info(f"📋 Loaded {len(TARGET_USERS)} target users")
-    log.info(f"🔗 Using API: {API_BASE}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
