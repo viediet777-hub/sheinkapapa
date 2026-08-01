@@ -18,7 +18,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -104,6 +104,21 @@ def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def today_ist():
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+
+def yesterday_ist():
+    return (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def tomorrow_ist():
+    return (datetime.now(IST) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
 class Database:
     def __init__(self, path=DB_PATH):
         self.path = path
@@ -125,7 +140,10 @@ class Database:
                     customer_id TEXT,
                     total_earned REAL DEFAULT 0,
                     active INTEGER DEFAULT 0,
-                    created_at TEXT
+                    created_at TEXT,
+                    last_collection_date TEXT DEFAULT '',
+                    streak_days INTEGER DEFAULT 0,
+                    daily_collected INTEGER DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS buzz_links (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,6 +164,19 @@ class Database:
                 """
             )
             self._conn.commit()
+            cols = [r[1] for r in self._conn.execute("PRAGMA table_info(accounts)").fetchall()]
+            for col, ddl in (
+                ("last_collection_date", "TEXT DEFAULT ''"),
+                ("streak_days", "INTEGER DEFAULT 0"),
+                ("daily_collected", "INTEGER DEFAULT 0"),
+            ):
+                if col not in cols:
+                    try:
+                        self._conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} {ddl}")
+                        self._conn.commit()
+                        log.info("Migrated accounts table: added column %s", col)
+                    except sqlite3.OperationalError:
+                        pass
 
     def _execute(self, sql, params=()):
         with self._lock:
@@ -195,6 +226,40 @@ class Database:
 
     def remove_account(self, account_id):
         self._execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+
+    def has_collected_today(self, account_id):
+        row = self._execute(
+            "SELECT last_collection_date, streak_days FROM accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        if not row:
+            return False, 0
+        return (row["last_collection_date"] or "") == today_ist(), row["streak_days"] or 0
+
+    def today_earnings(self, account_id):
+        cur = self._execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM buzz_logs "
+            "WHERE account_id = ? AND date(created_at) = ? AND status = 'ok'",
+            (account_id, today_ist()),
+        )
+        return cur.fetchone()["total"]
+
+    def finish_collection(self, account_id):
+        """Mark today's collection done and update the daily streak."""
+        row = self._execute(
+            "SELECT last_collection_date, streak_days FROM accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        last = (row["last_collection_date"] or "") if row else ""
+        streak = (row["streak_days"] or 0) if row else 0
+        today = today_ist()
+        if last == yesterday_ist():
+            streak += 1
+        elif last != today:
+            streak = 1
+        self._execute(
+            "UPDATE accounts SET last_collection_date = ?, streak_days = ?, daily_collected = 1 WHERE id = ?",
+            (today, streak, account_id),
+        )
+        return streak
 
     def add_links(self, entries, added_by):
         count = 0
@@ -304,9 +369,11 @@ def extract_campaign_id(url):
         return None
     match = CAMPAIGN_ID_RE.search(url)
     if match:
-        return match.group(1)
+        return match.group(1).rstrip("=")
     match = FALLBACK_CAMPAIGN_RE.search(url)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1).rstrip("=")
+    return None
 
 
 def split_campaign_id(campaign_id):
@@ -431,7 +498,34 @@ def parse_amount(payload):
     return round(total, 2)
 
 
-def is_success(data):
+def parse_total_earned(payload):
+    """Extract the real cumulative totalEarned (₹) from a rewards response.
+
+    Looks for rollingFreecash -> totalEarned -> units, exactly as Swiggy
+    returns it. max() is used so nested duplicates never inflate the amount.
+    """
+    total = 0.0
+
+    def walk(node):
+        nonlocal total
+        if isinstance(node, dict):
+            for key, val in node.items():
+                lowered = str(key).lower()
+                if lowered == "rollingfreecash" and isinstance(val, dict):
+                    earned = val.get("totalEarned") or {}
+                    try:
+                        total = max(total, float(earned.get("units", 0)))
+                    except (TypeError, ValueError):
+                        pass
+                elif isinstance(val, (dict, list)):
+                    walk(val)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    walk(item)
+
+    walk(payload)
+    return round(total, 2)
     if not isinstance(data, dict):
         return True
     if data.get("errors"):
@@ -927,16 +1021,18 @@ def progress_text(done, total, earned, last_ok):
     return (
         f"🎁 <b>Collecting... [{done}/{total}]</b>\n"
         f"{bar}\n"
-        f"💰 Earned: ₹{earned:.2f}\n"
+        f"💰 Today's collection: ₹{earned:.2f}\n"
         f"Last result: {mark}"
     )
 
 
-def final_text(done, total, earned, account_total):
+def final_text(done, total, earned, account_total, streak):
     return (
         f"✅ <b>Collection finished! [{done}/{total}]</b>\n\n"
-        f"💰 This run: ₹{earned:.2f}\n"
-        f"🏆 Account total: ₹{account_total:.2f}\n\n"
+        f"💰 <b>Today's collection: ₹{earned:.2f}</b>\n"
+        f"🏆 Total lifetime: ₹{account_total:.2f}\n"
+        f"🔥 Streak: {streak} day{'s' if streak != 1 else ''}\n"
+        f"📅 Next collection: Tomorrow\n\n"
         f"{BRAND}"
     )
 
@@ -956,20 +1052,46 @@ async def edit_progress(cid, context, text):
 
 async def run_collection(update, context, account):
     cid = chat_id(update)
-    client = SwiggyClient(device_id=account["device_id"], swuid=account["swuid"])
+    account_id = account["id"]
     links = db.get_all_links()
     total_new = 0.0
     done = 0
     last_ok = True
+    streak = 0
     try:
         if not links:
             await send_plain(update, context, "📭 No buzz links added yet. Ask an admin to add links first.")
             return
+        row = db.get_account(account_id)
+        if not row:
+            return
+        already, streak = db.has_collected_today(account_id)
+        if already:
+            today_earned = db.today_earnings(account_id)
+            await send_plain(
+                update,
+                context,
+                "✅ <b>Already collected today!</b>\n\n"
+                f"💰 Today's collection: ₹{today_earned:.2f}\n"
+                f"🔥 Streak: {streak} day{'s' if streak != 1 else ''}\n"
+                f"📅 Next collection: Tomorrow\n\n"
+                f"{BRAND}",
+            )
+            return
         first = await send_plain(update, context, "🎁 <b>Collecting... [0/0]</b>\n\nStarting...")
         if first is not None:
             progress_messages[cid] = first.message_id
+        client = SwiggyClient(device_id=account["device_id"], swuid=account["swuid"])
+        base_campaign, _ = split_campaign_id(links[0]["campaign_id"])
+        snapshot = 0.0
+        try:
+            base_resp = await asyncio.to_thread(client.collect_campaign, row, base_campaign)
+            snapshot = parse_total_earned(base_resp)
+            log.info("[DEBUG] Baseline totalEarned for %s: ₹%.2f", row["phone"], snapshot)
+        except Exception as exc:
+            log.warning("[DEBUG] Baseline fetch failed, starting from 0: %s", exc)
         for index, link in enumerate(links, 1):
-            row = db.get_account(account["id"])
+            row = db.get_account(account_id)
             if not row:
                 break
             if row["total_earned"] >= MAX_EARN_PER_ACCOUNT:
@@ -983,8 +1105,10 @@ async def run_collection(update, context, account):
             gained = 0.0
             try:
                 result = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"])
-                gained += parse_amount(result)
-                db.log(row["id"], link["id"], "open", parse_amount(result), "ok")
+                cur = parse_total_earned(result)
+                gained += max(0.0, cur - snapshot)
+                snapshot = max(snapshot, cur)
+                db.log(row["id"], link["id"], "open", gained, "ok")
                 last_ok = True
             except Exception as exc:
                 db.log(row["id"], link["id"], "open", 0, "failed")
@@ -992,7 +1116,9 @@ async def run_collection(update, context, account):
                 log.warning("open failed for %s: %s", link["campaign_id"], exc)
             try:
                 back = await asyncio.to_thread(client.buzz_back, row, link["campaign_id"])
-                back_amt = parse_amount(back)
+                cur = parse_total_earned(back)
+                back_amt = max(0.0, cur - snapshot)
+                snapshot = max(snapshot, cur)
                 gained += back_amt
                 db.log(row["id"], link["id"], "buzz_back", back_amt, "ok")
             except Exception as exc:
@@ -1003,9 +1129,11 @@ async def run_collection(update, context, account):
             done += 1
             await edit_progress(cid, context, progress_text(done, len(links), total_new, last_ok))
             await asyncio.sleep(REQUEST_DELAY)
-        row = db.get_account(account["id"])
+        row = db.get_account(account_id)
+        if done > 0:
+            streak = db.finish_collection(account_id)
         final_total = row["total_earned"] if row else total_new
-        await edit_progress(cid, context, final_text(done, len(links), total_new, final_total))
+        await edit_progress(cid, context, final_text(done, len(links), total_new, final_total, streak))
     except Exception as exc:
         log.exception("collection crashed")
         try:
@@ -1093,6 +1221,19 @@ async def collect_menu(update, context):
     active = db.get_active_account(user_id)
     if len(accounts) == 1 or active:
         account = active or accounts[0]
+        already, streak = db.has_collected_today(account["id"])
+        if already:
+            today_earned = db.today_earnings(account["id"])
+            await answer(
+                update,
+                "✅ <b>Already collected today!</b>\n\n"
+                f"💰 Today's collection: ₹{today_earned:.2f}\n"
+                f"🔥 Streak: {streak} day{'s' if streak != 1 else ''}\n"
+                f"📅 Next collection: Tomorrow\n\n"
+                f"{BRAND}",
+                main_menu(update),
+            )
+            return
         start_collection(update, context, account)
         await answer(update, f"🎁 Starting collection for <b>+{html.escape(account['phone'])}</b>...", main_menu(update))
         return
@@ -1107,14 +1248,23 @@ async def stats_menu(update):
     if not accounts:
         await answer(update, "❌ No accounts yet.", main_menu(update))
         return
-    lines = [
-        f"📱 +{html.escape(a['phone'])} → ₹{a['total_earned']:.2f}{' 🟢' if a['active'] else ''}"
-        for a in accounts
-    ]
+    lines = []
+    for a in accounts:
+        streak = a.get("streak_days") or 0
+        collected = (a.get("last_collection_date") or "") == today_ist()
+        today_earned = db.today_earnings(a["id"]) if collected else 0.0
+        line = f"📱 +{html.escape(a['phone'])} → ₹{a['total_earned']:.2f}"
+        if a["active"]:
+            line += " 🟢"
+        if streak > 0:
+            line += f" | 🔥 {streak}d"
+        if collected:
+            line += f" | ✅ today ₹{today_earned:.2f}"
+        lines.append(line)
     text = (
         "📊 <b>Your Stats</b>\n\n"
         + "\n".join(lines)
-        + f"\n\n💰 <b>Total earned: ₹{total:.2f}</b>\n\n{BRAND}"
+        + f"\n\n💰 <b>Total lifetime: ₹{total:.2f}</b>\n\n{BRAND}"
     )
     await answer(update, text, main_menu(update))
 
@@ -1125,8 +1275,9 @@ async def help_menu(update):
         "1️⃣ Tap <b>🔐 Login Account</b>\n"
         "2️⃣ Enter your <b>10-digit</b> phone number (no +91, no 91)\n"
         "3️⃣ Enter the OTP you receive\n"
-        "4️⃣ Buzz rewards are collected automatically\n\n"
-        "💰 Opening a link + buzz-back = ₹2-10 per link\n"
+        "4️⃣ Tap <b>🎁 Collect Buzz</b>\n\n"
+        "📅 Collect <b>once per day</b> — streaks build daily\n"
+        "💰 Real earnings are tracked from Swiggy's API\n"
         f"🏆 Max ₹{MAX_EARN_PER_ACCOUNT:g} per account\n\n"
         f"{BRAND}"
     )
