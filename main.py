@@ -1,384 +1,622 @@
-#!/usr/bin/env python3
-# VIEDIET SHOPSY ULTIMATE - Backend + Bot (Railway)
-
-import os
-import logging
-import telebot
-import json
-import time
-import threading
-import random
-import sqlite3
 import asyncio
-import uuid
-import sys
-from datetime import datetime
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from curl_cffi import requests as cffi_requests
+import html
+import logging
 
-# ==================== CONFIG ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    logging.error("BOT_TOKEN environment variable not set.")
-    exit(1)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 1364476174))
-CHANNEL_USERNAME = "viedietlooters"
-REFERRAL_REQUIRED = 3
+import config
+from database import Database
+from swiggy_api import SwiggyClient, extract_campaign_id, parse_amount, parse_session
 
-DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
-os.makedirs(DATA_DIR, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("buzzbot")
 
-DB_PATH = os.path.join(DATA_DIR, "viediet_ultimate.db")
+db = Database()
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+PHONE, OTP = range(2)
 
-# ==================== FLASK APP ====================
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "viediet-secret-2026")
-CORS(app)
+login_sessions = {}
+progress_messages = {}
+collecting_tasks = {}
 
-# ==================== BOT ====================
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ==================== DATABASE ====================
-def init_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        status TEXT DEFAULT 'LOCKED',
-        registered_at TEXT,
-        last_used TEXT,
-        referred_by INTEGER DEFAULT NULL,
-        referral_code TEXT,
-        referrals_count INTEGER DEFAULT 0,
-        is_unlocked INTEGER DEFAULT 0,
-        is_premium INTEGER DEFAULT 0,
-        mining_active INTEGER DEFAULT 0,
-        total_accounts_added INTEGER DEFAULT 0,
-        max_accounts_allowed INTEGER DEFAULT 5,
-        web_token TEXT UNIQUE,
-        credits INTEGER DEFAULT 0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS shopsy_sessions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        phone TEXT,
-        session_data TEXT,
-        login_method TEXT DEFAULT 'JSON',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_id, phone)
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS mining_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        phone TEXT,
-        coins_earned INTEGER,
-        games_played INTEGER,
-        gems_earned INTEGER,
-        mined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS referrals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        referrer_id INTEGER,
-        referred_id INTEGER UNIQUE,
-        is_valid INTEGER DEFAULT 1
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS pending_referrals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        referrer_id INTEGER,
-        referred_id INTEGER UNIQUE
-    )''')
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized")
+def tg_id(update):
+    user = update.effective_user
+    return user.id if user else 0
 
-init_db()
 
-# ==================== DB FUNCTIONS ====================
-def get_user(user_id):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            'user_id': row[0], 'username': row[1], 'first_name': row[2],
-            'status': row[3], 'registered_at': row[4], 'last_used': row[5],
-            'referred_by': row[6], 'referral_code': row[7],
-            'referrals_count': row[8] if len(row) > 8 else 0,
-            'is_unlocked': row[9] if len(row) > 9 else 0,
-            'is_premium': row[10] if len(row) > 10 else 0,
-            'mining_active': row[11] if len(row) > 11 else 0,
-            'total_accounts_added': row[12] if len(row) > 12 else 0,
-            'max_accounts_allowed': row[13] if len(row) > 13 else 5,
-            'web_token': row[14] if len(row) > 14 else None,
-            'credits': row[15] if len(row) > 15 else 0
-        }
-    return None
+def chat_id(update):
+    chat = update.effective_chat
+    return chat.id if chat else 0
 
-def get_user_by_token(token):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE web_token = ?', (token,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            'user_id': row[0], 'first_name': row[2], 'is_premium': row[10] if len(row) > 10 else 0,
-            'mining_active': row[11] if len(row) > 11 else 0, 'web_token': row[14] if len(row) > 14 else None
-        }
-    return None
 
-def create_user(user_id, username, first_name):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    token = f"WEB{uuid.uuid4().hex[:16]}"
-    c.execute('''INSERT OR IGNORE INTO users 
-        (user_id, username, first_name, registered_at, last_used, referral_code, web_token)
-        VALUES (?, ?, ?, ?, ?, ?, ?)''',
-        (user_id, username, first_name, now, now, f"REF{user_id}", token))
-    conn.commit()
-    conn.close()
-    return token
+def is_admin(user_id):
+    return user_id in config.ADMIN_IDS
 
-def update_user(user_id, **kwargs):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    updates = [f"{k} = ?" for k in kwargs]
-    values = list(kwargs.values()) + [user_id]
-    c.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", values)
-    conn.commit()
-    conn.close()
 
-def get_all_sessions(user_id):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT phone, login_method FROM shopsy_sessions WHERE user_id = ?', (user_id,))
-    rows = c.fetchall()
-    conn.close()
-    return [{'phone': r[0], 'login_method': r[1]} for r in rows]
+def main_menu(update):
+    user_id = tg_id(update)
+    rows = [
+        [
+            InlineKeyboardButton("🔐 Login Account", callback_data="btn_login"),
+            InlineKeyboardButton("👤 My Accounts", callback_data="btn_accounts"),
+        ],
+        [InlineKeyboardButton("🎁 Collect Buzz", callback_data="btn_collect")],
+        [
+            InlineKeyboardButton("📊 My Stats", callback_data="btn_stats"),
+            InlineKeyboardButton("🆘 Help", callback_data="btn_help"),
+        ],
+    ]
+    if is_admin(user_id):
+        rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="btn_admin")])
+    return InlineKeyboardMarkup(rows)
 
-def save_session(user_id, phone, session_data, method="JSON"):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO shopsy_sessions (user_id, phone, session_data, login_method) VALUES (?, ?, ?, ?)',
-              (user_id, phone, json.dumps(session_data), method))
-    conn.commit()
-    conn.close()
-    update_user(user_id, total_accounts_added=len(get_all_sessions(user_id)))
 
-def save_mining_history(user_id, phone, coins, games, gems):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('INSERT INTO mining_history (user_id, phone, coins_earned, games_played, gems_earned) VALUES (?, ?, ?, ?, ?)',
-              (user_id, phone, coins, games, gems))
-    conn.commit()
-    conn.close()
+def admin_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Add Links", callback_data="adm_add"),
+            InlineKeyboardButton("📋 View Links", callback_data="adm_links"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Delete Link", callback_data="adm_del"),
+            InlineKeyboardButton("📊 User Stats", callback_data="adm_stats"),
+        ],
+        [InlineKeyboardButton("💰 Earnings", callback_data="adm_earn")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="btn_back")],
+    ])
 
-def get_mining_history(user_id, limit=50):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT phone, coins_earned, games_played, gems_earned, mined_at FROM mining_history WHERE user_id = ? ORDER BY mined_at DESC LIMIT ?',
-              (user_id, limit))
-    rows = c.fetchall()
-    conn.close()
-    return [{'phone': r[0], 'coins_earned': r[1], 'games_played': r[2], 'gems_earned': r[3], 'mined_at': r[4]} for r in rows]
 
-def get_referral_count(user_id):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND is_valid = 1', (user_id,))
-    count = c.fetchone()[0]
-    conn.close()
-    return count
+async def answer(update, text, markup=None):
+    query = update.callback_query
+    if query is not None:
+        try:
+            await query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+            return
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc):
+                log.debug("edit_message_text failed: %s", exc)
+    message = update.message
+    if message is not None:
+        await message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
-# ==================== WEB API ROUTES ====================
 
-@app.route('/api/web/login', methods=['POST'])
-def web_login():
-    data = request.json
-    user_id = data.get('user_id')
-    password = data.get('password', '123456')
-    
-    user = get_user(user_id)
-    if not user:
-        token = create_user(user_id, f"user_{user_id}", "User")
-        user = get_user(user_id)
-    else:
-        token = user.get('web_token')
-        if not token:
-            token = f"WEB{uuid.uuid4().hex[:16]}"
-            update_user(user_id, web_token=token)
-    
-    if password == '123456' or user.get('is_premium', 0) == 1:
-        return jsonify({'success': True, 'token': token, 'user': user})
-    return jsonify({'error': 'Invalid password'}), 401
+async def send_plain(update, text):
+    cid = chat_id(update)
+    if not cid:
+        return None
+    bot = update.get_bot()
+    return await bot.send_message(cid, text, parse_mode=ParseMode.HTML)
 
-@app.route('/api/web/dashboard', methods=['GET'])
-def web_dashboard():
-    token = request.args.get('token')
-    user = get_user_by_token(token)
-    if not user:
-        return jsonify({'error': 'Invalid token'}), 401
-    
-    user_id = user['user_id']
-    sessions = get_all_sessions(user_id)
-    history = get_mining_history(user_id)
-    total_coins = sum(h['coins_earned'] for h in history)
-    today_coins = sum(h['coins_earned'] for h in history if h['mined_at'].startswith(datetime.now().strftime('%Y-%m-%d')))
-    referrals = get_referral_count(user_id)
-    
-    return jsonify({
-        'user': user,
-        'accounts': len(sessions),
-        'sessions': sessions,
-        'referrals': referrals,
-        'mining_stats': {'total_coins': total_coins},
-        'today_coins': today_coins
-    })
 
-@app.route('/api/web/otp/request', methods=['POST'])
-def web_otp_request():
-    data = request.json
-    phone = data.get('phone')
-    token = data.get('token')
-    
-    user = get_user_by_token(token)
-    if not user:
-        return jsonify({'error': 'Invalid token'}), 401
-    
-    # Simulate OTP (in production, call Shopsy API)
-    return jsonify({'success': True, 'request_id': f"REQ{uuid.uuid4().hex[:8]}"})
+async def start(update, context):
+    if not tg_id(update):
+        return
+    text = (
+        "<b>🤖 Swiggy Buzz Auto-Collector</b>\n\n"
+        "Collect all your Swiggy Buzz rewards automatically — no manual clicking!\n\n"
+        f"{config.BRAND}"
+    )
+    await update.message.reply_text(text, reply_markup=main_menu(update), parse_mode=ParseMode.HTML)
 
-@app.route('/api/web/otp/verify', methods=['POST'])
-def web_otp_verify():
-    data = request.json
-    phone = data.get('phone')
-    otp = data.get('otp')
-    token = data.get('token')
-    
-    user = get_user_by_token(token)
-    if not user:
-        return jsonify({'error': 'Invalid token'}), 401
-    
-    if otp and len(otp) == 6:
-        session_data = {'phone': phone, 'accountId': f"ACC{uuid.uuid4().hex[:8]}", 'isLoggedIn': True}
-        save_session(user['user_id'], phone, session_data, 'OTP')
-        return jsonify({'success': True})
-    return jsonify({'error': 'Invalid OTP'}), 400
 
-@app.route('/api/web/json/login', methods=['POST'])
-def web_json_login():
-    data = request.json
-    json_data = data.get('json_data')
-    token = data.get('token')
-    
-    user = get_user_by_token(token)
-    if not user:
-        return jsonify({'error': 'Invalid token'}), 401
-    
+async def cancel_login(update, context):
+    user_id = tg_id(update)
+    login_sessions.pop(user_id, None)
+    if update.message is not None:
+        await update.message.reply_text("❌ Login cancelled.", reply_markup=main_menu(update), parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
+
+
+async def conv_fallback(update, context):
+    user_id = tg_id(update)
+    login_sessions.pop(user_id, None)
+    await answer(update, "👈 Login flow reset.\n\nUse the buttons below.", main_menu(update))
+    return ConversationHandler.END
+
+
+async def login_start(update, context):
+    user_id = tg_id(update)
+    if not user_id:
+        return ConversationHandler.END
+    login_sessions.pop(user_id, None)
+    await answer(
+        update,
+        "📱 <b>Login to Swiggy Buzz</b>\n\n"
+        "Enter your phone number with country code.\n\n"
+        "Example: <code>919876543210</code>\n\n"
+        "Send /cancel to abort.",
+    )
+    return PHONE
+
+
+async def phone_received(update, context):
+    user_id = tg_id(update)
+    if not user_id:
+        return ConversationHandler.END
+    phone = (update.message.text or "").strip()
+    if not phone.isdigit() or not (10 <= len(phone) <= 13):
+        await update.message.reply_text(
+            "❌ Invalid phone number. Use digits only, e.g. <code>919876543210</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return PHONE
+    client = SwiggyClient()
     try:
-        if isinstance(json_data, str):
-            json_data = json.loads(json_data)
-        phone = json_data.get('phone') or json_data.get('accountId') or str(random.randint(7000000000, 9999999999))
-        save_session(user['user_id'], phone, json_data, 'JSON')
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        status = await asyncio.to_thread(client.send_otp, phone)
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ Could not send OTP: {html.escape(str(exc)[:200])}\n\nTry again:",
+            parse_mode=ParseMode.HTML,
+        )
+        return PHONE
+    if status.get("status") != "ok":
+        await update.message.reply_text(
+            f"❌ OTP request failed:\n{html.escape(str(status.get('message', 'unknown error'))[:200])}\n\nTry again:",
+            parse_mode=ParseMode.HTML,
+        )
+        return PHONE
+    login_sessions[user_id] = {"phone": phone, "client": client}
+    await update.message.reply_text(
+        "✅ <b>OTP sent!</b>\n\nEnter the 6-digit OTP you received on your phone:",
+        parse_mode=ParseMode.HTML,
+    )
+    return OTP
 
-@app.route('/api/web/mining/start', methods=['POST'])
-def web_mining_start():
-    token = request.args.get('token')
-    user = get_user_by_token(token)
-    if not user:
-        return jsonify({'error': 'Invalid token'}), 401
-    
-    sessions = get_all_sessions(user['user_id'])
-    if not sessions:
-        return jsonify({'error': 'No accounts found'}), 400
-    
-    results = []
-    total_coins = 0
-    total_gems = 0
-    
-    for s in sessions:
-        coins = random.randint(50, 300)
-        gems = random.randint(1000, 5000)
-        games = random.randint(1, 4)
-        save_mining_history(user['user_id'], s['phone'], coins, games, gems)
-        results.append({'phone': s['phone'], 'coins': coins, 'gems': gems})
-        total_coins += coins
-        total_gems += gems
-    
-    return jsonify({'success': True, 'results': results, 'total_coins': total_coins, 'total_gems': total_gems})
 
-@app.route('/api/web/accounts', methods=['GET'])
-def web_accounts():
-    token = request.args.get('token')
-    user = get_user_by_token(token)
-    if not user:
-        return jsonify({'error': 'Invalid token'}), 401
-    return jsonify({'accounts': get_all_sessions(user['user_id'])})
-
-@app.route('/api/web/history', methods=['GET'])
-def web_history():
-    token = request.args.get('token')
-    user = get_user_by_token(token)
-    if not user:
-        return jsonify({'error': 'Invalid token'}), 401
-    return jsonify({'history': get_mining_history(user['user_id'])})
-
-# ==================== TELEGRAM BOT ====================
-
-@bot.message_handler(commands=['start'])
-def start_command(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or ""
-    first_name = message.from_user.first_name or "User"
-    
-    user = get_user(user_id)
-    if not user:
-        token = create_user(user_id, username, first_name)
-        user = get_user(user_id)
-    
-    domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'https://your-railway-url.railway.app')
-    bot.send_message(
+async def otp_received(update, context):
+    user_id = tg_id(update)
+    if not user_id:
+        return ConversationHandler.END
+    session = login_sessions.get(user_id)
+    if not session:
+        await update.message.reply_text("⏳ Session expired. Send /start and tap 🔐 Login Account again.")
+        return ConversationHandler.END
+    otp = (update.message.text or "").strip()
+    if not otp.isdigit() or len(otp) != 6:
+        await update.message.reply_text("❌ Invalid OTP. Enter the 6-digit code:")
+        return OTP
+    client = session["client"]
+    try:
+        data = await asyncio.to_thread(client.verify_otp, session["phone"], otp)
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ OTP verification failed: {html.escape(str(exc)[:200])}\n\nTry again:",
+            parse_mode=ParseMode.HTML,
+        )
+        return OTP
+    login_info = parse_session(data)
+    if not login_info.get("token"):
+        await update.message.reply_text("❌ Login failed. Check the OTP and try again.", parse_mode=ParseMode.HTML)
+        return OTP
+    account_id = db.add_account(
         user_id,
-        f"🚀 <b>VIEDIET SHOPSY ULTIMATE</b>\n\n"
-        f"👋 Welcome, {first_name}!\n\n"
-        f"🌐 Visit your dashboard:\n<code>{domain}</code>\n\n"
-        f"🔑 Your Token: <code>{user['web_token']}</code>\n"
-        f"🔒 Default Password: 123456\n\n"
-        f"Use this token to login to web dashboard!"
+        session["phone"],
+        client.device_id,
+        client.swuid,
+        login_info["token"],
+        login_info["tid"],
+        login_info["sid"],
+        login_info["customer_id"],
+    )
+    login_sessions.pop(user_id, None)
+    account = db.get_account(account_id)
+    if not account:
+        await update.message.reply_text("❌ Could not save account. Try again.", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    await update.message.reply_text(
+        f"✅ <b>Logged in as +{html.escape(session['phone'])}</b>\n\n🎁 Auto-collection started...",
+        parse_mode=ParseMode.HTML,
+    )
+    start_collection(update, account)
+    await update.message.reply_text("🔹 <b>Main Menu</b>\n\n" + config.BRAND, reply_markup=main_menu(update), parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
+
+
+def start_collection(update, account):
+    cid = chat_id(update)
+    if not cid:
+        return
+    existing = collecting_tasks.get(cid)
+    if existing and not existing.done():
+        log.info("collection already running for chat %s", cid)
+        return
+    collecting_tasks[cid] = asyncio.create_task(run_collection(update, account))
+
+
+def progress_text(done, total, earned, last_ok):
+    bar_len = 12
+    filled = min(bar_len, int(bar_len * done / max(total, 1)))
+    bar = "🟩" * filled + "⬜" * (bar_len - filled)
+    mark = "✅" if last_ok else "❌"
+    return (
+        f"🎁 <b>Collecting... [{done}/{total}]</b>\n"
+        f"{bar}\n"
+        f"💰 Earned: ₹{earned:.2f}\n"
+        f"Last result: {mark}"
     )
 
-@bot.message_handler(commands=['admin'])
-def admin_command(message):
-    if message.from_user.id != ADMIN_ID:
+
+def final_text(done, total, earned, account_total):
+    return (
+        f"✅ <b>Collection finished! [{done}/{total}]</b>\n\n"
+        f"💰 This run: ₹{earned:.2f}\n"
+        f"🏆 Account total: ₹{account_total:.2f}\n\n"
+        f"{config.BRAND}"
+    )
+
+
+async def edit_progress(cid, update, text):
+    msg_id = progress_messages.get(cid)
+    if not msg_id:
         return
-    bot.reply_to(message, "👑 Admin panel loaded. Use /stats for details.")
-
-# ==================== MAIN ====================
-
-def run_bot():
-    logger.info("🤖 Starting bot...")
+    bot = update.get_bot()
     try:
-        bot.remove_webhook()
-        bot.polling(non_stop=True, interval=1, timeout=30)
-    except Exception as e:
-        logger.error(f"Bot error: {e}")
+        await bot.edit_message_text(text, chat_id=cid, message_id=msg_id, parse_mode=ParseMode.HTML)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc):
+            log.warning("progress edit failed: %s", exc)
+    except Exception as exc:
+        log.warning("progress edit failed: %s", exc)
+
+
+async def run_collection(update, account):
+    cid = chat_id(update)
+    client = SwiggyClient(device_id=account["device_id"], swuid=account["swuid"])
+    links = db.get_all_links()
+    total_new = 0.0
+    done = 0
+    last_ok = True
+    try:
+        if not links:
+            await send_plain(update, "📭 No buzz links added yet. Ask an admin to add links first.")
+            return
+        first = await send_plain(update, "🎁 <b>Collecting... [0/0]</b>\n\nStarting...")
+        if first is not None:
+            progress_messages[cid] = first.message_id
+        for index, link in enumerate(links, 1):
+            row = db.get_account(account["id"])
+            if not row:
+                break
+            if row["total_earned"] >= config.MAX_EARN_PER_ACCOUNT:
+                await edit_progress(
+                    cid,
+                    update,
+                    f"🏆 <b>Max limit ₹{config.MAX_EARN_PER_ACCOUNT:g} reached!</b>\n\n"
+                    f"Total earned: ₹{row['total_earned']:.2f}\n\n{config.BRAND}",
+                )
+                return
+            gained = 0.0
+            try:
+                result = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"], "web")
+                gained += parse_amount(result)
+                db.log(row["id"], link["id"], "open", parse_amount(result), "ok")
+                last_ok = True
+            except Exception as exc:
+                db.log(row["id"], link["id"], "open", 0, "failed")
+                last_ok = False
+                log.warning("open failed for %s: %s", link["campaign_id"], exc)
+            try:
+                back = await asyncio.to_thread(client.buzz_back, row, link["campaign_id"])
+                back_amt = parse_amount(back)
+                gained += back_amt
+                db.log(row["id"], link["id"], "buzz_back", back_amt, "ok")
+            except Exception as exc:
+                db.log(row["id"], link["id"], "buzz_back", 0, "failed")
+                log.warning("buzz_back failed for %s: %s", link["campaign_id"], exc)
+            db.add_earned(row["id"], gained)
+            total_new += gained
+            done += 1
+            await edit_progress(cid, update, progress_text(done, len(links), total_new, last_ok))
+            await asyncio.sleep(config.REQUEST_DELAY)
+        row = db.get_account(account["id"])
+        final_total = row["total_earned"] if row else total_new
+        await edit_progress(cid, update, final_text(done, len(links), total_new, final_total))
+    except Exception as exc:
+        log.exception("collection crashed")
+        try:
+            await edit_progress(cid, update, f"❌ <b>Collection stopped:</b> {html.escape(str(exc)[:200])}")
+        except Exception:
+            pass
+    finally:
+        progress_messages.pop(cid, None)
+        collecting_tasks.pop(cid, None)
+
+
+async def accounts_menu(update):
+    user_id = tg_id(update)
+    accounts = db.get_accounts(user_id)
+    if not accounts:
+        await answer(update, "❌ No accounts linked yet.\n\nTap 🔐 Login Account to add one.", main_menu(update))
+        return
+    lines = [
+        f"{'🟢' if a['active'] else '⚪'} <b>+{html.escape(a['phone'])}</b> — ₹{a['total_earned']:.2f}"
+        for a in accounts
+    ]
+    rows = [
+        [
+            InlineKeyboardButton(f"{'✅' if a['active'] else '👆'} +{a['phone']}", callback_data=f"pick_{a['id']}"),
+            InlineKeyboardButton("🗑️", callback_data=f"logout_{a['id']}"),
+        ]
+        for a in accounts
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_back")])
+    text = "👤 <b>Your Accounts</b>\n\n" + "\n".join(lines) + "\n\nTap to switch active account. 🗑️ removes it."
+    await answer(update, text, InlineKeyboardMarkup(rows))
+
+
+async def pick_account(update, account_id):
+    user_id = tg_id(update)
+    try:
+        account_id = int(account_id)
+    except (TypeError, ValueError):
+        return
+    account = db.get_account(account_id)
+    if not account or account["telegram_id"] != user_id:
+        await answer(update, "❌ Account not found.", main_menu(update))
+        return
+    db.set_active(user_id, account_id)
+    await answer(
+        update,
+        f"✅ Active account set to <b>+{html.escape(account['phone'])}</b>\n\n🎁 Tap Collect Buzz to start collecting.",
+        main_menu(update),
+    )
+
+
+async def logout_account(update, account_id):
+    user_id = tg_id(update)
+    try:
+        account_id = int(account_id)
+    except (TypeError, ValueError):
+        return
+    account = db.get_account(account_id)
+    if not account or account["telegram_id"] != user_id:
+        await answer(update, "❌ Account not found.", main_menu(update))
+        return
+    db.remove_account(account_id)
+    remaining = db.get_active_account(user_id)
+    if not remaining:
+        others = db.get_accounts(user_id)
+        if others:
+            db.set_active(user_id, others[0]["id"])
+    await answer(update, f"🗑️ Removed <b>+{html.escape(account['phone'])}</b>.", main_menu(update))
+
+
+async def collect_menu(update):
+    user_id = tg_id(update)
+    cid = chat_id(update)
+    existing = collecting_tasks.get(cid)
+    if existing and not existing.done():
+        await answer(update, "⏳ Collection is already running. Please wait...", main_menu(update))
+        return
+    accounts = db.get_accounts(user_id)
+    if not accounts:
+        await answer(update, "❌ No accounts linked yet. Tap 🔐 Login Account first.", main_menu(update))
+        return
+    active = db.get_active_account(user_id)
+    if len(accounts) == 1 or active:
+        account = active or accounts[0]
+        start_collection(update, account)
+        await answer(update, f"🎁 Starting collection for <b>+{html.escape(account['phone'])}</b>...", main_menu(update))
+        return
+    rows = [[InlineKeyboardButton(f"📱 +{a['phone']}", callback_data=f"pick_{a['id']}")] for a in accounts]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_back")])
+    await answer(update, "🎁 <b>Choose an account to collect with:</b>", InlineKeyboardMarkup(rows))
+
+
+async def stats_menu(update):
+    user_id = tg_id(update)
+    accounts, total = db.get_stats(user_id)
+    if not accounts:
+        await answer(update, "❌ No accounts yet.", main_menu(update))
+        return
+    lines = [
+        f"📱 +{html.escape(a['phone'])} → ₹{a['total_earned']:.2f}{' 🟢' if a['active'] else ''}"
+        for a in accounts
+    ]
+    text = (
+        "📊 <b>Your Stats</b>\n\n"
+        + "\n".join(lines)
+        + f"\n\n💰 <b>Total earned: ₹{total:.2f}</b>\n\n{config.BRAND}"
+    )
+    await answer(update, text, main_menu(update))
+
+
+async def help_menu(update):
+    text = (
+        "<b>🤖 How to use Swiggy Buzz Auto-Collector</b>\n\n"
+        "1️⃣ Tap <b>🔐 Login Account</b>\n"
+        "2️⃣ Enter your phone number with country code\n"
+        "3️⃣ Enter the OTP you receive\n"
+        "4️⃣ Buzz rewards are collected automatically\n\n"
+        "💰 Opening a link + buzz-back = ₹2-10 per link\n"
+        f"🏆 Max ₹{config.MAX_EARN_PER_ACCOUNT:g} per account\n\n"
+        f"{config.BRAND}"
+    )
+    await answer(update, text, main_menu(update))
+
+
+async def view_links(update):
+    links = db.get_all_links()
+    if not links:
+        await answer(update, "📋 <b>No links yet.</b>\n\nUse ➕ Add Links to add buzz links.", admin_menu())
+        return
+    total = len(links)
+    lines = [f"{i}. <code>{html.escape(l['campaign_id'])}</code>" for i, l in enumerate(links[:50], 1)]
+    more = f"\n... and {total - 50} more" if total > 50 else ""
+    await answer(update, f"📋 <b>Total links: {total}</b>\n\n" + "\n".join(lines) + more, admin_menu())
+
+
+async def delete_menu(update):
+    links = db.get_all_links()
+    if not links:
+        await answer(update, "📋 No links to delete.", admin_menu())
+        return
+    rows = [
+        [InlineKeyboardButton(f"🗑 {html.escape(l['campaign_id'])}", callback_data=f"del_{l['id']}")]
+        for l in links[:30]
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_admin")])
+    await answer(update, "🗑 <b>Tap a link to delete it:</b>", InlineKeyboardMarkup(rows))
+
+
+async def delete_link(update, link_id):
+    user_id = tg_id(update)
+    if not is_admin(user_id):
+        await answer(update, "⛔ Admin only.", main_menu(update))
+        return
+    try:
+        link_id = int(link_id)
+    except (TypeError, ValueError):
+        return
+    db.delete_link(link_id)
+    await delete_menu(update)
+
+
+async def admin_actions(update, context, data):
+    user_id = tg_id(update)
+    if not is_admin(user_id):
+        await answer(update, "⛔ Admin only.", main_menu(update))
+        return
+    if data == "adm_add":
+        context.user_data["adm_add"] = True
+        await answer(
+            update,
+            "📎 <b>Send buzz links</b>, one per line.\n\nThey will be added automatically.\n\n"
+            "Example:\n<code>https://r.swiggy.com/buzzstreaks/ougwl_abc123</code>",
+            admin_menu(),
+        )
+    elif data == "adm_links":
+        await view_links(update)
+    elif data == "adm_del":
+        await delete_menu(update)
+    elif data == "adm_stats":
+        accounts = db.all_accounts()
+        if not accounts:
+            await answer(update, "📊 No users yet.", admin_menu())
+            return
+        lines = [
+            f"👤 tg:{a['telegram_id']} 📱 +{html.escape(a['phone'])} → ₹{a['total_earned']:.2f}"
+            for a in accounts
+        ]
+        text = "📊 <b>All Accounts</b>\n\n" + "\n".join(lines[:40])
+        if len(lines) > 40:
+            text += f"\n... and {len(lines) - 40} more"
+        await answer(update, text, admin_menu())
+    elif data == "adm_earn":
+        total = db.total_earnings()
+        logs = db.total_logs()
+        accounts = db.all_accounts()
+        text = f"💰 <b>Total earnings: ₹{total:.2f}</b> ({logs} collect actions)\n\n"
+        lines = [f"📱 +{html.escape(a['phone'])} → ₹{a['total_earned']:.2f}" for a in accounts]
+        text += "\n".join(lines[:40])
+        await answer(update, text, admin_menu())
+
+
+async def admin_links_received(update, context):
+    user_id = tg_id(update)
+    if not context.user_data.get("adm_add"):
+        return
+    if not is_admin(user_id):
+        context.user_data["adm_add"] = False
+        return
+    context.user_data["adm_add"] = False
+    text = (update.message.text or "").strip()
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        cid = extract_campaign_id(line)
+        if cid:
+            entries.append((line, cid))
+    if not entries:
+        await update.message.reply_text(
+            "❌ No valid buzz links found. Campaign IDs must look like <code>ougwl_xxxxx</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    added = db.add_links(entries, user_id)
+    await update.message.reply_text(
+        f"✅ Added <b>{added}</b> new links (out of {len(entries)} valid).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def on_callback(update, context):
+    query = update.callback_query
+    user_id = tg_id(update)
+    if not user_id:
+        await query.answer("Session expired. Send /start.", show_alert=True)
+        return
+    data = query.data or ""
+    await query.answer()
+    try:
+        if data == "btn_back":
+            await answer(update, "🔹 <b>Main Menu</b>\n\n" + config.BRAND, main_menu(update))
+        elif data == "btn_accounts":
+            await accounts_menu(update)
+        elif data == "btn_collect":
+            await collect_menu(update)
+        elif data == "btn_stats":
+            await stats_menu(update)
+        elif data == "btn_help":
+            await help_menu(update)
+        elif data == "btn_admin":
+            if is_admin(user_id):
+                await answer(update, "👑 <b>Admin Panel</b>", admin_menu())
+        elif data.startswith("pick_"):
+            await pick_account(update, data.split("_", 1)[1])
+        elif data.startswith("logout_"):
+            await logout_account(update, data.split("_", 1)[1])
+        elif data.startswith("del_"):
+            await delete_link(update, data.split("_", 1)[1])
+        elif data.startswith("adm_"):
+            await admin_actions(update, context, data)
+    except Exception as exc:
+        log.exception("callback error")
+        await answer(update, f"❌ Something went wrong: {html.escape(str(exc)[:150])}", main_menu(update))
+
+
+async def error_handler(update, context):
+    log.error("Update %s caused error %s", update, context.error)
+
+
+def main():
+    app = Application.builder().token(config.BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+
+    login_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(login_start, pattern="^btn_login$")],
+        states={
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received)],
+            OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_received)],
+        },
+        fallbacks=[
+            CallbackQueryHandler(conv_fallback, pattern="^btn_"),
+            CommandHandler("start", start),
+            CommandHandler("cancel", cancel_login),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(login_conv)
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_links_received))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(error_handler)
+
+    log.info("Swiggy Buzz bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    
-    port = int(os.environ.get("PORT", 5000))
-    logger.info(f"🌐 Web server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    main()
