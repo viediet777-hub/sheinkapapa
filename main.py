@@ -8,6 +8,7 @@ Made by @viediet
 """
 
 import asyncio
+import base64
 import html
 import json
 import logging
@@ -79,6 +80,22 @@ BASE_HEADERS = {
 OTP_URL = "https://profile.swiggy.com/api/v3/app/sms_otp"
 VERIFY_URL = "https://profile.swiggy.com/api/v3/app/login/verify"
 REWARDS_URL = "https://spns.swiggy.com/api/v1/campaign/rewards"
+CAMPAIGN_ACTION_URL = "https://spns.swiggy.com/api/v1/campaign/action"
+
+SPNS_HEADERS = {
+    "client-id": "portal",
+    "user-agent": "Mozilla/5.0 (Linux; Android 11; Pixel 4 Build/RD2A.211001.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/83.0.4103.120 Mobile Safari/537.36",
+    "content-type": "application/json",
+    "accept": "*/*",
+    "origin": "https://webviews.swiggy.com",
+    "x-requested-with": "in.swiggy.android",
+    "referer": "https://webviews.swiggy.com/moments-iw/buzz-your-friend/?source=banner&campaignId=ougwl&is_promoted=true",
+    "accept-encoding": "gzip, deflate",
+    "accept-language": "en-IN,en-US;q=0.9,en;q=0.8",
+    "sec-fetch-site": "same-site",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+}
 
 # ============================== DATABASE ==============================
 
@@ -292,6 +309,34 @@ def extract_campaign_id(url):
     return match.group(1) if match else None
 
 
+def split_campaign_id(campaign_id):
+    """Split 'ougwl_<base64>' into (base_campaign, encoded_target)."""
+    if not campaign_id or "_" not in campaign_id:
+        return campaign_id, ""
+    return campaign_id.split("_", 1)[0], campaign_id.split("_", 1)[1]
+
+
+def decode_target_user_id(campaign_id):
+    """Decode 'ougwl_<base64(userId#name)>' -> target userId."""
+    base, encoded = split_campaign_id(campaign_id)
+    if not encoded:
+        return None
+    padded = encoded + "=" * (-len(encoded) % 4)
+    decoded = ""
+    try:
+        decoded = base64.urlsafe_b64decode(padded).decode("utf-8", "ignore")
+    except Exception:
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8", "ignore")
+        except Exception:
+            return None
+    if not decoded:
+        return None
+    if "#" in decoded:
+        return decoded.split("#", 1)[0]
+    return decoded if decoded.isdigit() else None
+
+
 def find_key(node, key, depth=0):
     if depth > 10 or not isinstance(node, (dict, list)):
         return None
@@ -368,7 +413,12 @@ def parse_amount(payload):
         if isinstance(node, dict):
             for key, val in node.items():
                 lowered = str(key).lower()
-                if lowered in REWARD_KEYS and isinstance(val, (int, float)) and val > 0:
+                if lowered == "totalearned" and isinstance(val, dict):
+                    try:
+                        total += float(val.get("units", 0))
+                    except (TypeError, ValueError):
+                        pass
+                elif lowered in REWARD_KEYS and isinstance(val, (int, float)) and val > 0:
                     total += float(val)
                 elif isinstance(val, (dict, list)):
                     walk(val)
@@ -506,12 +556,26 @@ class SwiggyClient:
             headers["sid"] = account["sid"]
         return headers
 
+    def _spns_headers(self, account):
+        headers = dict(SPNS_HEADERS)
+        if account.get("token"):
+            headers["token"] = account["token"]
+        if account.get("tid"):
+            headers["tid"] = account["tid"]
+        if account.get("sid"):
+            headers["sid"] = account["sid"]
+        headers["deviceid"] = self.device_id
+        headers["swuid"] = self.swuid
+        return headers
+
     def _post(self, url, headers, body, attempts=2):
         last_exc = None
         for attempt in range(attempts + 1):
             try:
+                log.info("[DEBUG] POST %s headers=%s body=%s", url, {k: (v[:40] + "..." if len(v) > 40 else v) for k, v in headers.items()}, json.dumps(body)[:500])
                 resp = self.session.post(url, headers=headers, json=body, timeout=30)
                 data = resp.json() if resp.content else {}
+                log.info("[DEBUG] POST %s response: %s", url, json.dumps(data)[:800])
                 if not is_success(data):
                     last_exc = ApiError(f"API error: {json.dumps(data)[:300]}")
                 else:
@@ -524,16 +588,57 @@ class SwiggyClient:
                 time.sleep(1.5 * (attempt + 1))
         raise last_exc
 
-    def collect_campaign(self, account, campaign_id, client_id="web"):
+    def collect_campaign(self, account, campaign_id, client_id="portal_banner", source="banner"):
         body = {
-            "clientId": client_id,
-            "campaignIds": [campaign_id],
-            "userId": account.get("customer_id", ""),
+            "generalContext": {
+                "requestContext": {
+                    "clientId": client_id,
+                }
+            },
+            "campaignRewardRequests": [
+                {
+                    "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
+                    "campaignId": campaign_id,
+                    "rollingFreecashParams": {
+                        "forceRefresh": True,
+                        "requestParams": {
+                            "dataRequested": "wallet,connections,transactions",
+                            "consumerName": "",
+                            "source": source,
+                        },
+                    },
+                }
+            ],
         }
-        return self._post(REWARDS_URL, self._auth_headers(account), body)
+        return self._post(REWARDS_URL, self._spns_headers(account), body)
 
     def buzz_back(self, account, campaign_id):
-        return self.collect_campaign(account, campaign_id, client_id="portal_invite")
+        """Buzz back: connect with the friend who sent the invite (ACTION_TYPE_CONNECT)."""
+        base_campaign, _ = split_campaign_id(campaign_id)
+        target_id = decode_target_user_id(campaign_id)
+        if not target_id:
+            log.warning("[DEBUG] No target user id in campaign_id %s, falling back to rewards invite", campaign_id)
+            return self.collect_campaign(account, campaign_id, client_id="portal_invite", source="invite")
+        body = {
+            "generalContext": {
+                "requestContext": {
+                    "clientId": "portal_invite",
+                }
+            },
+            "consumerContext": {
+                "consumerId": account.get("customer_id", ""),
+            },
+            "campaignUserActionRequest": {
+                "campaignId": base_campaign,
+                "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
+                "action": {
+                    "actionType": "ACTION_TYPE_CONNECT",
+                    "targetEntityId": target_id,
+                },
+            },
+        }
+        log.info("[DEBUG] Buzz back: campaign=%s target=%s", base_campaign, target_id)
+        return self._post(CAMPAIGN_ACTION_URL, self._spns_headers(account), body)
 
 
 # ============================== BOT HELPERS ==============================
@@ -877,7 +982,7 @@ async def run_collection(update, context, account):
                 return
             gained = 0.0
             try:
-                result = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"], "web")
+                result = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"])
                 gained += parse_amount(result)
                 db.log(row["id"], link["id"], "open", parse_amount(result), "ok")
                 last_ok = True
