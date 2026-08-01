@@ -1109,17 +1109,19 @@ async def run_collection(update, context, account):
             try:
                 result = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"])
                 cur = parse_total_earned(result)
-                gained += max(0.0, cur - snapshot)
+                open_amt = max(0.0, cur - snapshot)
                 snapshot = max(snapshot, cur)
-                db.log(row["id"], link["id"], "open", gained, "ok")
+                gained += open_amt
+                db.log(row["id"], link["id"], "open", open_amt, "ok")
                 last_ok = True
             except Exception as exc:
                 db.log(row["id"], link["id"], "open", 0, "failed")
                 last_ok = False
                 log.warning("open failed for %s: %s", link["campaign_id"], exc)
             try:
-                back = await asyncio.to_thread(client.buzz_back, row, link["campaign_id"])
-                cur = parse_total_earned(back)
+                await asyncio.to_thread(client.buzz_back, row, link["campaign_id"])
+                check = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"])
+                cur = parse_total_earned(check)
                 back_amt = max(0.0, cur - snapshot)
                 snapshot = max(snapshot, cur)
                 gained += back_amt
