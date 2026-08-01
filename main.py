@@ -3,84 +3,94 @@ import re
 import time
 import uuid
 import logging
+import sqlite3
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 app = Flask(__name__)
-CORS(app)  # allow Netlify frontend to call
+CORS(app)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("buzz-api")
 
-# ------------------- CONFIG -------------------
-DATABASE_URL = os.environ.get("DATABASE_URL")  # Railway provides this
-if not DATABASE_URL:
-    raise Exception("DATABASE_URL not set")
+# ------------------- DATABASE (SQLite fallback) -------------------
+DATABASE_URL = os.environ.get("DATABASE_URL")
+USE_SQLITE = not DATABASE_URL
 
-# Swiggy API endpoints (direct)
-BASE_URL = "https://profile.swiggy.com/api/v3/app"
-SMS_OTP_URL = f"{BASE_URL}/sms_otp"
-LOGIN_VERIFY_URL = f"{BASE_URL}/login/verify"
-SPNS_BASE = "https://spns.swiggy.com/api/v1/campaign"
-REWARDS_URL = f"{SPNS_BASE}/rewards"
-ACTION_URL = f"{SPNS_BASE}/action"
+if USE_SQLITE:
+    DB_PATH = os.path.join(os.path.dirname(__file__), "swiggy_buzz.db")
+    log.warning("⚠️ DATABASE_URL not set – using SQLite (data will not persist across restarts)")
 
-# 50 target users (from your data)
-TARGET_USERS = [
-    "9905454846", "8302374884", "9569907686", "6019557067",
-    "8103200020", "9793231470", "6075716540", "6057085260",
-    "6529467214", "4742565540", "2159541308", "5711812412",
-    "4805096977", "6306972524", "5810763039", "5767374231",
-    "5255411320", "9263536039", "9656243680", "7028403798",
-    "2022592103", "4339594714", "9315838951", "5021810039",
-    "4179533661", "3969482763", "5378219742", "4622672366",
-    "6529938009", "8841032307", "7847081991", "8476578440",
-    "4958316534", "6089374148", "3974751011", "9076113237",
-    "2405719218", "8557791891", "5237191585", "7504061044",
-    "7239858845", "5773101973", "9292974443", "8481419410",
-    "4219735233", "9104704566", "3923205642", "1106827431",
-    "9066285442", "8745675335"
-]
-
-# ------------------- DATABASE HELPERS -------------------
 def get_db_connection():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    return conn
+    if USE_SQLITE:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+    else:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
     conn = get_db_connection()
     with conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT,
-                phone TEXT UNIQUE,
-                token TEXT,
-                tid TEXT,
-                sid TEXT,
-                device_id TEXT,
-                secrettoken TEXT,
-                customer_id TEXT,
-                total_earned REAL DEFAULT 0,
-                last_collection_date DATE,
-                streak_days INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS logs (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER REFERENCES users(id),
-                action TEXT,
-                amount REAL,
-                status TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
+        if USE_SQLITE:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT UNIQUE,
+                    token TEXT,
+                    tid TEXT,
+                    sid TEXT,
+                    device_id TEXT,
+                    secrettoken TEXT,
+                    customer_id TEXT,
+                    total_earned REAL DEFAULT 0,
+                    last_collection_date TEXT,
+                    streak_days INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    action TEXT,
+                    amount REAL,
+                    status TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            """)
+        else:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT UNIQUE,
+                    token TEXT,
+                    tid TEXT,
+                    sid TEXT,
+                    device_id TEXT,
+                    secrettoken TEXT,
+                    customer_id TEXT,
+                    total_earned REAL DEFAULT 0,
+                    last_collection_date DATE,
+                    streak_days INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS logs (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id),
+                    action TEXT,
+                    amount REAL,
+                    status TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
     conn.close()
 
 init_db()
