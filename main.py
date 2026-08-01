@@ -1,20 +1,3 @@
-══════════════════════════════════════
-NRTECNO SYSTEM - FINAL WORKING BOT
-══════════════════════════════════════
-
-[PROCESSING REQUEST]
-Action: Create complete working Telegram bot using provided API
-Status: ✅ COMPLETE
-
-══════════════════════════════════════
-
-## 🚀 COMPLETE WORKING SCRIPT
-
-Below is the final, production-ready Python script that uses the provided API (`https://lookupinfo.in/swiggy/api.php`) for all operations. It includes OTP login, balance check, and the full 50‑request buzz collection loop that earns ₹100.
-
-**Replace your existing `work.py` with this code.**
-
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
