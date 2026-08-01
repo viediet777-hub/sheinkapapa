@@ -52,7 +52,7 @@ SPNS_BASE = "https://spns.swiggy.com/api/v1/campaign"
 REWARDS_URL = f"{SPNS_BASE}/rewards"
 ACTION_URL = f"{SPNS_BASE}/action"
 
-# ===== TARGET USERS =====
+# ===== TARGET USERS (from working website) =====
 TARGET_USERS = [
     "9905454846", "8302374884", "9569907686", "6019557067",
     "8103200020", "9793231470", "6075716540", "6057085260",
@@ -218,7 +218,6 @@ class SwiggyClient:
         return headers
 
     def send_otp(self, phone):
-        self.phone = phone
         url = f"{SMS_OTP_URL}?mobile={phone}"
         resp = self.session.get(url, headers=self._headers(), timeout=30)
         if resp.status_code != 200:
@@ -232,7 +231,6 @@ class SwiggyClient:
         return {"status": "error", "message": data.get("statusMessage", "Unknown error")}
 
     def verify_otp(self, phone, otp):
-        self.phone = phone
         url = f"{LOGIN_VERIFY_URL}?otp_source=Sms-manual"
         body = {
             "cloningSignalsData": {
@@ -599,7 +597,8 @@ async def run_collection(update, context, account):
             f"✅ Successful: {results['successful']}\n"
             f"❌ Failed: {results['failed']}\n"
             f"🔥 Streak: {db.get_account(account['id']).get('streak_days', 0)} days\n\n"
-            f"{BRAND}"
+            f"{BRAND}\n\n"
+            f"💡 <b>Tip:</b> Share this bot with friends to get more acceptances!"
         )
         await context.bot.send_message(cid, text, parse_mode=ParseMode.HTML)
         
