@@ -3,18 +3,21 @@
 
 """
 SWIGGY BUZZ AUTO-COLLECTOR BOT
-Complete Single Script - Fixed Import Error
+Complete Single Script - Railway Ready - NO aiohttp
 Made by @viediet
 """
 
-import asyncio
-import logging
+import os
 import re
 import sqlite3
+import json
+import time
 import uuid
+import logging
+import threading
 from datetime import datetime, timedelta, timezone
 
-import aiohttp
+import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -32,6 +35,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("papu")
 
+# ===================== CONFIG =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_USERNAME = "viedietlooters"
 CHANNEL_LINK = "https://t.me/viedietlooters"
@@ -45,8 +49,8 @@ DB_PATH = "papu.db"
 
 REWARDS = {1: 100, 2: 100, 3: 150, 4: 200, 5: 250, 6: 250}
 
+# ===================== SWIGGY API =====================
 SWIGGY_BASE = "https://www.swiggy.com/dapi"
-SWIGGY_API_KEY = "SWIGGY_KEY"
 SMS_LOGIN_URL = SWIGGY_BASE + "/auth/smsotp/login"
 BUZZ_STATUS_URL = SWIGGY_BASE + "/buzz/status"
 BUZZ_JOIN_BONUS_URL = SWIGGY_BASE + "/buzz/join"
@@ -59,26 +63,22 @@ USER_AGENT = (
 PENDING_LOGIN = {}
 COLLECT_LOCKS = {}
 
-
+# ===================== DATABASE =====================
 def utcnow():
     return datetime.now(timezone.utc)
 
-
 def now_iso():
     return utcnow().isoformat()
-
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def ensure_column(conn, table, column, ddl):
     cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-
 
 def init_db():
     with get_conn() as conn:
@@ -121,7 +121,6 @@ def init_db():
         ensure_column(conn, "users", "referral_points", "INTEGER DEFAULT 0")
         ensure_column(conn, "users", "joined_channel", "INTEGER DEFAULT 0")
 
-
 def ensure_user(user_id, username, first_name, referred_by=None):
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
@@ -140,12 +139,31 @@ def ensure_user(user_id, username, first_name, referred_by=None):
             )
         return row
 
-
 def get_user(user_id):
     with get_conn() as conn:
         return conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
 
+def get_accounts(user_id, include_invalid=True):
+    with get_conn() as conn:
+        if include_invalid:
+            return conn.execute(
+                "SELECT * FROM accounts WHERE user_id=? ORDER BY id", (user_id,)
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM accounts WHERE user_id=? AND invalid=0 ORDER BY id", (user_id,)
+        ).fetchall()
 
+def mask_phone(phone):
+    digits = re.sub(r"\D", "", phone)
+    return "+91-XXXX" + digits[-4:] if len(digits) >= 4 else phone
+
+def expiry_text(last_claimed_at):
+    if not last_claimed_at:
+        return "No cash yet"
+    dt = datetime.fromisoformat(last_claimed_at) + timedelta(days=CASH_EXPIRY_DAYS)
+    return dt.strftime("%d %b %Y, %I:%M %p")
+
+# ===================== BOT HELPERS =====================
 def main_menu():
     kb = [
         [InlineKeyboardButton("💰 Collect Now", callback_data="collect")],
@@ -160,12 +178,10 @@ def main_menu():
     ]
     return InlineKeyboardMarkup(kb)
 
-
 def join_button():
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)]]
     )
-
 
 async def is_channel_member(context, user_id):
     try:
@@ -173,7 +189,6 @@ async def is_channel_member(context, user_id):
         return member.status in ("member", "administrator", "creator")
     except Exception:
         return False
-
 
 def require_member(f):
     async def wrapper(update, context):
@@ -186,33 +201,205 @@ def require_member(f):
             )
             return None
         return await f(update, context)
-
     return wrapper
 
+# ===================== SWIGGY API FUNCTIONS =====================
+def buzz_headers(token):
+    return {
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
 
-def get_accounts(user_id, include_invalid=True):
+def _post_json(url, token, payload=None):
+    try:
+        response = requests.post(
+            url,
+            headers=buzz_headers(token),
+            json=payload or {},
+            timeout=20
+        )
+        return response.json()
+    except Exception as e:
+        logger.error(f"POST {url} error: {e}")
+        raise
+
+def buzz_status(token):
+    try:
+        response = requests.get(
+            BUZZ_STATUS_URL,
+            headers=buzz_headers(token),
+            timeout=20
+        )
+        return response.json()
+    except Exception as e:
+        logger.error(f"Buzz status error: {e}")
+        raise
+
+def buzz_claim_join_bonus(token):
+    return _post_json(BUZZ_JOIN_BONUS_URL, token)
+
+def buzz_claim_reward(token):
+    return _post_json(BUZZ_CLAIM_URL, token)
+
+def swiggy_send_otp(phone):
+    device_id = uuid.uuid4().hex
+    payload = {"deviceId": device_id, "mobile": phone, "otp": ""}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    response = requests.post(SMS_LOGIN_URL, json=payload, headers=headers, timeout=20)
+    return device_id
+
+def swiggy_verify_otp(phone, otp, device_id):
+    payload = {"deviceId": device_id, "mobile": phone, "otp": otp}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    response = requests.post(SMS_LOGIN_URL, json=payload, headers=headers, timeout=20)
+    data = response.json()
+    data = data.get("data") or {}
+    token = data.get("access_token") or data.get("token")
+    return token
+
+def process_account(acc):
+    token = acc["swiggy_token"]
+    try:
+        status = buzz_status(token)
+        data = status.get("data") or {}
+    except Exception:
+        return "❌ Invalid session", 0, None
+
+    if data.get("joiningBonusApplicable") and not acc["bonus_claimed"]:
+        try:
+            jr = buzz_claim_join_bonus(token)
+            if isinstance(jr, dict) and jr.get("statusCode") in (None, 200):
+                with get_conn() as conn:
+                    conn.execute(
+                        "UPDATE accounts SET bonus_claimed=1 WHERE id=?",
+                        (acc["id"],),
+                    )
+        except Exception:
+            logger.exception("bonus claim failed for account %s", acc["id"])
+
+    if acc["last_claimed_at"]:
+        last = datetime.fromisoformat(acc["last_claimed_at"])
+        if utcnow() - last < timedelta(hours=CLAIM_COOLDOWN_HOURS):
+            return "⚠️ Already Done", 0, None
+
+    try:
+        cr = buzz_claim_reward(token)
+        amount = parse_amount(cr, acc["collection_day"])
+    except Exception:
+        return "❌ Invalid session", 0, None
+
+    if amount <= 0:
+        return "⚠️ Nothing to claim", 0, None
+
+    day = acc["collection_day"]
     with get_conn() as conn:
-        if include_invalid:
-            return conn.execute(
-                "SELECT * FROM accounts WHERE user_id=? ORDER BY id", (user_id,)
-            ).fetchall()
-        return conn.execute(
-            "SELECT * FROM accounts WHERE user_id=? AND invalid=0 ORDER BY id", (user_id,)
-        ).fetchall()
+        conn.execute(
+            "UPDATE accounts SET collection_day = MIN(collection_day + 1, 6), "
+            "last_claimed_at=?, total_claimed = total_claimed + ? WHERE id=?",
+            (now_iso(), amount, acc["id"]),
+        )
+    return f"✅ Claimed ₹{amount}", amount, day
 
+def parse_amount(j, day):
+    data = j.get("data") or {}
+    for key in ("amount", "rewardAmount", "reward", "cashback", "value"):
+        v = data.get(key)
+        if v is not None:
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                pass
+    return REWARDS.get(day, REWARDS[6])
 
-def mask_phone(phone):
-    digits = re.sub(r"\D", "", phone)
-    return "+91-XXXX" + digits[-4:] if len(digits) >= 4 else phone
+def credit_referral_if_needed(user_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT referred_by FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if not row or not row["referred_by"]:
+            return
+        ref = row["referred_by"]
+        already = conn.execute(
+            "SELECT id FROM referrals WHERE referred_id=?", (user_id,)
+        ).fetchone()
+        if already:
+            return
+        exists = conn.execute(
+            "SELECT user_id FROM users WHERE user_id=?", (ref,)
+        ).fetchone()
+        if not exists:
+            return
+        conn.execute(
+            "INSERT INTO referrals (referrer_id, referred_id, credited, created_at) "
+            "VALUES (?,?,1,?)",
+            (ref, user_id, now_iso()),
+        )
+        conn.execute(
+            "UPDATE users SET points_balance = points_balance + ?, "
+            "referral_points = referral_points + ? WHERE user_id=?",
+            (POINTS_PER_REFERRAL, POINTS_PER_REFERRAL, ref),
+        )
 
+def run_collection_sync(user_id, chat_id, message_id, context):
+    row = get_user(user_id)
+    if row["points_balance"] < POINTS_PER_COLLECTION:
+        context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="🚫 Not enough points. Get points via /refer.",
+        )
+        return
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET points_balance = points_balance - ? WHERE user_id=?",
+            (POINTS_PER_COLLECTION, user_id),
+        )
 
-def expiry_text(last_claimed_at):
-    if not last_claimed_at:
-        return "No cash yet"
-    dt = datetime.fromisoformat(last_claimed_at) + timedelta(days=CASH_EXPIRY_DAYS)
-    return dt.strftime("%d %b %Y, %I:%M %p")
+    accts = get_accounts(user_id, include_invalid=False)
+    results = []
+    total = 0
+    any_success = False
+    for acc in accts:
+        status, amount, day = process_account(acc)
+        if amount:
+            total += amount
+        if day is not None:
+            any_success = True
+        results.append((acc, status, amount))
 
+    if any_success:
+        credit_referral_if_needed(user_id)
 
+    lines = []
+    for acc, status, amount in results:
+        if amount:
+            lines.append(f"📞 {mask_phone(acc['phone'])}: {status}")
+        else:
+            lines.append(f"📞 {mask_phone(acc['phone'])}: {status}")
+
+    row = get_user(user_id)
+    text = (
+        "✅ Collection finished!\n\n"
+        + "\n".join(lines)
+        + f"\n\n💰 Total claimed this run: ₹{total}\n"
+        f"⭐ Points left: {row['points_balance']}\n"
+        "⚠️ Cash expires in 3 days — collect daily to keep it fresh!"
+    )
+    try:
+        context.bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=text
+        )
+    except Exception:
+        context.bot.send_message(chat_id=chat_id, text=text)
+
+# ===================== TELEGRAM HANDLERS =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     referred_by = None
@@ -260,7 +447,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, reply_markup=main_menu())
 
-
 @require_member
 async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -275,7 +461,6 @@ async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• No limit on referrals!",
         parse_mode="Markdown",
     )
-
 
 @require_member
 async def cmd_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,7 +485,6 @@ async def cmd_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
-
 @require_member
 async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     accts = get_accounts(update.effective_user.id)
@@ -322,8 +506,7 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"claimed ₹{a['total_claimed']} · bonus {'done' if a['bonus_claimed'] else 'pending'}\n"
                 f"   Cash expires: {expiry_text(a['last_claimed_at'])}"
             )
-    await update.message.reply_text("👤 Your accounts:\n\n" + "\n".join(lines))
-
+    await update.message.reply_text("👤 Your accounts:\n\n" + "\n.join(lines))
 
 @require_member
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -343,11 +526,29 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-
 @require_member
 async def cmd_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_collection(update, context, update.message)
-
+    user_id = update.effective_user.id
+    accts = get_accounts(user_id, include_invalid=False)
+    if not accts:
+        await update.message.reply_text(
+            "📭 No accounts added. Use /add first.", reply_markup=main_menu()
+        )
+        return
+    row = get_user(user_id)
+    if row["points_balance"] < POINTS_PER_COLLECTION:
+        await update.message.reply_text(
+            f"🚫 Not enough points!\n\nYou need {POINTS_PER_COLLECTION} point to collect. "
+            "Get points via /refer (2 pts per friend)."
+        )
+        return
+    msg = await update.message.reply_text(
+        f"⏳ Collecting from {len(accts)} account(s)..."
+    )
+    threading.Thread(
+        target=run_collection_sync,
+        args=(user_id, update.effective_chat.id, msg.message_id, context)
+    ).start()
 
 @require_member
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -355,254 +556,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.id in PENDING_LOGIN:
         del PENDING_LOGIN[chat.id]
     await update.message.reply_text("❌ Login cancelled.")
-
-
-async def start_collection(update, context, source_message):
-    user_id = update.effective_user.id
-    accts = get_accounts(user_id, include_invalid=False)
-    if not accts:
-        await source_message.reply_text(
-            "📭 No accounts added. Use /add first.", reply_markup=main_menu()
-        )
-        return
-    row = get_user(user_id)
-    if row["points_balance"] < POINTS_PER_COLLECTION:
-        await source_message.reply_text(
-            f"🚫 Not enough points!\n\nYou need {POINTS_PER_COLLECTION} point to collect. "
-            "Get points via /refer (2 pts per friend)."
-        )
-        return
-    lock = COLLECT_LOCKS.setdefault(user_id, asyncio.Lock())
-    if lock.locked():
-        await source_message.reply_text("⏳ A collection is already running. Please wait.")
-        return
-    msg = await source_message.reply_text(
-        f"⏳ Collecting from {len(accts)} account(s)..."
-    )
-    asyncio.create_task(
-        run_collection(context, user_id, update.effective_chat.id, msg.message_id, accts)
-    )
-
-
-async def run_collection(context, user_id, chat_id, message_id, accts):
-    lock = COLLECT_LOCKS.setdefault(user_id, asyncio.Lock())
-    async with lock:
-        row = get_user(user_id)
-        if row["points_balance"] < POINTS_PER_COLLECTION:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text="🚫 Not enough points. Get points via /refer.",
-            )
-            return
-        with get_conn() as conn:
-            conn.execute(
-                "UPDATE users SET points_balance = points_balance - ? WHERE user_id=?",
-                (POINTS_PER_COLLECTION, user_id),
-            )
-
-        results = []
-        total = 0
-        any_success = False
-        for acc in accts:
-            status, amount, day = await process_account(acc)
-            if amount:
-                total += amount
-            if day is not None:
-                any_success = True
-            results.append((acc, status, amount))
-
-        if any_success:
-            credit_referral_if_needed(user_id)
-
-        lines = []
-        for acc, status, amount in results:
-            if amount:
-                lines.append(f"📞 {mask_phone(acc['phone'])}: {status}")
-            else:
-                lines.append(f"📞 {mask_phone(acc['phone'])}: {status}")
-
-        row = get_user(user_id)
-        text = (
-            "✅ Collection finished!\n\n"
-            + "\n".join(lines)
-            + f"\n\n💰 Total claimed this run: ₹{total}\n"
-            f"⭐ Points left: {row['points_balance']}\n"
-            "⚠️ Cash expires in 3 days — collect daily to keep it fresh!"
-        )
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=message_id, text=text
-            )
-        except Exception:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-
-
-async def process_account(acc):
-    token = acc["swiggy_token"]
-    try:
-        status = await buzz_status(token)
-        data = status.get("data") or {}
-    except Exception:
-        return "❌ Invalid session", 0, None
-
-    if data.get("joiningBonusApplicable") and not acc["bonus_claimed"]:
-        try:
-            jr = await buzz_claim_join_bonus(token)
-            if isinstance(jr, dict) and jr.get("statusCode") in (None, 200):
-                with get_conn() as conn:
-                    conn.execute(
-                        "UPDATE accounts SET bonus_claimed=1 WHERE id=?",
-                        (acc["id"],),
-                    )
-        except Exception:
-            logger.exception("bonus claim failed for account %s", acc["id"])
-
-    if acc["last_claimed_at"]:
-        last = datetime.fromisoformat(acc["last_claimed_at"])
-        if utcnow() - last < timedelta(hours=CLAIM_COOLDOWN_HOURS):
-            return "⚠️ Already Done", 0, None
-
-    try:
-        cr = await buzz_claim_reward(token)
-        amount = parse_amount(cr, acc["collection_day"])
-    except Exception:
-        return "❌ Invalid session", 0, None
-
-    if amount <= 0:
-        return "⚠️ Nothing to claim", 0, None
-
-    day = acc["collection_day"]
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE accounts SET collection_day = MIN(collection_day + 1, 6), "
-            "last_claimed_at=?, total_claimed = total_claimed + ? WHERE id=?",
-            (now_iso(), amount, acc["id"]),
-        )
-    return f"✅ Claimed ₹{amount}", amount, day
-
-
-def parse_amount(j, day):
-    data = j.get("data") or {}
-    for key in ("amount", "rewardAmount", "reward", "cashback", "value"):
-        v = data.get(key)
-        if v is not None:
-            try:
-                return int(float(v))
-            except (TypeError, ValueError):
-                pass
-    return REWARDS.get(day, REWARDS[6])
-
-
-def credit_referral_if_needed(user_id):
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT referred_by FROM users WHERE user_id=?", (user_id,)
-        ).fetchone()
-        if not row or not row["referred_by"]:
-            return
-        ref = row["referred_by"]
-        already = conn.execute(
-            "SELECT id FROM referrals WHERE referred_id=?", (user_id,)
-        ).fetchone()
-        if already:
-            return
-        exists = conn.execute(
-            "SELECT user_id FROM users WHERE user_id=?", (ref,)
-        ).fetchone()
-        if not exists:
-            return
-        conn.execute(
-            "INSERT INTO referrals (referrer_id, referred_id, credited, created_at) "
-            "VALUES (?,?,1,?)",
-            (ref, user_id, now_iso()),
-        )
-        conn.execute(
-            "UPDATE users SET points_balance = points_balance + ?, "
-            "referral_points = referral_points + ? WHERE user_id=?",
-            (POINTS_PER_REFERRAL, POINTS_PER_REFERRAL, ref),
-        )
-
-
-def buzz_headers(token):
-    return {
-        "Authorization": "Bearer " + token,
-        "X-Api-Key": SWIGGY_API_KEY,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    }
-
-
-async def _post_json(url, token, payload=None):
-    last_exc = None
-    for attempt in range(2):
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    url,
-                    headers=buzz_headers(token),
-                    json=payload or {},
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as r:
-                    return await r.json(content_type=None)
-        except Exception as e:
-            last_exc = e
-            await asyncio.sleep(0.8)
-    raise last_exc
-
-
-async def buzz_status(token):
-    async with aiohttp.ClientSession() as s:
-        async with s.get(
-            BUZZ_STATUS_URL,
-            headers=buzz_headers(token),
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            return await r.json(content_type=None)
-
-
-async def buzz_claim_join_bonus(token):
-    return await _post_json(BUZZ_JOIN_BONUS_URL, token)
-
-
-async def buzz_claim_reward(token):
-    return await _post_json(BUZZ_CLAIM_URL, token)
-
-
-async def swiggy_send_otp(phone):
-    device_id = uuid.uuid4().hex
-    payload = {"deviceId": device_id, "mobile": phone, "otp": ""}
-    headers = {
-        "X-Api-Key": SWIGGY_API_KEY,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    }
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            SMS_LOGIN_URL, json=payload, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            await r.read()
-    return device_id
-
-
-async def swiggy_verify_otp(phone, otp, device_id):
-    payload = {"deviceId": device_id, "mobile": phone, "otp": otp}
-    headers = {
-        "X-Api-Key": SWIGGY_API_KEY,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    }
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            SMS_LOGIN_URL, json=payload, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            j = await r.json(content_type=None)
-    data = j.get("data") or {}
-    token = data.get("access_token") or data.get("token")
-    return token
-
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -624,7 +577,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         phone = "+" + digits
         try:
-            device_id = await swiggy_send_otp(phone)
+            device_id = swiggy_send_otp(phone)
         except Exception:
             del PENDING_LOGIN[chat.id]
             await update.message.reply_text(
@@ -644,7 +597,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid OTP. Try again.")
             return
         try:
-            token = await swiggy_verify_otp(state["phone"], otp, state["device_id"])
+            token = swiggy_verify_otp(state["phone"], otp, state["device_id"])
         except Exception:
             await update.message.reply_text("❌ OTP verification failed. Try again.")
             return
@@ -673,7 +626,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu(),
         )
 
-
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -687,7 +639,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if q.data == "collect":
-        await start_collection(update, context, q.message)
+        accts = get_accounts(user_id, include_invalid=False)
+        if not accts:
+            await q.edit_message_text(
+                "📭 No accounts added. Use /add first.", reply_markup=main_menu()
+            )
+            return
+        row = get_user(user_id)
+        if row["points_balance"] < POINTS_PER_COLLECTION:
+            await q.edit_message_text(
+                f"🚫 Not enough points!\n\nYou need {POINTS_PER_COLLECTION} point to collect. "
+                "Get points via /refer (2 pts per friend).",
+                reply_markup=main_menu()
+            )
+            return
+        msg = await q.edit_message_text(
+            f"⏳ Collecting from {len(accts)} account(s)..."
+        )
+        threading.Thread(
+            target=run_collection_sync,
+            args=(user_id, q.message.chat_id, msg.message_id, context)
+        ).start()
 
     elif q.data == "accounts":
         accts = get_accounts(user_id)
@@ -771,7 +743,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🏠 Main Menu", reply_markup=main_menu()
         )
 
-
+# ===================== MAIN =====================
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
@@ -784,9 +756,10 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    logger.info("Swiggy Buzz Auto-Collector bot started")
+    logger.info("🤖 Swiggy Buzz Auto-Collector Bot started")
+    logger.info(f"👑 Channel: {CHANNEL_USERNAME}")
+    logger.info("⚡ Made by @viediet")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
