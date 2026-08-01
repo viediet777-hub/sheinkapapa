@@ -3,11 +3,12 @@
 
 """
 SWIGGY BUZZ AUTO-COLLECTOR BOT
-Complete Single Script Version
+Complete Single Script - Railway Ready
 Made by @viediet
 """
 
 import os
+import sys
 import json
 import time
 import re
@@ -17,6 +18,7 @@ import asyncio
 import logging
 import html
 import uuid
+import requests
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -30,12 +32,26 @@ from telegram.ext import (
     filters,
 )
 
-# ==================== CONFIG ====================
-BOT_TOKEN = "8714473259:AAF3PCTX82kjhMvXDcPuqTl8qGgZvU_S5Qo"
-ADMIN_IDS = [1364476174]
-DB_PATH = "swiggy_buzz.db"
-MAX_EARN_PER_ACCOUNT = 1000
-REQUEST_DELAY = 0.8
+# ==================== CONFIG (ENV VARIABLES) ====================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    print("❌ BOT_TOKEN environment variable required!")
+    sys.exit(1)
+
+ADMIN_IDS = []
+admin_ids_str = os.getenv("ADMIN_IDS", "")
+if admin_ids_str:
+    for x in admin_ids_str.split(","):
+        try:
+            ADMIN_IDS.append(int(x.strip()))
+        except:
+            pass
+if not ADMIN_IDS:
+    ADMIN_IDS = [1364476174]
+
+DB_PATH = os.getenv("DB_PATH", "swiggy_buzz.db")
+MAX_EARN_PER_ACCOUNT = float(os.getenv("MAX_EARN_PER_ACCOUNT", "1000"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.8"))
 BRAND = "⚡ Made by @viediet"
 
 BASE_HEADERS = {
@@ -295,10 +311,6 @@ class SwiggyClient:
         return headers
 
     def send_otp(self, phone):
-        try:
-            import requests
-        except:
-            pass
         resp = self.session.get(f"{OTP_URL}?mobile={phone}", headers=self._headers(), timeout=30)
         if resp.status_code != 200:
             return {"status": "error", "message": f"HTTP {resp.status_code}"}
