@@ -1,4 +1,2 @@
-telebot==0.0.5
-requests==2.31.0
-curl_cffi==0.5.10
-python-telegram-bot==20.3
+python-telegram-bot>=21.0,<22
+requests>=2.31
