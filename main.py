@@ -226,6 +226,41 @@ CAMPAIGN_ID_RE = re.compile(r"buzzstreaks/([^/?#\s]+)")
 FALLBACK_CAMPAIGN_RE = re.compile(r"([A-Za-z0-9]{4,}_[A-Za-z0-9]{3,})")
 REWARD_KEYS = ("amount", "rewardvalue", "reward_amount", "points", "earned", "cashback")
 
+PHONE_RE = re.compile(r"^\d{10}$")
+
+
+def normalize_phone(raw):
+    """Clean any raw input down to a plain 10-digit Indian mobile number.
+
+    Removes spaces, dashes, parentheses and leading country codes
+    (+91 / 91 / 0) so Swiggy always receives exactly 10 digits.
+    Returns None if the result is not a valid 10-digit number.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    elif len(digits) > 10:
+        digits = digits[-10:]
+    if not PHONE_RE.match(digits) or digits[0] not in ("6", "7", "8", "9"):
+        return None
+    return digits
+
+
+def api_status(data):
+    """Extract (statusCode, statusMessage) from an API response JSON."""
+    if not isinstance(data, dict):
+        return None, ""
+    code = data.get("statusCode", data.get("code"))
+    msg = (
+        data.get("statusMessage")
+        or data.get("message")
+        or data.get("errorMessage")
+        or ""
+    )
+    return code, msg
+
 
 class ApiError(Exception):
     def __init__(self, message, data=None):
@@ -368,13 +403,25 @@ class SwiggyClient:
         return headers
 
     def send_otp(self, phone):
-        resp = self.session.get(f"{OTP_URL}?mobile={phone}", headers=self._headers(), timeout=30)
+        phone = normalize_phone(phone)
+        if not phone:
+            return {"status": "error", "message": "Invalid phone number (must be 10 digits)"}
+        url = f"{OTP_URL}?mobile={phone}"
+        log.info("[DEBUG] Sending OTP for phone=%s device=%s url=%s", phone, self.device_id, url)
+        resp = self.session.get(url, headers=self._headers(), timeout=30)
         if resp.status_code != 200:
             return {"status": "error", "message": f"HTTP {resp.status_code}"}
         try:
             data = resp.json()
         except ValueError:
             return {"status": "error", "message": "Invalid response from server"}
+        log.info("[DEBUG] OTP send response for phone=%s: %s", phone, json.dumps(data)[:800])
+        code, msg = api_status(data)
+        if code == 999 or (code is not None and not is_success(data)):
+            return {
+                "status": "error",
+                "message": f"{msg or 'Request failed'} (statusCode {code})",
+            }
         if "captcha" in json.dumps(data).lower():
             return {"status": "captcha", "message": "OTP blocked by captcha. Try again later or from a fresh device."}
         if not isinstance(data, dict) or data.get("errorCode") or data.get("errorMessage"):
@@ -382,6 +429,10 @@ class SwiggyClient:
         return {"status": "ok", "data": data}
 
     def verify_otp(self, phone, otp):
+        phone = normalize_phone(phone)
+        if not phone:
+            raise ApiError("Invalid phone number (must be 10 digits)")
+        log.info("[DEBUG] Verifying OTP for phone=%s otp=%s", phone, otp)
         body = {
             "cloningSignalsData": {
                 "versionCode": 1795,
@@ -391,16 +442,23 @@ class SwiggyClient:
                 "deviceId": self.device_id,
             },
             "otp": otp,
+            "mobile": phone,
         }
+        url = f"{VERIFY_URL}?otp_source=Sms-manual&mobile={phone}"
         resp = self.session.post(
-            f"{VERIFY_URL}?otp_source=Sms-manual",
+            url,
             headers=self._headers(),
             json=body,
             timeout=30,
         )
         if resp.status_code != 200:
             raise ApiError(f"Login verify returned HTTP {resp.status_code}")
-        return resp.json()
+        data = resp.json()
+        log.info("[DEBUG] Verify response for phone=%s: %s", phone, json.dumps(data)[:800])
+        code, msg = api_status(data)
+        if code is not None and not is_success(data):
+            raise ApiError(f"{msg or 'Verification failed'} (statusCode {code})", data)
+        return data
 
     def _auth_headers(self, account):
         headers = self._headers()
@@ -553,8 +611,9 @@ async def login_start(update, context):
     await answer(
         update,
         "📱 <b>Login to Swiggy Buzz</b>\n\n"
-        "Enter your phone number with country code.\n\n"
-        "Example: <code>919876543210</code>\n\n"
+        "Enter your <b>10-digit</b> mobile number only.\n"
+        "Do NOT add +91 or 91 — just the 10 digits.\n\n"
+        "Example: <code>9876543210</code>\n\n"
         "Send /cancel to abort.",
     )
     return PHONE
@@ -564,13 +623,18 @@ async def phone_received(update, context):
     user_id = tg_id(update)
     if not user_id:
         return ConversationHandler.END
-    phone = (update.message.text or "").strip()
-    if not phone.isdigit() or not (10 <= len(phone) <= 13):
+    raw = (update.message.text or "").strip()
+    phone = normalize_phone(raw)
+    if not phone:
         await update.message.reply_text(
-            "❌ Invalid phone number. Use digits only, e.g. <code>919876543210</code>",
+            "❌ <b>Invalid phone number.</b>\n\n"
+            "Enter your <b>10-digit</b> mobile number only (no +91, no 91, no spaces).\n"
+            "Example: <code>9876543210</code>\n\n"
+            "Try again:",
             parse_mode=ParseMode.HTML,
         )
         return PHONE
+    log.info("[DEBUG] Login flow: cleaned phone %r -> %s", raw, phone)
     client = SwiggyClient()
     try:
         status = await asyncio.to_thread(client.send_otp, phone)
@@ -581,14 +645,24 @@ async def phone_received(update, context):
         )
         return PHONE
     if status.get("status") != "ok":
-        await update.message.reply_text(
-            f"❌ OTP request failed:\n{html.escape(str(status.get('message', 'unknown error'))[:200])}\n\nTry again:",
-            parse_mode=ParseMode.HTML,
-        )
+        msg = str(status.get("message", "unknown error"))
+        log.error("[DEBUG] OTP send failed for phone=%s: %s", phone, msg)
+        if "invalid" in msg.lower() or "999" in msg:
+            await update.message.reply_text(
+                "❌ <b>This mobile number is invalid on Swiggy.</b>\n\n"
+                f"API said: {html.escape(msg[:200])}\n\n"
+                "Check the number and re-enter your correct <b>10-digit</b> number:",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ OTP request failed:\n{html.escape(msg[:200])}\n\nTry again:",
+                parse_mode=ParseMode.HTML,
+            )
         return PHONE
     login_sessions[user_id] = {"phone": phone, "client": client}
     await update.message.reply_text(
-        "✅ <b>OTP sent!</b>\n\nEnter the 6-digit OTP you received on your phone:",
+        f"✅ <b>OTP sent to +91 {phone}!</b>\n\nEnter the 6-digit OTP you received:",
         parse_mode=ParseMode.HTML,
     )
     return OTP
@@ -611,6 +685,25 @@ async def otp_received(update, context):
         log.info(f"Verifying OTP: {otp} for phone: {session['phone']}")
         data = await asyncio.to_thread(client.verify_otp, session["phone"], otp)
         log.info(f"Verify response: {json.dumps(data)[:500]}")
+    except ApiError as exc:
+        err_msg = str(exc)
+        log.error(f"OTP verification API error for phone={session['phone']}: {err_msg}")
+        if "invalid" in err_msg.lower() or "999" in err_msg:
+            login_sessions.pop(user_id, None)
+            await update.message.reply_text(
+                "❌ <b>This mobile number is invalid on Swiggy.</b>\n\n"
+                f"API response: {html.escape(err_msg[:200])}\n\n"
+                "Tap 🔐 Login Account and re-enter your correct <b>10-digit</b> "
+                "number (no +91, no 91).",
+                reply_markup=main_menu(update),
+                parse_mode=ParseMode.HTML,
+            )
+            return ConversationHandler.END
+        await update.message.reply_text(
+            f"❌ OTP verification failed: {html.escape(err_msg[:200])}\n\nTry again:",
+            parse_mode=ParseMode.HTML,
+        )
+        return OTP
     except Exception as exc:
         log.error(f"OTP verification error: {exc}")
         await update.message.reply_text(
@@ -877,7 +970,7 @@ async def help_menu(update):
     text = (
         "<b>🤖 How to use Swiggy Buzz Auto-Collector</b>\n\n"
         "1️⃣ Tap <b>🔐 Login Account</b>\n"
-        "2️⃣ Enter your phone number with country code\n"
+        "2️⃣ Enter your <b>10-digit</b> phone number (no +91, no 91)\n"
         "3️⃣ Enter the OTP you receive\n"
         "4️⃣ Buzz rewards are collected automatically\n\n"
         "💰 Opening a link + buzz-back = ₹2-10 per link\n"
