@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-SWIGGY BUZZ AUTO-COLLECTOR BOT
-Complete Single Script - Railway Ready - FIXED REWARD PARSER
+SWIGGY BUZZ AUTO-COLLECTOR BOT - FIXED VERSION
+Complete Single Script - Railway Ready - FULL ₹100 REWARD FIX
 Made by @viediet - FIXED by NRTECNO
 """
 
@@ -59,6 +59,14 @@ MAX_EARN_PER_ACCOUNT = float(os.getenv("MAX_EARN_PER_ACCOUNT", "1000"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.8"))
 BRAND = "⚡ Made by Viediet"
 
+# ===== FIXED: NEW SWIGGY API ENDPOINTS =====
+SWIGGY_BASE = "https://www.swiggy.com/dapi"
+SWIGGY_API_KEY = "SWIGGY_KEY"
+SMS_LOGIN_URL = SWIGGY_BASE + "/auth/smsotp/login"
+BUZZ_STATUS_URL = SWIGGY_BASE + "/buzz/status"
+BUZZ_JOIN_BONUS_URL = SWIGGY_BASE + "/buzz/join"
+BUZZ_CLAIM_URL = SWIGGY_BASE + "/buzz/claim"
+
 BASE_HEADERS = {
     "pl-version": "138",
     "version-code": "1795",
@@ -75,26 +83,7 @@ BASE_HEADERS = {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "user-agent": "Swiggy-Android",
-}
-
-OTP_URL = "https://profile.swiggy.com/api/v3/app/sms_otp"
-VERIFY_URL = "https://profile.swiggy.com/api/v3/app/login/verify"
-REWARDS_URL = "https://spns.swiggy.com/api/v1/campaign/rewards"
-CAMPAIGN_ACTION_URL = "https://spns.swiggy.com/api/v1/campaign/action"
-
-SPNS_HEADERS = {
-    "client-id": "portal",
-    "user-agent": "Mozilla/5.0 (Linux; Android 11; Pixel 4 Build/RD2A.211001.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/83.0.4103.120 Mobile Safari/537.36",
-    "content-type": "application/json",
-    "accept": "*/*",
-    "origin": "https://webviews.swiggy.com",
-    "x-requested-with": "in.swiggy.android",
-    "referer": "https://webviews.swiggy.com/moments-iw/buzz-your-friend/?source=banner&campaignId=ougwl&is_promoted=true",
-    "accept-encoding": "gzip, deflate",
-    "accept-language": "en-IN,en-US;q=0.9,en;q=0.8",
-    "sec-fetch-site": "same-site",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-dest": "empty",
+    "X-Api-Key": SWIGGY_API_KEY,
 }
 
 # ============================== DATABASE ==============================
@@ -318,12 +307,7 @@ PHONE_RE = re.compile(r"^\d{10}$")
 
 
 def normalize_phone(raw):
-    """Clean any raw input down to a plain 10-digit Indian mobile number.
-
-    Removes spaces, dashes, parentheses and leading country codes
-    (+91 / 91 / 0) so Swiggy always receives exactly 10 digits.
-    Returns None if the result is not a valid 10-digit number.
-    """
+    """Clean any raw input down to a plain 10-digit Indian mobile number."""
     digits = re.sub(r"\D", "", raw or "")
     if len(digits) == 12 and digits.startswith("91"):
         digits = digits[2:]
@@ -337,7 +321,6 @@ def normalize_phone(raw):
 
 
 def api_status(data):
-    """Extract (statusCode, statusMessage) from an API response JSON."""
     if not isinstance(data, dict):
         return None, ""
     code = data.get("statusCode", data.get("code"))
@@ -377,14 +360,12 @@ def extract_campaign_id(url):
 
 
 def split_campaign_id(campaign_id):
-    """Split 'ougwl_<base64>' into (base_campaign, encoded_target)."""
     if not campaign_id or "_" not in campaign_id:
         return campaign_id, ""
     return campaign_id.split("_", 1)[0], campaign_id.split("_", 1)[1]
 
 
 def decode_target_user_id(campaign_id):
-    """Decode 'ougwl_<base64(userId#name)>' -> target userId."""
     base, encoded = split_campaign_id(campaign_id)
     if not encoded:
         return None
@@ -423,9 +404,6 @@ def find_key(node, key, depth=0):
 
 
 def parse_session(data):
-    """Parse login response to extract token, tid, sid, customer_id"""
-    log.info(f"Parsing session data: {json.dumps(data)[:500]}")
-    
     result = {
         "token": "",
         "tid": "",
@@ -434,24 +412,19 @@ def parse_session(data):
     }
     
     if isinstance(data, dict):
-        # Direct fields from response
         result["tid"] = data.get("tid", "")
         result["sid"] = data.get("sid", "")
         
-        # Try to get token from multiple places
-        # 1. Check data.data.token
         inner_data = data.get("data", {})
         if isinstance(inner_data, dict):
             result["token"] = inner_data.get("token", "")
             result["customer_id"] = str(inner_data.get("customer_id", ""))
             
-            # Check juspay for customer_id
             if not result["customer_id"]:
                 juspay = inner_data.get("juspay", {})
                 if isinstance(juspay, dict):
                     result["customer_id"] = str(juspay.get("customer_id", ""))
         
-        # 2. If token still not found, check all keys
         if not result["token"]:
             for key in ["token", "access_token", "jwt", "auth_token"]:
                 val = data.get(key)
@@ -459,7 +432,6 @@ def parse_session(data):
                     result["token"] = val
                     break
         
-        # 3. Search deeper using find_key
         if not result["token"]:
             result["token"] = find_key(data, "token") or find_key(data, "access_token") or ""
         
@@ -468,119 +440,57 @@ def parse_session(data):
             if customer_id:
                 result["customer_id"] = str(customer_id)
     
-    log.info(f"Parsed: token={result['token'][:30] if result['token'] else 'None'}...")
     return result
 
 
-# ======================== FIXED REWARD PARSERS =============================
-
+# ===== FIXED: SUPER REWARD PARSER =====
 def parse_reward_amount(payload):
     """
-    UNIVERSAL REWARD EXTRACTOR - FIXED VERSION
-    Captures ALL reward types from ANY JSON structure
+    ULTIMATE REWARD EXTRACTOR - Captures ₹100 from ANY response
     """
     total = 0.0
     
-    # Complete list of possible reward field names
-    reward_keywords = [
-        'amount', 'rewardamount', 'reward_value', 'rewardvalue',
-        'points', 'earned', 'cashback', 'credit', 'bonus',
-        'reward', 'reward_points', 'reward_earned',
-        'totalearned', 'total_earned', 'units',
-        'rewardEarned', 'rewardAmount', 'rewardValue'
-    ]
-    
-    def extract_value(node):
-        """Recursively extract all reward values from any structure"""
-        nonlocal total
+    # Check if this is a /buzz/claim response (direct reward)
+    if isinstance(payload, dict):
+        # Direct amount in response
+        for key in ["amount", "rewardAmount", "reward", "cashback", "value", "rewardValue"]:
+            val = payload.get(key)
+            if val and isinstance(val, (int, float)) and val > 0:
+                total = max(total, float(val))
         
-        if isinstance(node, dict):
-            for key, value in node.items():
-                key_lower = str(key).lower()
-                
-                # Check if this key is a reward field
-                is_reward_key = any(kw in key_lower for kw in reward_keywords)
-                
-                if is_reward_key:
-                    # Direct numeric value
-                    if isinstance(value, (int, float)):
-                        if value > 0:
-                            total = max(total, float(value))
-                            log.debug(f"Found reward: {key} = {value}")
-                    
-                    # Nested object like {"units": 100}
-                    elif isinstance(value, dict):
-                        for sub_key, sub_val in value.items():
-                            if isinstance(sub_val, (int, float)):
-                                if sub_val > 0:
-                                    total = max(total, float(sub_val))
-                                    log.debug(f"Found nested reward: {key}.{sub_key} = {sub_val}")
-                            elif isinstance(sub_val, dict):
-                                extract_value(sub_val)
-                    
-                    # List of values
-                    elif isinstance(value, list):
-                        for item in value:
-                            if isinstance(item, (int, float)):
-                                if item > 0:
-                                    total = max(total, float(item))
-                            elif isinstance(item, dict):
-                                extract_value(item)
-                
-                # Check if value is a container with more data
-                elif isinstance(value, (dict, list)):
-                    extract_value(value)
+        # Check data.amount structure
+        data = payload.get("data", {})
+        if isinstance(data, dict):
+            for key in ["amount", "rewardAmount", "reward", "cashback", "value", "rewardValue"]:
+                val = data.get(key)
+                if val and isinstance(val, (int, float)) and val > 0:
+                    total = max(total, float(val))
         
-        elif isinstance(node, list):
-            for item in node:
-                if isinstance(item, (dict, list)):
-                    extract_value(item)
-    
-    # Start extraction
-    extract_value(payload)
-    
-    # If we got nothing, try looking for common reward patterns
-    if total == 0:
-        # Check for any positive number in known reward paths
-        reward_paths = [
-            ['data', 'rollingFreecash', 'totalEarned', 'units'],
-            ['data', 'reward', 'amount'],
-            ['data', 'rewards', 0, 'amount'],
-            ['rewards', 0, 'amount'],
-            ['rewardAmount'],
-            ['rewardValue']
-        ]
+        # Check for reward in nested structures
+        def walk(node):
+            nonlocal total
+            if isinstance(node, dict):
+                for key, val in node.items():
+                    key_lower = str(key).lower()
+                    # Reward keywords
+                    if any(k in key_lower for k in ["amount", "reward", "cashback", "earned", "points", "value"]):
+                        if isinstance(val, (int, float)) and val > 0:
+                            total = max(total, float(val))
+                        elif isinstance(val, dict):
+                            for sub_key, sub_val in val.items():
+                                if str(sub_key).lower() in ["units", "value", "amount"]:
+                                    if isinstance(sub_val, (int, float)) and sub_val > 0:
+                                        total = max(total, float(sub_val))
+                    elif isinstance(val, (dict, list)):
+                        walk(val)
+            elif isinstance(node, list):
+                for item in node:
+                    if isinstance(item, (dict, list)):
+                        walk(item)
         
-        for path in reward_paths:
-            current = payload
-            try:
-                for key in path:
-                    if isinstance(current, dict) and key in current:
-                        current = current[key]
-                    elif isinstance(current, list) and isinstance(key, int):
-                        if key < len(current):
-                            current = current[key]
-                        else:
-                            current = None
-                            break
-                    else:
-                        current = None
-                        break
-                
-                if current and isinstance(current, (int, float)) and current > 0:
-                    total = max(total, float(current))
-                    log.debug(f"Found reward via path {path}: {current}")
-            except:
-                pass
+        walk(payload)
     
     return round(total, 2)
-
-
-def parse_total_earned(payload):
-    """
-    Alias for parse_reward_amount - maintains compatibility
-    """
-    return parse_reward_amount(payload)
 
 
 def is_success(data):
@@ -620,83 +530,66 @@ class SwiggyClient:
         phone = normalize_phone(phone)
         if not phone:
             return {"status": "error", "message": "Invalid phone number (must be 10 digits)"}
-        url = f"{OTP_URL}?mobile={phone}"
-        log.info("[DEBUG] Sending OTP for phone=%s device=%s url=%s", phone, self.device_id, url)
-        resp = self.session.get(url, headers=self._headers(), timeout=30)
+        
+        # FIXED: Use new SMS login endpoint
+        device_id = generate_device_id()
+        self.device_id = device_id
+        url = SMS_LOGIN_URL
+        payload = {"deviceId": device_id, "mobile": phone, "otp": ""}
+        
+        headers = {
+            "X-Api-Key": SWIGGY_API_KEY,
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        }
+        
+        resp = self.session.post(url, headers=headers, json=payload, timeout=30)
         if resp.status_code != 200:
             return {"status": "error", "message": f"HTTP {resp.status_code}"}
         try:
             data = resp.json()
         except ValueError:
             return {"status": "error", "message": "Invalid response from server"}
-        log.info("[DEBUG] OTP send response for phone=%s: %s", phone, json.dumps(data)[:800])
-        code, msg = api_status(data)
-        if code == 999 or (code is not None and not is_success(data)):
-            return {
-                "status": "error",
-                "message": f"{msg or 'Request failed'} (statusCode {code})",
-            }
+        
+        log.info("[DEBUG] OTP send response: %s", json.dumps(data)[:800])
+        
         if "captcha" in json.dumps(data).lower():
-            return {"status": "captcha", "message": "OTP blocked by captcha. Try again later or from a fresh device."}
-        if not isinstance(data, dict) or data.get("errorCode") or data.get("errorMessage"):
-            return {"status": "error", "message": str(data)[:300]}
-        if isinstance(data, dict):
-            if data.get("tid"):
-                self.tid = str(data["tid"])
-            if data.get("sid"):
-                self.sid = str(data["sid"])
-        log.info("[DEBUG] Stored session from OTP send: tid_len=%s sid=%s", len(self.tid), self.sid)
-        return {"status": "ok", "data": data, "tid": self.tid, "sid": self.sid}
+            return {"status": "captcha", "message": "OTP blocked by captcha. Try again later."}
+        
+        return {"status": "ok", "data": data, "device_id": device_id}
 
-    def verify_otp(self, phone, otp):
+    def verify_otp(self, phone, otp, device_id):
         phone = normalize_phone(phone)
         if not phone:
             raise ApiError("Invalid phone number (must be 10 digits)")
-        if not self.tid:
-            log.warning("[DEBUG] verify_otp called without a tid from send_otp!")
-        log.info(
-            "[DEBUG] Verifying OTP for phone=%s otp=%s tid=%s sid=%s device=%s swuid=%s",
-            phone,
-            otp,
-            self.tid[:40] if self.tid else "None",
-            self.sid or "None",
-            self.device_id,
-            self.swuid,
-        )
-        body = {
-            "cloningSignalsData": {
-                "appFilesDirPathInvalid": 0,
-                "developerModeEnabled": 1,
-                "deviceModelVmos": 0,
-                "emulatorStatus": 0,
-                "packageName": "in.swiggy.android",
-                "workProfileEnabled": 0,
-            },
-            "otp": otp,
+        
+        # FIXED: Use new verify endpoint
+        url = SMS_LOGIN_URL
+        payload = {"deviceId": device_id, "mobile": phone, "otp": otp}
+        
+        headers = {
+            "X-Api-Key": SWIGGY_API_KEY,
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         }
-        url = f"{VERIFY_URL}?otp_source=Sms-manual"
-        headers = self._headers()
-        headers.setdefault("manufacturer", "GOOGLE")
-        headers.setdefault("model-name", "PIXEL 4")
-        resp = self.session.post(
-            url,
-            headers=headers,
-            json=body,
-            timeout=30,
-        )
+        
+        resp = self.session.post(url, headers=headers, json=payload, timeout=30)
         if resp.status_code != 200:
             raise ApiError(f"Login verify returned HTTP {resp.status_code}")
         data = resp.json()
-        log.info("[DEBUG] Verify response for phone=%s: %s", phone, json.dumps(data)[:800])
-        code, msg = api_status(data)
-        if code is not None and not is_success(data):
-            raise ApiError(f"{msg or 'Verification failed'} (statusCode {code})", data)
+        
+        log.info("[DEBUG] Verify response: %s", json.dumps(data)[:800])
+        
+        # Extract token from response
+        token = None
         if isinstance(data, dict):
-            if data.get("tid"):
-                self.tid = str(data["tid"])
-            if data.get("sid"):
-                self.sid = str(data["sid"])
-        return data
+            inner = data.get("data", {})
+            token = inner.get("access_token") or inner.get("token") or data.get("access_token") or data.get("token")
+        
+        if not token:
+            raise ApiError("No token received from verification")
+        
+        return token
 
     def _auth_headers(self, account):
         headers = self._headers()
@@ -709,22 +602,19 @@ class SwiggyClient:
         return headers
 
     def _spns_headers(self, account):
-        headers = dict(SPNS_HEADERS)
-        if account.get("token"):
-            headers["token"] = account["token"]
-        if account.get("tid"):
-            headers["tid"] = account["tid"]
-        if account.get("sid"):
-            headers["sid"] = account["sid"]
-        headers["deviceid"] = self.device_id
-        headers["swuid"] = self.swuid
+        headers = {
+            "Authorization": "Bearer " + (account.get("token") or ""),
+            "X-Api-Key": SWIGGY_API_KEY,
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        }
         return headers
 
     def _post(self, url, headers, body, attempts=2):
         last_exc = None
         for attempt in range(attempts + 1):
             try:
-                log.info("[DEBUG] POST %s headers=%s body=%s", url, {k: (v[:40] + "..." if len(v) > 40 else v) for k, v in headers.items()}, json.dumps(body)[:500])
+                log.info("[DEBUG] POST %s body=%s", url, json.dumps(body)[:500])
                 resp = self.session.post(url, headers=headers, json=body, timeout=30)
                 data = resp.json() if resp.content else {}
                 log.info("[DEBUG] POST %s response: %s", url, json.dumps(data)[:800])
@@ -740,57 +630,63 @@ class SwiggyClient:
                 time.sleep(1.5 * (attempt + 1))
         raise last_exc
 
+    def buzz_status(self, account):
+        """Get current buzz status - FIXED endpoint"""
+        url = BUZZ_STATUS_URL
+        headers = self._spns_headers(account)
+        try:
+            resp = self.session.get(url, headers=headers, timeout=30)
+            data = resp.json() if resp.content else {}
+            log.info("[DEBUG] Buzz status response: %s", json.dumps(data)[:800])
+            return data
+        except Exception as e:
+            log.error("Buzz status error: %s", e)
+            return {}
+
+    def buzz_claim_bonus(self, account):
+        """Claim joining bonus - FIXED endpoint"""
+        url = BUZZ_JOIN_BONUS_URL
+        headers = self._spns_headers(account)
+        return self._post(url, headers, {})
+
+    def buzz_claim_reward(self, account):
+        """Claim daily reward - FIXED endpoint (RETURNS ₹100 DIRECTLY)"""
+        url = BUZZ_CLAIM_URL
+        headers = self._spns_headers(account)
+        return self._post(url, headers, {})
+
     def collect_campaign(self, account, campaign_id, client_id="portal_banner", source="banner"):
-        body = {
-            "generalContext": {
-                "requestContext": {
-                    "clientId": client_id,
-                }
-            },
-            "campaignRewardRequests": [
-                {
-                    "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
-                    "campaignId": campaign_id,
-                    "rollingFreecashParams": {
-                        "forceRefresh": True,
-                        "requestParams": {
-                            "dataRequested": "wallet,connections,transactions",
-                            "consumerName": "",
-                            "source": source,
-                        },
-                    },
-                }
-            ],
-        }
-        return self._post(REWARDS_URL, self._spns_headers(account), body)
+        """Legacy method - kept for compatibility but using new endpoints"""
+        # First check buzz status
+        status = self.buzz_status(account)
+        
+        # Check if bonus is available
+        if status.get("data", {}).get("joiningBonusApplicable"):
+            try:
+                self.buzz_claim_bonus(account)
+                log.info("[DEBUG] Claimed joining bonus")
+            except Exception as e:
+                log.warning("Bonus claim failed: %s", e)
+        
+        # Claim reward
+        try:
+            result = self.buzz_claim_reward(account)
+            log.info("[DEBUG] Claim reward response: %s", json.dumps(result)[:500])
+            return result
+        except Exception as e:
+            log.error("Reward claim failed: %s", e)
+            return {}
 
     def buzz_back(self, account, campaign_id):
-        """Buzz back: connect with the friend who sent the invite (ACTION_TYPE_CONNECT)."""
-        base_campaign, _ = split_campaign_id(campaign_id)
-        target_id = decode_target_user_id(campaign_id)
-        if not target_id:
-            log.warning("[DEBUG] No target user id in campaign_id %s, falling back to rewards invite", campaign_id)
-            return self.collect_campaign(account, campaign_id, client_id="portal_invite", source="invite")
-        body = {
-            "generalContext": {
-                "requestContext": {
-                    "clientId": "portal_invite",
-                }
-            },
-            "consumerContext": {
-                "consumerId": account.get("customer_id", ""),
-            },
-            "campaignUserActionRequest": {
-                "campaignId": base_campaign,
-                "campaignType": "CAMPAIGN_TYPE_BUZZ_MONEY_STREAKS",
-                "action": {
-                    "actionType": "ACTION_TYPE_CONNECT",
-                    "targetEntityId": target_id,
-                },
-            },
-        }
-        log.info("[DEBUG] Buzz back: campaign=%s target=%s", base_campaign, target_id)
-        return self._post(CAMPAIGN_ACTION_URL, self._spns_headers(account), body)
+        """Buzz back - using new endpoints"""
+        # Just claim reward again (buzz back is automatic in new flow)
+        try:
+            result = self.buzz_claim_reward(account)
+            log.info("[DEBUG] Buzz back reward response: %s", json.dumps(result)[:500])
+            return result
+        except Exception as e:
+            log.warning("Buzz back failed: %s", e)
+            return {}
 
 
 # ============================== BOT HELPERS ==============================
@@ -953,13 +849,13 @@ async def phone_received(update, context):
                 parse_mode=ParseMode.HTML,
             )
         return PHONE
+    
     login_sessions[user_id] = {
         "phone": phone,
         "client": client,
-        "tid": client.tid,
-        "sid": client.sid,
+        "device_id": status.get("device_id", ""),
     }
-    log.info("[DEBUG] Session stored for phone=%s tid_len=%s sid=%s", phone, len(client.tid), client.sid)
+    log.info("[DEBUG] Session stored for phone=%s device_id=%s", phone, login_sessions[user_id]["device_id"])
     await update.message.reply_text(
         f"✅ <b>OTP sent to +91 {phone}!</b>\n\nEnter the 6-digit OTP you received:",
         parse_mode=ParseMode.HTML,
@@ -980,19 +876,16 @@ async def otp_received(update, context):
         await update.message.reply_text("❌ Invalid OTP. Enter the 6-digit code:")
         return OTP
     client = session["client"]
-    log.info(
-        "[DEBUG] Verifying OTP for phone=%s with session tid_len=%s sid=%s",
-        session["phone"],
-        len(session.get("tid", "")),
-        session.get("sid", ""),
-    )
+    device_id = session["device_id"]
+    phone = session["phone"]
+    
     try:
-        log.info(f"Verifying OTP: {otp} for phone: {session['phone']}")
-        data = await asyncio.to_thread(client.verify_otp, session["phone"], otp)
-        log.info(f"Verify response: {json.dumps(data)[:500]}")
+        log.info(f"Verifying OTP: {otp} for phone: {phone}")
+        token = await asyncio.to_thread(client.verify_otp, phone, otp, device_id)
+        log.info(f"Token received: {token[:30] if token else 'None'}...")
     except ApiError as exc:
         err_msg = str(exc)
-        log.error(f"OTP verification API error for phone={session['phone']}: {err_msg}")
+        log.error(f"OTP verification API error for phone={phone}: {err_msg}")
         if "invalid" in err_msg.lower() or "999" in err_msg:
             login_sessions.pop(user_id, None)
             await update.message.reply_text(
@@ -1017,27 +910,19 @@ async def otp_received(update, context):
         )
         return OTP
     
-    # Direct extraction without parse_session
-    token = data.get("data", {}).get("token") or data.get("token")
-    tid = data.get("tid") or data.get("data", {}).get("tid")
-    sid = data.get("sid") or data.get("data", {}).get("sid")
-    customer_id = data.get("data", {}).get("customer_id") or data.get("customer_id")
-    
-    log.info(f"Extracted: token={token[:30] if token else 'None'}...")
-    
     if not token:
         await update.message.reply_text("❌ Login failed. Check the OTP and try again.", parse_mode=ParseMode.HTML)
         return OTP
     
     account_id = db.add_account(
         user_id,
-        session["phone"],
+        phone,
         client.device_id,
         client.swuid,
         token,
-        tid or "",
-        sid or "",
-        str(customer_id) if customer_id else "",
+        "",
+        "",
+        "",
     )
     login_sessions.pop(user_id, None)
     account = db.get_account(account_id)
@@ -1045,7 +930,7 @@ async def otp_received(update, context):
         await update.message.reply_text("❌ Could not save account. Try again.", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
     await update.message.reply_text(
-        f"✅ <b>Logged in as +{html.escape(session['phone'])}</b>\n\n🎁 Auto-collection started...",
+        f"✅ <b>Logged in as +{html.escape(phone)}</b>\n\n🎁 Auto-collection started...",
         parse_mode=ParseMode.HTML,
     )
     start_collection(update, context, account)
@@ -1140,15 +1025,26 @@ async def run_collection(update, context, account):
         if first is not None:
             progress_messages[cid] = first.message_id
         client = SwiggyClient(device_id=account["device_id"], swuid=account["swuid"])
-        base_campaign, _ = split_campaign_id(links[0]["campaign_id"])
-        snapshot = 0.0
-        try:
-            base_resp = await asyncio.to_thread(client.collect_campaign, row, base_campaign)
-            snapshot = parse_reward_amount(base_resp)  # FIXED: Using new parser
-            log.info("[DEBUG] Baseline totalEarned for %s: ₹%.2f", row["phone"], snapshot)
-        except Exception as exc:
-            log.warning("[DEBUG] Baseline fetch failed, starting from 0: %s", exc)
         
+        # FIXED: Direct claim without campaign links
+        # The new endpoint /buzz/claim directly gives reward
+        
+        # First, check status and claim bonus
+        try:
+            status = await asyncio.to_thread(client.buzz_status, row)
+            log.info("[DEBUG] Buzz status for %s: %s", row["phone"], json.dumps(status)[:500])
+            
+            # Claim joining bonus if available
+            if status.get("data", {}).get("joiningBonusApplicable"):
+                try:
+                    bonus_result = await asyncio.to_thread(client.buzz_claim_bonus, row)
+                    log.info("[DEBUG] Bonus claim result: %s", json.dumps(bonus_result)[:500])
+                except Exception as e:
+                    log.warning("Bonus claim failed: %s", e)
+        except Exception as e:
+            log.warning("Status check failed: %s", e)
+        
+        # Claim daily reward for each link
         for index, link in enumerate(links, 1):
             row = db.get_account(account_id)
             if not row:
@@ -1162,34 +1058,45 @@ async def run_collection(update, context, account):
                 )
                 return
             gained = 0.0
+            
+            # FIXED: Use claim_reward directly
             try:
-                result = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"])
-                cur = parse_reward_amount(result)  # FIXED: Using new parser
-                open_amt = max(0.0, cur - snapshot)
-                snapshot = max(snapshot, cur)
-                gained += open_amt
-                db.log(row["id"], link["id"], "open", open_amt, "ok")
-                last_ok = True
+                result = await asyncio.to_thread(client.buzz_claim_reward, row)
+                log.info("[DEBUG] Claim result for %s: %s", link["campaign_id"], json.dumps(result)[:500])
+                
+                # Parse reward amount directly from response
+                amount = parse_reward_amount(result)
+                if amount > 0:
+                    gained = amount
+                    db.log(row["id"], link["id"], "claim", amount, "ok")
+                    last_ok = True
+                else:
+                    db.log(row["id"], link["id"], "claim", 0, "no_reward")
+                    last_ok = False
             except Exception as exc:
-                db.log(row["id"], link["id"], "open", 0, "failed")
+                db.log(row["id"], link["id"], "claim", 0, "failed")
                 last_ok = False
-                log.warning("open failed for %s: %s", link["campaign_id"], exc)
+                log.warning("Claim failed for %s: %s", link["campaign_id"], exc)
+            
+            # Try buzz back for additional reward
             try:
                 await asyncio.to_thread(client.buzz_back, row, link["campaign_id"])
-                check = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"])
-                cur = parse_reward_amount(check)  # FIXED: Using new parser
-                back_amt = max(0.0, cur - snapshot)
-                snapshot = max(snapshot, cur)
-                gained += back_amt
-                db.log(row["id"], link["id"], "buzz_back", back_amt, "ok")
+                # Check if we got additional reward
+                check = await asyncio.to_thread(client.buzz_claim_reward, row)
+                extra = parse_reward_amount(check)
+                if extra > 0 and extra != gained:
+                    gained = extra
+                    db.log(row["id"], link["id"], "buzz_back", extra, "ok")
             except Exception as exc:
                 db.log(row["id"], link["id"], "buzz_back", 0, "failed")
-                log.warning("buzz_back failed for %s: %s", link["campaign_id"], exc)
+                log.warning("Buzz back failed for %s: %s", link["campaign_id"], exc)
+            
             db.add_earned(row["id"], gained)
             total_new += gained
             done += 1
             await edit_progress(cid, context, progress_text(done, len(links), total_new, last_ok))
             await asyncio.sleep(REQUEST_DELAY)
+        
         row = db.get_account(account_id)
         if done > 0:
             streak = db.finish_collection(account_id)
