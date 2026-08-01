@@ -271,7 +271,7 @@ def find_key(node, key, depth=0):
 
 def parse_session(data):
     """Parse login response to extract token, tid, sid, customer_id"""
-    log.info("Parsing session data...")
+    log.info(f"Parsing session data: {json.dumps(data)[:500]}")
     
     result = {
         "token": "",
@@ -285,22 +285,30 @@ def parse_session(data):
         result["tid"] = data.get("tid", "")
         result["sid"] = data.get("sid", "")
         
-        # Get data from inner data object
+        # Try to get token from multiple places
+        # 1. Check data.data.token
         inner_data = data.get("data", {})
         if isinstance(inner_data, dict):
-            # Token is directly in data
             result["token"] = inner_data.get("token", "")
             result["customer_id"] = str(inner_data.get("customer_id", ""))
             
-            # Also check juspay for customer_id
+            # Check juspay for customer_id
             if not result["customer_id"]:
                 juspay = inner_data.get("juspay", {})
                 if isinstance(juspay, dict):
                     result["customer_id"] = str(juspay.get("customer_id", ""))
         
-        # If token still not found, search deeper
+        # 2. If token still not found, check all keys
         if not result["token"]:
-            result["token"] = find_key(data, "token") or ""
+            for key in ["token", "access_token", "jwt", "auth_token"]:
+                val = data.get(key)
+                if val and isinstance(val, str) and len(val) > 10:
+                    result["token"] = val
+                    break
+        
+        # 3. Search deeper using find_key
+        if not result["token"]:
+            result["token"] = find_key(data, "token") or find_key(data, "access_token") or ""
         
         if not result["customer_id"]:
             customer_id = find_key(data, "customer_id")
@@ -602,7 +610,7 @@ async def otp_received(update, context):
     try:
         log.info(f"Verifying OTP: {otp} for phone: {session['phone']}")
         data = await asyncio.to_thread(client.verify_otp, session["phone"], otp)
-        log.info(f"Verify response received")
+        log.info(f"Verify response: {json.dumps(data)[:500]}")
     except Exception as exc:
         log.error(f"OTP verification error: {exc}")
         await update.message.reply_text(
@@ -611,10 +619,15 @@ async def otp_received(update, context):
         )
         return OTP
     
-    login_info = parse_session(data)
-    log.info(f"Parsed login info: token={login_info['token'][:30] if login_info['token'] else 'None'}...")
+    # Direct extraction without parse_session
+    token = data.get("data", {}).get("token") or data.get("token")
+    tid = data.get("tid") or data.get("data", {}).get("tid")
+    sid = data.get("sid") or data.get("data", {}).get("sid")
+    customer_id = data.get("data", {}).get("customer_id") or data.get("customer_id")
     
-    if not login_info.get("token"):
+    log.info(f"Extracted: token={token[:30] if token else 'None'}...")
+    
+    if not token:
         await update.message.reply_text("❌ Login failed. Check the OTP and try again.", parse_mode=ParseMode.HTML)
         return OTP
     
@@ -623,10 +636,10 @@ async def otp_received(update, context):
         session["phone"],
         client.device_id,
         client.swuid,
-        login_info["token"],
-        login_info["tid"],
-        login_info["sid"],
-        login_info["customer_id"],
+        token,
+        tid or "",
+        sid or "",
+        str(customer_id) if customer_id else "",
     )
     login_sessions.pop(user_id, None)
     account = db.get_account(account_id)
