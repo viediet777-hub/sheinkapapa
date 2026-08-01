@@ -56,6 +56,7 @@ if not ADMIN_IDS:
 
 DB_PATH = os.getenv("DB_PATH", "swiggy_buzz.db")
 MAX_EARN_PER_ACCOUNT = float(os.getenv("MAX_EARN_PER_ACCOUNT", "1000"))
+MAX_CONNECTIONS = int(os.getenv("MAX_CONNECTIONS", "5"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.8"))
 BRAND = "⚡ Made by Viediet"
 
@@ -402,6 +403,21 @@ def decode_target_user_id(campaign_id):
     if "#" in decoded:
         return decoded.split("#", 1)[0]
     return decoded if decoded.isdigit() else None
+
+
+def parse_connections(payload):
+    """Extract connected user ids from a rewards response.
+
+    Response shape (from captured data):
+      campaignRewardResponses[].connections.connections[] -> {connectedUserId, ...}
+    """
+    node = find_key(payload, "connections")
+    ids = []
+    if isinstance(node, dict):
+        for item in node.get("connections") or []:
+            if isinstance(item, dict) and item.get("connectedUserId"):
+                ids.append(str(item["connectedUserId"]))
+    return ids
 
 
 def find_key(node, key, depth=0):
@@ -1087,10 +1103,15 @@ async def run_collection(update, context, account):
         client = SwiggyClient(device_id=account["device_id"], swuid=account["swuid"])
         base_campaign, _ = split_campaign_id(links[0]["campaign_id"])
         snapshot = 0.0
+        known_connections = []
         try:
             base_resp = await asyncio.to_thread(client.collect_campaign, row, base_campaign)
             snapshot = parse_total_earned(base_resp)
-            log.info("[DEBUG] Baseline totalEarned for %s: ₹%.2f", row["phone"], snapshot)
+            known_connections = parse_connections(base_resp)
+            log.info(
+                "[DEBUG] Baseline totalEarned for %s: ₹%.2f | connections: %d/%d",
+                row["phone"], snapshot, len(known_connections), MAX_CONNECTIONS,
+            )
         except Exception as exc:
             log.warning("[DEBUG] Baseline fetch failed, starting from 0: %s", exc)
         for index, link in enumerate(links, 1):
@@ -1118,17 +1139,38 @@ async def run_collection(update, context, account):
                 db.log(row["id"], link["id"], "open", 0, "failed")
                 last_ok = False
                 log.warning("open failed for %s: %s", link["campaign_id"], exc)
-            try:
-                await asyncio.to_thread(client.buzz_back, row, link["campaign_id"])
-                check = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"])
-                cur = parse_total_earned(check)
-                back_amt = max(0.0, cur - snapshot)
-                snapshot = max(snapshot, cur)
-                gained += back_amt
-                db.log(row["id"], link["id"], "buzz_back", back_amt, "ok")
-            except Exception as exc:
-                db.log(row["id"], link["id"], "buzz_back", 0, "failed")
-                log.warning("buzz_back failed for %s: %s", link["campaign_id"], exc)
+            target_id = decode_target_user_id(link["campaign_id"])
+            skip_reason = ""
+            if not target_id:
+                skip_reason = ""
+            elif target_id in known_connections:
+                skip_reason = f"already connected to user {target_id}"
+            elif len(known_connections) >= MAX_CONNECTIONS:
+                skip_reason = f"connection limit reached ({len(known_connections)}/{MAX_CONNECTIONS})"
+            if skip_reason:
+                log.info("[SKIP] Buzz back skipped for %s: %s", link["campaign_id"], skip_reason)
+                db.log(row["id"], link["id"], "buzz_back", 0, "skipped")
+            else:
+                try:
+                    await asyncio.to_thread(client.buzz_back, row, link["campaign_id"])
+                    check = await asyncio.to_thread(client.collect_campaign, row, link["campaign_id"])
+                    cur = parse_total_earned(check)
+                    back_amt = max(0.0, cur - snapshot)
+                    snapshot = max(snapshot, cur)
+                    gained += back_amt
+                    db.log(row["id"], link["id"], "buzz_back", back_amt, "ok")
+                    if target_id:
+                        known_connections.append(target_id)
+                except ApiError as exc:
+                    if "limit" in str(exc).lower():
+                        log.info("[SKIP] Buzz back skipped for %s: %s", link["campaign_id"], exc)
+                        db.log(row["id"], link["id"], "buzz_back", 0, "skipped")
+                    else:
+                        db.log(row["id"], link["id"], "buzz_back", 0, "failed")
+                        log.warning("buzz_back failed for %s: %s", link["campaign_id"], exc)
+                except Exception as exc:
+                    db.log(row["id"], link["id"], "buzz_back", 0, "failed")
+                    log.warning("buzz_back failed for %s: %s", link["campaign_id"], exc)
             db.add_earned(row["id"], gained)
             total_new += gained
             done += 1
