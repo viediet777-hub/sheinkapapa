@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-SWIGGY BUZZ AUTO-COLLECTOR BOT - FIXED VERSION
-Complete Single Script - Railway Ready - FULL ₹100 REWARD FIX
+SWIGGY BUZZ AUTO-COLLECTOR BOT - FIXED OTP
+Complete Single Script - Railway Ready
 Made by @viediet - FIXED by NRTECNO
 """
 
@@ -59,7 +59,7 @@ MAX_EARN_PER_ACCOUNT = float(os.getenv("MAX_EARN_PER_ACCOUNT", "1000"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.8"))
 BRAND = "⚡ Made by Viediet"
 
-# ===== FIXED: NEW SWIGGY API ENDPOINTS =====
+# ===== SWIGGY API ENDPOINTS =====
 SWIGGY_BASE = "https://www.swiggy.com/dapi"
 SWIGGY_API_KEY = "SWIGGY_KEY"
 SMS_LOGIN_URL = SWIGGY_BASE + "/auth/smsotp/login"
@@ -67,46 +67,18 @@ BUZZ_STATUS_URL = SWIGGY_BASE + "/buzz/status"
 BUZZ_JOIN_BONUS_URL = SWIGGY_BASE + "/buzz/join"
 BUZZ_CLAIM_URL = SWIGGY_BASE + "/buzz/claim"
 
-BASE_HEADERS = {
-    "pl-version": "138",
-    "version-code": "1795",
-    "app-version": "4.113.0",
-    "os-version": "11",
-    "latitude": "22.7421633",
-    "longitude": "75.907875",
-    "current-latitude": "22.7421633",
-    "current-longitude": "75.907875",
-    "accessibility_enabled": "false",
-    "x-network-quality": "GOOD",
-    "faw-flags": "1354",
-    "accept": "application/json; charset=utf-8",
-    "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
-    "user-agent": "Swiggy-Android",
-    "X-Api-Key": SWIGGY_API_KEY,
-}
-
 # ============================== DATABASE ==============================
-
 
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-
 IST = timezone(timedelta(hours=5, minutes=30))
-
 
 def today_ist():
     return datetime.now(IST).strftime("%Y-%m-%d")
 
-
 def yesterday_ist():
     return (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
-
-
-def tomorrow_ist():
-    return (datetime.now(IST) + timedelta(days=1)).strftime("%Y-%m-%d")
-
 
 class Database:
     def __init__(self, path=DB_PATH):
@@ -122,11 +94,8 @@ class Database:
                     telegram_id INTEGER NOT NULL,
                     phone TEXT NOT NULL,
                     token TEXT,
-                    tid TEXT,
-                    sid TEXT,
                     device_id TEXT,
                     swuid TEXT,
-                    customer_id TEXT,
                     total_earned REAL DEFAULT 0,
                     active INTEGER DEFAULT 0,
                     created_at TEXT,
@@ -153,19 +122,6 @@ class Database:
                 """
             )
             self._conn.commit()
-            cols = [r[1] for r in self._conn.execute("PRAGMA table_info(accounts)").fetchall()]
-            for col, ddl in (
-                ("last_collection_date", "TEXT DEFAULT ''"),
-                ("streak_days", "INTEGER DEFAULT 0"),
-                ("daily_collected", "INTEGER DEFAULT 0"),
-            ):
-                if col not in cols:
-                    try:
-                        self._conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} {ddl}")
-                        self._conn.commit()
-                        log.info("Migrated accounts table: added column %s", col)
-                    except sqlite3.OperationalError:
-                        pass
 
     def _execute(self, sql, params=()):
         with self._lock:
@@ -173,7 +129,7 @@ class Database:
             self._conn.commit()
             return cur
 
-    def add_account(self, telegram_id, phone, device_id, swuid, token, tid, sid, customer_id):
+    def add_account(self, telegram_id, phone, device_id, swuid, token):
         cur = self._execute(
             "SELECT id FROM accounts WHERE telegram_id = ? AND phone = ?",
             (telegram_id, phone),
@@ -181,15 +137,15 @@ class Database:
         row = cur.fetchone()
         if row:
             self._execute(
-                "UPDATE accounts SET token = ?, tid = ?, sid = ?, device_id = ?, swuid = ?, customer_id = ?, active = 1 WHERE id = ?",
-                (token, tid, sid, device_id, swuid, customer_id, row["id"]),
+                "UPDATE accounts SET token = ?, device_id = ?, swuid = ?, active = 1 WHERE id = ?",
+                (token, device_id, swuid, row["id"]),
             )
             account_id = row["id"]
         else:
             cur = self._execute(
-                "INSERT INTO accounts (telegram_id, phone, token, tid, sid, device_id, swuid, customer_id, active, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
-                (telegram_id, phone, token, tid, sid, device_id, swuid, customer_id, now()),
+                "INSERT INTO accounts (telegram_id, phone, token, device_id, swuid, active, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?)",
+                (telegram_id, phone, token, device_id, swuid, now()),
             )
             account_id = cur.lastrowid
         self._execute("UPDATE accounts SET active = 0 WHERE telegram_id = ? AND id != ?", (telegram_id, account_id))
@@ -233,7 +189,6 @@ class Database:
         return cur.fetchone()["total"]
 
     def finish_collection(self, account_id):
-        """Mark today's collection done and update the daily streak."""
         row = self._execute(
             "SELECT last_collection_date, streak_days FROM accounts WHERE id = ?", (account_id,)
         ).fetchone()
@@ -294,20 +249,15 @@ class Database:
         cur = self._execute("SELECT COUNT(*) AS total FROM buzz_logs")
         return cur.fetchone()["total"]
 
-
 db = Database()
 
 # ============================== SWIGGY API ==============================
 
 CAMPAIGN_ID_RE = re.compile(r"buzzstreaks/([^/?#\s]+)")
 FALLBACK_CAMPAIGN_RE = re.compile(r"([A-Za-z0-9]{4,}_[A-Za-z0-9]{3,})")
-REWARD_KEYS = ("amount", "rewardvalue", "reward_amount", "points", "earned", "cashback")
-
 PHONE_RE = re.compile(r"^\d{10}$")
 
-
 def normalize_phone(raw):
-    """Clean any raw input down to a plain 10-digit Indian mobile number."""
     digits = re.sub(r"\D", "", raw or "")
     if len(digits) == 12 and digits.startswith("91"):
         digits = digits[2:]
@@ -319,33 +269,11 @@ def normalize_phone(raw):
         return None
     return digits
 
-
-def api_status(data):
-    if not isinstance(data, dict):
-        return None, ""
-    code = data.get("statusCode", data.get("code"))
-    msg = (
-        data.get("statusMessage")
-        or data.get("message")
-        or data.get("errorMessage")
-        or ""
-    )
-    return code, msg
-
-
-class ApiError(Exception):
-    def __init__(self, message, data=None):
-        super().__init__(message)
-        self.data = data
-
-
 def generate_device_id():
     return str(uuid.uuid4()).upper()
 
-
 def generate_swuid():
     return "SW-" + uuid.uuid4().hex[:12].upper()
-
 
 def extract_campaign_id(url):
     if not url:
@@ -358,107 +286,28 @@ def extract_campaign_id(url):
         return match.group(1).rstrip("=")
     return None
 
-
 def split_campaign_id(campaign_id):
     if not campaign_id or "_" not in campaign_id:
         return campaign_id, ""
     return campaign_id.split("_", 1)[0], campaign_id.split("_", 1)[1]
 
+class ApiError(Exception):
+    def __init__(self, message, data=None):
+        super().__init__(message)
+        self.data = data
 
-def decode_target_user_id(campaign_id):
-    base, encoded = split_campaign_id(campaign_id)
-    if not encoded:
-        return None
-    padded = encoded + "=" * (-len(encoded) % 4)
-    decoded = ""
-    try:
-        decoded = base64.urlsafe_b64decode(padded).decode("utf-8", "ignore")
-    except Exception:
-        try:
-            decoded = base64.b64decode(padded).decode("utf-8", "ignore")
-        except Exception:
-            return None
-    if not decoded:
-        return None
-    if "#" in decoded:
-        return decoded.split("#", 1)[0]
-    return decoded if decoded.isdigit() else None
-
-
-def find_key(node, key, depth=0):
-    if depth > 10 or not isinstance(node, (dict, list)):
-        return None
-    if isinstance(node, dict):
-        for k, v in node.items():
-            if str(k).lower() == key.lower():
-                return v
-            found = find_key(v, key, depth + 1)
-            if found:
-                return found
-    else:
-        for item in node:
-            found = find_key(item, key, depth + 1)
-            if found:
-                return found
-    return None
-
-
-def parse_session(data):
-    result = {
-        "token": "",
-        "tid": "",
-        "sid": "",
-        "customer_id": "",
-    }
-    
-    if isinstance(data, dict):
-        result["tid"] = data.get("tid", "")
-        result["sid"] = data.get("sid", "")
-        
-        inner_data = data.get("data", {})
-        if isinstance(inner_data, dict):
-            result["token"] = inner_data.get("token", "")
-            result["customer_id"] = str(inner_data.get("customer_id", ""))
-            
-            if not result["customer_id"]:
-                juspay = inner_data.get("juspay", {})
-                if isinstance(juspay, dict):
-                    result["customer_id"] = str(juspay.get("customer_id", ""))
-        
-        if not result["token"]:
-            for key in ["token", "access_token", "jwt", "auth_token"]:
-                val = data.get(key)
-                if val and isinstance(val, str) and len(val) > 10:
-                    result["token"] = val
-                    break
-        
-        if not result["token"]:
-            result["token"] = find_key(data, "token") or find_key(data, "access_token") or ""
-        
-        if not result["customer_id"]:
-            customer_id = find_key(data, "customer_id")
-            if customer_id:
-                result["customer_id"] = str(customer_id)
-    
-    return result
-
-
-# ===== FIXED: SUPER REWARD PARSER =====
 def parse_reward_amount(payload):
-    """
-    ULTIMATE REWARD EXTRACTOR - Captures ₹100 from ANY response
-    """
+    """Extract reward amount from ANY response"""
     total = 0.0
     
-    # Check if this is a /buzz/claim response (direct reward)
     if isinstance(payload, dict):
-        # Direct amount in response
+        # Direct amount
         for key in ["amount", "rewardAmount", "reward", "cashback", "value", "rewardValue"]:
             val = payload.get(key)
             if val and isinstance(val, (int, float)) and val > 0:
                 total = max(total, float(val))
         
-        # Check data.amount structure
+        # data.amount structure
         data = payload.get("data", {})
         if isinstance(data, dict):
             for key in ["amount", "rewardAmount", "reward", "cashback", "value", "rewardValue"]:
@@ -466,13 +315,12 @@ def parse_reward_amount(payload):
                 if val and isinstance(val, (int, float)) and val > 0:
                     total = max(total, float(val))
         
-        # Check for reward in nested structures
+        # Recursive search
         def walk(node):
             nonlocal total
             if isinstance(node, dict):
                 for key, val in node.items():
                     key_lower = str(key).lower()
-                    # Reward keywords
                     if any(k in key_lower for k in ["amount", "reward", "cashback", "earned", "points", "value"]):
                         if isinstance(val, (int, float)) and val > 0:
                             total = max(total, float(val))
@@ -492,46 +340,17 @@ def parse_reward_amount(payload):
     
     return round(total, 2)
 
-
-def is_success(data):
-    if not isinstance(data, dict):
-        return True
-    if data.get("errors"):
-        return False
-    code = data.get("statusCode", data.get("code"))
-    if isinstance(code, int):
-        return code in (0, 200)
-    if isinstance(code, str):
-        return code.lower() in ("success", "ok", "200", "0")
-    return True
-
-
 class SwiggyClient:
     def __init__(self, device_id=None, swuid=None):
         self.device_id = device_id or generate_device_id()
         self.swuid = swuid or generate_swuid()
-        self.tid = ""
-        self.sid = ""
         self.session = requests.Session()
-
-    def _headers(self, extra=None):
-        headers = dict(BASE_HEADERS)
-        headers["deviceid"] = self.device_id
-        headers["swuid"] = self.swuid
-        if self.tid:
-            headers["tid"] = self.tid
-        if self.sid:
-            headers["sid"] = self.sid
-        if extra:
-            headers.update(extra)
-        return headers
 
     def send_otp(self, phone):
         phone = normalize_phone(phone)
         if not phone:
             return {"status": "error", "message": "Invalid phone number (must be 10 digits)"}
         
-        # FIXED: Use new SMS login endpoint
         device_id = generate_device_id()
         self.device_id = device_id
         url = SMS_LOGIN_URL
@@ -544,26 +363,28 @@ class SwiggyClient:
         }
         
         resp = self.session.post(url, headers=headers, json=payload, timeout=30)
-        if resp.status_code != 200:
+        
+        # FIX: HTTP 202 = ACCEPTED (success!)
+        if resp.status_code in [200, 202]:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {"status": "ok", "message": "OTP sent"}
+            
+            log.info("[DEBUG] OTP send response: %s", json.dumps(data)[:800])
+            
+            if "captcha" in json.dumps(data).lower():
+                return {"status": "captcha", "message": "OTP blocked by captcha. Try again later."}
+            
+            return {"status": "ok", "data": data, "device_id": device_id}
+        else:
             return {"status": "error", "message": f"HTTP {resp.status_code}"}
-        try:
-            data = resp.json()
-        except ValueError:
-            return {"status": "error", "message": "Invalid response from server"}
-        
-        log.info("[DEBUG] OTP send response: %s", json.dumps(data)[:800])
-        
-        if "captcha" in json.dumps(data).lower():
-            return {"status": "captcha", "message": "OTP blocked by captcha. Try again later."}
-        
-        return {"status": "ok", "data": data, "device_id": device_id}
 
     def verify_otp(self, phone, otp, device_id):
         phone = normalize_phone(phone)
         if not phone:
             raise ApiError("Invalid phone number (must be 10 digits)")
         
-        # FIXED: Use new verify endpoint
         url = SMS_LOGIN_URL
         payload = {"deviceId": device_id, "mobile": phone, "otp": otp}
         
@@ -574,143 +395,105 @@ class SwiggyClient:
         }
         
         resp = self.session.post(url, headers=headers, json=payload, timeout=30)
-        if resp.status_code != 200:
-            raise ApiError(f"Login verify returned HTTP {resp.status_code}")
-        data = resp.json()
         
+        if resp.status_code not in [200, 202]:
+            raise ApiError(f"Login verify returned HTTP {resp.status_code}")
+        
+        data = resp.json()
         log.info("[DEBUG] Verify response: %s", json.dumps(data)[:800])
         
-        # Extract token from response
         token = None
         if isinstance(data, dict):
             inner = data.get("data", {})
             token = inner.get("access_token") or inner.get("token") or data.get("access_token") or data.get("token")
+            if not token:
+                token = data.get("token")
+            if not token and data.get("statusCode") == 999:
+                raise ApiError("Invalid OTP. Please try again.")
         
         if not token:
             raise ApiError("No token received from verification")
         
         return token
 
-    def _auth_headers(self, account):
-        headers = self._headers()
-        if account.get("token"):
-            headers["token"] = account["token"]
-        if account.get("tid"):
-            headers["tid"] = account["tid"]
-        if account.get("sid"):
-            headers["sid"] = account["sid"]
-        return headers
-
-    def _spns_headers(self, account):
+    def buzz_status(self, account):
+        url = BUZZ_STATUS_URL
         headers = {
             "Authorization": "Bearer " + (account.get("token") or ""),
             "X-Api-Key": SWIGGY_API_KEY,
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         }
-        return headers
-
-    def _post(self, url, headers, body, attempts=2):
-        last_exc = None
-        for attempt in range(attempts + 1):
-            try:
-                log.info("[DEBUG] POST %s body=%s", url, json.dumps(body)[:500])
-                resp = self.session.post(url, headers=headers, json=body, timeout=30)
-                data = resp.json() if resp.content else {}
-                log.info("[DEBUG] POST %s response: %s", url, json.dumps(data)[:800])
-                if not is_success(data):
-                    last_exc = ApiError(f"API error: {json.dumps(data)[:300]}")
-                else:
-                    return data
-            except ApiError:
-                raise
-            except Exception as exc:
-                last_exc = ApiError(f"network error: {exc}")
-            if attempt < attempts:
-                time.sleep(1.5 * (attempt + 1))
-        raise last_exc
-
-    def buzz_status(self, account):
-        """Get current buzz status - FIXED endpoint"""
-        url = BUZZ_STATUS_URL
-        headers = self._spns_headers(account)
         try:
             resp = self.session.get(url, headers=headers, timeout=30)
             data = resp.json() if resp.content else {}
-            log.info("[DEBUG] Buzz status response: %s", json.dumps(data)[:800])
             return data
         except Exception as e:
             log.error("Buzz status error: %s", e)
             return {}
 
     def buzz_claim_bonus(self, account):
-        """Claim joining bonus - FIXED endpoint"""
         url = BUZZ_JOIN_BONUS_URL
-        headers = self._spns_headers(account)
-        return self._post(url, headers, {})
+        headers = {
+            "Authorization": "Bearer " + (account.get("token") or ""),
+            "X-Api-Key": SWIGGY_API_KEY,
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        }
+        resp = self.session.post(url, headers=headers, json={}, timeout=30)
+        return resp.json() if resp.content else {}
 
     def buzz_claim_reward(self, account):
-        """Claim daily reward - FIXED endpoint (RETURNS ₹100 DIRECTLY)"""
         url = BUZZ_CLAIM_URL
-        headers = self._spns_headers(account)
-        return self._post(url, headers, {})
+        headers = {
+            "Authorization": "Bearer " + (account.get("token") or ""),
+            "X-Api-Key": SWIGGY_API_KEY,
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        }
+        resp = self.session.post(url, headers=headers, json={}, timeout=30)
+        return resp.json() if resp.content else {}
 
     def collect_campaign(self, account, campaign_id, client_id="portal_banner", source="banner"):
-        """Legacy method - kept for compatibility but using new endpoints"""
-        # First check buzz status
+        # First check status
         status = self.buzz_status(account)
-        
-        # Check if bonus is available
         if status.get("data", {}).get("joiningBonusApplicable"):
             try:
                 self.buzz_claim_bonus(account)
-                log.info("[DEBUG] Claimed joining bonus")
             except Exception as e:
                 log.warning("Bonus claim failed: %s", e)
         
         # Claim reward
         try:
-            result = self.buzz_claim_reward(account)
-            log.info("[DEBUG] Claim reward response: %s", json.dumps(result)[:500])
-            return result
+            return self.buzz_claim_reward(account)
         except Exception as e:
             log.error("Reward claim failed: %s", e)
             return {}
 
     def buzz_back(self, account, campaign_id):
-        """Buzz back - using new endpoints"""
-        # Just claim reward again (buzz back is automatic in new flow)
         try:
-            result = self.buzz_claim_reward(account)
-            log.info("[DEBUG] Buzz back reward response: %s", json.dumps(result)[:500])
-            return result
+            return self.buzz_claim_reward(account)
         except Exception as e:
             log.warning("Buzz back failed: %s", e)
             return {}
 
-
 # ============================== BOT HELPERS ==============================
 
 PHONE, OTP = range(2)
-
 login_sessions = {}
 progress_messages = {}
 collecting_tasks = {}
-
 
 def tg_id(update):
     user = update.effective_user
     return user.id if user else 0
 
-
 def chat_id(update):
     chat = update.effective_chat
     return chat.id if chat else 0
 
-
 def is_admin(user_id):
     return user_id in ADMIN_IDS
-
 
 def main_menu(update):
     user_id = tg_id(update)
@@ -729,7 +512,6 @@ def main_menu(update):
         rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="btn_admin")])
     return InlineKeyboardMarkup(rows)
 
-
 def admin_menu():
     return InlineKeyboardMarkup([
         [
@@ -744,7 +526,6 @@ def admin_menu():
         [InlineKeyboardButton("⬅️ Back", callback_data="btn_back")],
     ])
 
-
 async def answer(update, text, markup=None):
     query = update.callback_query
     if query is not None:
@@ -758,13 +539,11 @@ async def answer(update, text, markup=None):
     if message is not None:
         await message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
-
 async def send_plain(update, context, text):
     cid = chat_id(update)
     if not cid:
         return None
     return await context.bot.send_message(cid, text, parse_mode=ParseMode.HTML)
-
 
 async def start(update, context):
     if not tg_id(update):
@@ -776,7 +555,6 @@ async def start(update, context):
     )
     await update.message.reply_text(text, reply_markup=main_menu(update), parse_mode=ParseMode.HTML)
 
-
 async def cancel_login(update, context):
     user_id = tg_id(update)
     login_sessions.pop(user_id, None)
@@ -784,13 +562,11 @@ async def cancel_login(update, context):
         await update.message.reply_text("❌ Login cancelled.", reply_markup=main_menu(update), parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
-
 async def conv_fallback(update, context):
     user_id = tg_id(update)
     login_sessions.pop(user_id, None)
     await answer(update, "👈 Login flow reset.\n\nUse the buttons below.", main_menu(update))
     return ConversationHandler.END
-
 
 async def login_start(update, context):
     user_id = tg_id(update)
@@ -806,7 +582,6 @@ async def login_start(update, context):
         "Send /cancel to abort.",
     )
     return PHONE
-
 
 async def phone_received(update, context):
     user_id = tg_id(update)
@@ -836,18 +611,10 @@ async def phone_received(update, context):
     if status.get("status") != "ok":
         msg = str(status.get("message", "unknown error"))
         log.error("[DEBUG] OTP send failed for phone=%s: %s", phone, msg)
-        if "invalid" in msg.lower() or "999" in msg:
-            await update.message.reply_text(
-                "❌ <b>This mobile number is invalid on Swiggy.</b>\n\n"
-                f"API said: {html.escape(msg[:200])}\n\n"
-                "Check the number and re-enter your correct <b>10-digit</b> number:",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ OTP request failed:\n{html.escape(msg[:200])}\n\nTry again:",
-                parse_mode=ParseMode.HTML,
-            )
+        await update.message.reply_text(
+            f"❌ OTP request failed:\n{html.escape(msg[:200])}\n\nTry again:",
+            parse_mode=ParseMode.HTML,
+        )
         return PHONE
     
     login_sessions[user_id] = {
@@ -861,7 +628,6 @@ async def phone_received(update, context):
         parse_mode=ParseMode.HTML,
     )
     return OTP
-
 
 async def otp_received(update, context):
     user_id = tg_id(update)
@@ -885,18 +651,7 @@ async def otp_received(update, context):
         log.info(f"Token received: {token[:30] if token else 'None'}...")
     except ApiError as exc:
         err_msg = str(exc)
-        log.error(f"OTP verification API error for phone={phone}: {err_msg}")
-        if "invalid" in err_msg.lower() or "999" in err_msg:
-            login_sessions.pop(user_id, None)
-            await update.message.reply_text(
-                "❌ <b>This mobile number is invalid on Swiggy.</b>\n\n"
-                f"API response: {html.escape(err_msg[:200])}\n\n"
-                "Tap 🔐 Login Account and re-enter your correct <b>10-digit</b> "
-                "number (no +91, no 91).",
-                reply_markup=main_menu(update),
-                parse_mode=ParseMode.HTML,
-            )
-            return ConversationHandler.END
+        log.error(f"OTP verification API error: {err_msg}")
         await update.message.reply_text(
             f"❌ OTP verification failed: {html.escape(err_msg[:200])}\n\nTry again:",
             parse_mode=ParseMode.HTML,
@@ -920,9 +675,6 @@ async def otp_received(update, context):
         client.device_id,
         client.swuid,
         token,
-        "",
-        "",
-        "",
     )
     login_sessions.pop(user_id, None)
     account = db.get_account(account_id)
@@ -941,9 +693,7 @@ async def otp_received(update, context):
     )
     return ConversationHandler.END
 
-
 # ============================== COLLECTION ==============================
-
 
 def start_collection(update, context, account):
     cid = chat_id(update)
@@ -954,7 +704,6 @@ def start_collection(update, context, account):
         log.info("collection already running for chat %s", cid)
         return
     collecting_tasks[cid] = asyncio.create_task(run_collection(update, context, account))
-
 
 def progress_text(done, total, earned, last_ok):
     bar_len = 12
@@ -968,7 +717,6 @@ def progress_text(done, total, earned, last_ok):
         f"Last result: {mark}"
     )
 
-
 def final_text(done, total, earned, account_total, streak):
     return (
         f"✅ <b>Collection finished! [{done}/{total}]</b>\n\n"
@@ -978,7 +726,6 @@ def final_text(done, total, earned, account_total, streak):
         f"📅 Next collection: Tomorrow\n\n"
         f"{BRAND}"
     )
-
 
 async def edit_progress(cid, context, text):
     msg_id = progress_messages.get(cid)
@@ -991,7 +738,6 @@ async def edit_progress(cid, context, text):
             log.warning("progress edit failed: %s", exc)
     except Exception as exc:
         log.warning("progress edit failed: %s", exc)
-
 
 async def run_collection(update, context, account):
     cid = chat_id(update)
@@ -1026,25 +772,17 @@ async def run_collection(update, context, account):
             progress_messages[cid] = first.message_id
         client = SwiggyClient(device_id=account["device_id"], swuid=account["swuid"])
         
-        # FIXED: Direct claim without campaign links
-        # The new endpoint /buzz/claim directly gives reward
-        
-        # First, check status and claim bonus
+        # Check status and claim bonus
         try:
             status = await asyncio.to_thread(client.buzz_status, row)
-            log.info("[DEBUG] Buzz status for %s: %s", row["phone"], json.dumps(status)[:500])
-            
-            # Claim joining bonus if available
             if status.get("data", {}).get("joiningBonusApplicable"):
                 try:
-                    bonus_result = await asyncio.to_thread(client.buzz_claim_bonus, row)
-                    log.info("[DEBUG] Bonus claim result: %s", json.dumps(bonus_result)[:500])
+                    await asyncio.to_thread(client.buzz_claim_bonus, row)
                 except Exception as e:
                     log.warning("Bonus claim failed: %s", e)
         except Exception as e:
             log.warning("Status check failed: %s", e)
         
-        # Claim daily reward for each link
         for index, link in enumerate(links, 1):
             row = db.get_account(account_id)
             if not row:
@@ -1059,12 +797,8 @@ async def run_collection(update, context, account):
                 return
             gained = 0.0
             
-            # FIXED: Use claim_reward directly
             try:
                 result = await asyncio.to_thread(client.buzz_claim_reward, row)
-                log.info("[DEBUG] Claim result for %s: %s", link["campaign_id"], json.dumps(result)[:500])
-                
-                # Parse reward amount directly from response
                 amount = parse_reward_amount(result)
                 if amount > 0:
                     gained = amount
@@ -1078,14 +812,11 @@ async def run_collection(update, context, account):
                 last_ok = False
                 log.warning("Claim failed for %s: %s", link["campaign_id"], exc)
             
-            # Try buzz back for additional reward
             try:
                 await asyncio.to_thread(client.buzz_back, row, link["campaign_id"])
-                # Check if we got additional reward
                 check = await asyncio.to_thread(client.buzz_claim_reward, row)
                 extra = parse_reward_amount(check)
-                if extra > 0 and extra != gained:
-                    gained = extra
+                if extra > 0:
                     db.log(row["id"], link["id"], "buzz_back", extra, "ok")
             except Exception as exc:
                 db.log(row["id"], link["id"], "buzz_back", 0, "failed")
@@ -1112,9 +843,7 @@ async def run_collection(update, context, account):
         progress_messages.pop(cid, None)
         collecting_tasks.pop(cid, None)
 
-
 # ============================== MENU HANDLERS ==============================
-
 
 async def accounts_menu(update):
     user_id = tg_id(update)
@@ -1137,7 +866,6 @@ async def accounts_menu(update):
     text = "👤 <b>Your Accounts</b>\n\n" + "\n".join(lines) + "\n\nTap to switch active account. 🗑️ removes it."
     await answer(update, text, InlineKeyboardMarkup(rows))
 
-
 async def pick_account(update, account_id):
     user_id = tg_id(update)
     try:
@@ -1154,7 +882,6 @@ async def pick_account(update, account_id):
         f"✅ Active account set to <b>+{html.escape(account['phone'])}</b>\n\n🎁 Tap Collect Buzz to start collecting.",
         main_menu(update),
     )
-
 
 async def logout_account(update, account_id):
     user_id = tg_id(update)
@@ -1173,7 +900,6 @@ async def logout_account(update, account_id):
         if others:
             db.set_active(user_id, others[0]["id"])
     await answer(update, f"🗑️ Removed <b>+{html.escape(account['phone'])}</b>.", main_menu(update))
-
 
 async def collect_menu(update, context):
     user_id = tg_id(update)
@@ -1209,7 +935,6 @@ async def collect_menu(update, context):
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_back")])
     await answer(update, "🎁 <b>Choose an account to collect with:</b>", InlineKeyboardMarkup(rows))
 
-
 async def stats_menu(update):
     user_id = tg_id(update)
     accounts, total = db.get_stats(user_id)
@@ -1236,7 +961,6 @@ async def stats_menu(update):
     )
     await answer(update, text, main_menu(update))
 
-
 async def help_menu(update):
     text = (
         "<b>🤖 How to use Swiggy Buzz Auto-Collector</b>\n\n"
@@ -1251,9 +975,7 @@ async def help_menu(update):
     )
     await answer(update, text, main_menu(update))
 
-
 # ============================== ADMIN HANDLERS ==============================
-
 
 async def view_links(update):
     links = db.get_all_links()
@@ -1264,7 +986,6 @@ async def view_links(update):
     lines = [f"{i}. <code>{html.escape(l['campaign_id'])}</code>" for i, l in enumerate(links[:50], 1)]
     more = f"\n... and {total - 50} more" if total > 50 else ""
     await answer(update, f"📋 <b>Total links: {total}</b>\n\n" + "\n".join(lines) + more, admin_menu())
-
 
 async def delete_menu(update):
     links = db.get_all_links()
@@ -1278,7 +999,6 @@ async def delete_menu(update):
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="btn_admin")])
     await answer(update, "🗑 <b>Tap a link to delete it:</b>", InlineKeyboardMarkup(rows))
 
-
 async def delete_link(update, link_id):
     user_id = tg_id(update)
     if not is_admin(user_id):
@@ -1290,7 +1010,6 @@ async def delete_link(update, link_id):
         return
     db.delete_link(link_id)
     await delete_menu(update)
-
 
 async def admin_actions(update, context, data):
     user_id = tg_id(update)
@@ -1331,7 +1050,6 @@ async def admin_actions(update, context, data):
         text += "\n".join(lines[:40])
         await answer(update, text, admin_menu())
 
-
 async def admin_links_received(update, context):
     user_id = tg_id(update)
     if not context.user_data.get("adm_add"):
@@ -1358,7 +1076,6 @@ async def admin_links_received(update, context):
         f"✅ Added <b>{added}</b> new links (out of {len(entries)} valid).",
         parse_mode=ParseMode.HTML,
     )
-
 
 async def on_callback(update, context):
     query = update.callback_query
@@ -1394,16 +1111,12 @@ async def on_callback(update, context):
         log.exception("callback error")
         await answer(update, f"❌ Something went wrong: {html.escape(str(exc)[:150])}", main_menu(update))
 
-
 async def error_handler(update, context):
     log.error("Update %s caused error %s", update, context.error)
 
-
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-
     login_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(login_start, pattern="^btn_login$")],
         states={
@@ -1418,14 +1131,11 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(login_conv)
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_links_received))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(error_handler)
-
     log.info("Swiggy Buzz bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
