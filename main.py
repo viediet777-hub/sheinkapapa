@@ -62,8 +62,8 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # 1. CONFIGURATION (environment variables)
 # ════════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "").strip() or "0")
+BOT_TOKEN = os.environ.get("BOT_TOKEN").strip()
+ADMIN_ID = int(os.environ.get("ADMIN_ID").strip() or "0")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "viedietlooters").strip().lstrip("@")
 DATA_DIR = os.environ.get("DATA_DIR", "./data").strip()
 
