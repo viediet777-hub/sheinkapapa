@@ -65,7 +65,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 BOT_TOKEN = os.environ.get("BOT_TOKEN").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID").strip() or "0")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "viedietlooters").strip().lstrip("@")
-DATA_DIR = os.environ.get("DATA_DIR", "./data").strip()
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data/reward_bot.db").strip()
 
 PRODUCT_CODE = "8902102126232"   # Ujala product code (hardcoded)
 SPIN_COST = 1                    # points needed per spin
