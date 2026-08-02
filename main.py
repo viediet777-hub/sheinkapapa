@@ -69,7 +69,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "./data").strip()
 
 PRODUCT_CODE = "8902102126232"   # Ujala product code (hardcoded)
 SPIN_COST = 1                    # points needed per spin
-REFERRAL_POINTS = 2              # points earned per successful referral
+REFERRAL_POINTS = 1              # points earned per successful referral
 PAGE_SIZE = 10                   # admin user list pagination size
 API_RETRIES = 2                  # max attempts for every Ujala API call
 
@@ -973,7 +973,7 @@ def start_spin(chat_id, message_id=None):
             return
         spin_sessions[chat_id] = {"step": "phone", "_ts": time.time()}
     text = (
-        f"🎡 <b>SPIN THE WHEEL</b>\n"
+        f"🎡 <b>UJALA THE WHEEL</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📱 Please send your <b>10 digit mobile number</b>.\n"
         f"(No country code needed)\n\n"
@@ -1742,7 +1742,7 @@ def scheduler_loop():
 
 def main():
     print("=" * 60)
-    print(" 🎡 VIEDIET REWARD SPIN BOT")
+    print(" 🎡 VIEDIET UJALA BOT")
     print("    Made by viediet")
     print("=" * 60)
 
