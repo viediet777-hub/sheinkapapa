@@ -737,7 +737,7 @@ def main_menu_text(user, first_name):
     name = escape(first_name or "User")
     points = user["points"] if user else 0
     return (
-        f"🎡 <b>VIEDIET REWARD SPIN BOT</b>\n"
+        f"🎡 <b>VIEDIET UJALA BOT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👋 Welcome, <b>{name}</b>!\n"
         f"💎 Your Points: <b>{points}</b>\n"
