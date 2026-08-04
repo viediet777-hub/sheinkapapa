@@ -901,7 +901,8 @@ def check_panel_active(url):
             "simDetails",
             "sim",
             "devices",
-            "All_Users/devices"
+            "All_Users/devices",
+            "All_Users/Data",
         ]
         found_path, sim_data = fb_get_first(url, fallback_sim)
         if found_path:
