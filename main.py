@@ -868,6 +868,10 @@ def check_panel_active(url):
                 elif "deviceInfo" in all_users["Data"]:
                     device_path = "All_Users/Data/deviceInfo"
                     device_data = all_users["Data"]["deviceInfo"]
+                else:
+                    # All_Users/Data IS the device info directly
+                    device_path = "All_Users/Data"
+                    device_data = all_users["Data"]
         else:
             # Root-level simDetails or DeviceInfo
             if "simDetails" in root_data:
@@ -885,6 +889,9 @@ def check_panel_active(url):
             elif "deviceInfo" in root_data:
                 device_path = "deviceInfo"
                 device_data = root_data["deviceInfo"]
+            elif "Data" in root_data and isinstance(root_data["Data"], dict):
+                device_path = "Data"
+                device_data = root_data["Data"]
 
     # 2) If still not found, use a list of fallback paths
     if sim_data is None:
@@ -904,6 +911,7 @@ def check_panel_active(url):
         fallback_device = [
             "All_Users/Data/DeviceInfo",
             "All_Users/Data/deviceInfo",
+            "All_Users/Data",
             "All_Users/DeviceInfo",
             "DeviceInfo",
             "deviceInfo",
@@ -923,7 +931,10 @@ def check_panel_active(url):
     for dev_id, sim in sim_data.items():
         info = info_all.get(dev_id) or {}
         status = str(info.get("Status", "")).lower()
-        if status == "online":
+        is_online = status == "online"
+        if not is_online and "Status" not in info and "status" not in info:
+            is_online = bool(info.get("phoneNumber") or info.get("phone") or info.get("mobile"))
+        if is_online:
             nums = extract_all_nums(sim, info)
             if nums:
                 online_devices.append({
